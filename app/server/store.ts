@@ -21,12 +21,22 @@ function flush() {
   writeFileSync(FILE, JSON.stringify(scans, null, 2));
 }
 
+/** The runs index. Bodies are stripped — the sidebar only needs the headline
+ *  numbers, and a scan carries hundreds of excerpts. */
 export const list = () =>
-  scans.map(({ mentions, issues, ...rest }) => ({
+  scans.map(({ mentions, issues, abuse, log, ...rest }) => ({
     ...rest,
     mentions: [],
     issues: [],
-    counts: { mentions: mentions.length, issues: issues.length },
+    abuse: [],
+    log: [],
+    counts: {
+      mentions: mentions.length,
+      issues: issues.length,
+      abuse: abuse?.length ?? 0,
+      critical: (issues ?? []).filter((i) => i.severity === 'critical').length
+        + (abuse ?? []).filter((a) => a.severity === 'critical').length,
+    },
   }));
 
 export const get = (id: string) => scans.find((s) => s.id === id);

@@ -93,7 +93,12 @@ export interface Scan {
   createdAt: string;
   status: 'running' | 'done' | 'error';
   stage: Stage;
+  /** Short, human-readable explanation of why the scan (or a stage) failed. */
   error?: string;
+  /** Full raw error text (model output, stack line) — kept for the details toggle. */
+  errorDetail?: string;
+  /** The pipeline stage that failed, when known. */
+  failedStage?: Stage;
   profiles: Profile[];
   mentions: Mention[];
   issues: Issue[];
@@ -136,4 +141,11 @@ export type ScanEvent =
   | { type: 'log'; line: LogLine }
   | { type: 'patch'; scan: Partial<Scan> }
   | { type: 'done'; scan: Scan }
-  | { type: 'error'; message: string };
+  | {
+      type: 'error';
+      message: string;
+      /** The pipeline stage that failed, when it can be pinned down. */
+      stage?: Stage;
+      /** The full raw error text, for the details toggle. */
+      detail?: string;
+    };

@@ -59,12 +59,41 @@ async function askJson<T>(opts: {
   effort?: 'none' | 'low' | 'medium' | 'high';
   emit: Emit;
 }): Promise<T> {
+  let servers = opts.servers ?? [];
+
+  // A connector can be registered with TrueForge and still be broken — no
+  // credentials, an expired token, the container down. TrueForge attaches every
+  // server eagerly at turn start, so one broken connector otherwise takes the
+  // whole turn down before the model gets to try anything. Strip it and retry
+  // rather than losing the stage over a server nothing here is even using yet.
+  for (let attempt = 0; attempt <= servers.length; attempt++) {
+    try {
+      return await attemptJson<T>({ ...opts, servers });
+    } catch (error) {
+      const broken = error instanceof Error
+        && error.message.match(/Failed to connect to remote MCP server '([\w-]+)'/)?.[1];
+      if (!broken || !servers.includes(broken)) throw error;
+      opts.emit('warn', `${broken} is registered but unreachable — continuing without it`);
+      servers = servers.filter((s) => s !== broken);
+    }
+  }
+  throw new Error('every connector for this stage failed to connect');
+}
+
+async function attemptJson<T>(opts: {
+  instructions: string;
+  prompt: string;
+  schema: unknown;
+  servers: string[];
+  effort?: 'none' | 'low' | 'medium' | 'high';
+  emit: Emit;
+}): Promise<T> {
   const { data: session } = await client.sessions.create({
     agent: {
       spec: {
         model: { name: MODEL, params: { reasoningEffort: opts.effort ?? 'low' } },
         instructions: opts.instructions,
-        mcpServers: (opts.servers ?? []).map((name) => ({
+        mcpServers: opts.servers.map((name) => ({
           name,
           preload: true,
           // Everything here is read-only research; stopping for approval would
@@ -209,7 +238,7 @@ export async function resolveSite(company: string, servers: string[], emit: Emit
       name: 'site',
       schema: { type: 'object', required: ['url'], properties: { url: { type: 'string' } } },
     },
-    servers: servers.filter((s) => s === 'exa'),
+    servers: orderServers(servers, ['bright-data', 'exa']),
     emit,
   });
   return url;
@@ -217,31 +246,51 @@ export async function resolveSite(company: string, servers: string[], emit: Emit
 
 /* --------------------------------------------------------------- discovery */
 
-const DISCOVERY_INSTRUCTIONS = `You find where people discuss software, and you report only what you actually found.
+const DISCOVERY_INSTRUCTIONS = `You find where people discuss software, and you report only what you actually found — read the real conversation, not just confirmation that a page exists.
 
-Method:
-- Search each venue you have a tool for. Use Reddit and Hacker News tools directly; use Exa for everything else (blogs, forums, review sites, YouTube).
-- Run several narrow searches rather than one broad one: plain mentions, "X vs", "X review", "X problems", "we use X".
-- Open threads with real discussion and quote what was said. Post titles rarely carry the opinion; comments do.
-- Record the date whenever the source shows one, and the engagement number the venue reports.
+A search result that only tells you a Reddit post or a tweet exists is not a finding. You have not covered a venue until you have opened the actual thread and pulled real comment or reply text from it. Do not stop at a list of links.
+
+Method, in order:
+1. Search each venue to get a list of candidate threads: Bright Data or Exa for general web search, the Reddit tool for Reddit, the Hacker News tool for HN, the X tool for X if it is available. Run several narrow queries rather than one broad one: plain mentions, "X vs", "X review", "X problems", "we use X", "switched from X".
+2. For every candidate that looks like real discussion (not a listicle, not a press release), open it and read it:
+   - Reddit: call get_post_comments on the post. Pull actual comment text, not the post title or body alone. A Reddit post with zero comments read is not a finding — go back and read them.
+   - Hacker News: call get_story_info on the story. HN's signal is in the comment tree, not the submission title.
+   - X: if you have an X search tool, fetch the actual post text and, where possible, the replies with real engagement — not just that a tweet exists.
+   - Everything else (blogs, forums, review sites, YouTube comments): fetch the page and quote the actual passage, not a search-result snippet.
+3. If a connector for a venue isn't available, search that venue through general web search instead (e.g. "site:reddit.com" or "site:news.ycombinator.com" via Exa/Bright Data) rather than skipping it.
+
+The excerpt field must be a verbatim quote of what a real person wrote — at least one full sentence, taken from the comment or post body you actually opened. Never a paraphrase of the title, and never invented.
 
 Rules:
+- A tool failure is not the end of the search. If one returns a rate limit or an error, note it, move to the next venue, and report what the others gave you. Never stop the whole search because one backend was unavailable.
 - Never invent a URL, a date, an engagement count, or a quote. Omit the field instead.
 - Skip press releases, listicles, job postings and the company's own docs and blog.
-- A submission with no comments is not a discussion.`;
+- A submission with no comments read is not a discussion — either read the comments or leave it out.
+- Aim for depth over breadth: 15 mentions you actually read in full beat 40 you only found the URL for.`;
 
 export async function findMentions(
-  company: string, site: string, servers: string[], emit: Emit,
+  company: string, site: string, profiles: Profile[], servers: string[], emit: Emit,
 ): Promise<Mention[]> {
-  const usable = servers.filter((s) => ['exa', 'reddit', 'hn'].includes(s));
-  const { mentions } = await askJson<{ mentions: Omit<Mention, 'id' | 'sentiment' | 'score' | 'themes'>[] }>({
-    instructions: DISCOVERY_INSTRUCTIONS,
-    prompt: `Find third-party discussion of "${company}" (${site}). Cover Reddit and Hacker News thoroughly, then the wider web. Return up to 40 mentions, newest first.`,
-    schema: mentionsSchema,
-    servers: usable,
-    effort: 'high',
-    emit,
-  });
+  const usable = orderServers(servers, ['bright-data', 'exa', 'reddit', 'hn', 'x']);
+  emit('info', `searching with ${usable.join(', ') || 'no connectors'}`);
+
+  // The company's own accounts, found in the presence stage, are the sharpest
+  // starting point: a real subreddit, a real handle, a real Discord — searching
+  // those directly beats a blind web search for the name.
+  const known = profiles.length
+    ? `\n\nAccounts this company actually runs, useful as search anchors:\n${profiles.map((p) => `- ${p.platform}: ${p.url}`).join('\n')}`
+    : '';
+
+  const { mentions } = await withRetry('discovery', emit, () =>
+    askJson<{ mentions: Omit<Mention, 'id' | 'sentiment' | 'score' | 'themes'>[] }>({
+      instructions: DISCOVERY_INSTRUCTIONS,
+      prompt: `Find third-party discussion of "${company}" (${site}). Cover Reddit and Hacker News thoroughly — open real threads and read real comments — then the wider web.${known}\n\nReturn up to 30 mentions, newest first. Depth over breadth: every mention must carry a verbatim quote you actually read.`,
+      schema: mentionsSchema,
+      servers: usable,
+      effort: 'high',
+      emit,
+    }),
+  );
 
   const seen = new Set<string>();
   return (mentions ?? [])
@@ -278,7 +327,8 @@ export async function scoreBuzz(
     url: m.url, venue: m.venue, date: m.date, title: m.title, excerpt: m.excerpt.slice(0, 600),
   }));
 
-  const { scored, verdict } = await askJson<{
+  emit('info', `scoring ${mentions.length} mentions`);
+  const { scored, verdict } = await withRetry('buzz', emit, () => askJson<{
     scored: { url: string; sentiment: Mention['sentiment']; score: number; themes?: string[] }[];
     verdict: string;
   }>({
@@ -295,7 +345,7 @@ The verdict names the direction perception is moving and what is driving it, in 
     schema: buzzSchema,
     effort: 'low',
     emit,
-  });
+  }));
 
   const byUrl = new Map((scored ?? []).map((s) => [s.url, s]));
   return {
@@ -327,7 +377,8 @@ export async function findIssues(
     url: m.url, date: m.date, venue: m.venue, title: m.title, excerpt: m.excerpt.slice(0, 800),
   }));
 
-  const { issues } = await askJson<{ issues: Omit<Issue, 'id' | 'status' | 'firstSeen' | 'lastSeen'>[] }>({
+  emit('info', `triaging ${complaints.length} negative or neutral mentions`);
+  const { issues } = await withRetry('health', emit, () => askJson<{ issues: Omit<Issue, 'id' | 'status' | 'firstSeen' | 'lastSeen'>[] }>({
     instructions: `You triage public complaints into engineering issues.
 
 Keep only problems in the product: bugs, broken or confusing interfaces, slowness, unreliability, missing documentation, billing surprises, and gaps people hit repeatedly. Discard opinion, pricing objections that are not billing bugs, competitor preference, and anything that is a support question rather than a defect.
@@ -341,7 +392,7 @@ The draft reply is written to the people who raised it. Acknowledge the specific
     schema: healthSchema,
     effort: 'medium',
     emit,
-  });
+  }));
 
   const byUrl = new Map(mentions.map((m) => [m.url, m]));
   return (issues ?? []).map((issue) => {
@@ -355,6 +406,73 @@ The draft reply is written to the people who raised it. Acknowledge the specific
       evidence: (issue.evidence ?? []).map((url) => byUrl.get(url)?.id ?? url),
       firstSeen: dates[0] ?? null,
       lastSeen: dates.at(-1) ?? null,
+      status: 'open' as const,
+    };
+  });
+}
+
+/* ------------------------------------------------------------------- abuse */
+
+const ABUSE_INSTRUCTIONS = `You look for people abusing a brand's name, and you report only what the evidence supports.
+
+What counts:
+- **Impersonation** — accounts, servers or pages posing as the company, its founders or its support staff.
+- **Phishing and credential theft** — lookalike domains, fake login or wallet-connect pages, "verify your account" flows.
+- **Scams** — fake giveaways, airdrops, investment or refund schemes trading on the brand.
+- **Fake support** — DMs offering help that route users off-platform, a pattern in Discord and Telegram communities.
+- **Counterfeit** — resold licences, cracked builds, unauthorised listings.
+- **Malware** — trojaned packages, installers or extensions using the name.
+- **Spam and harassment** — coordinated posting, or brigading aimed at the company or its users.
+
+Rules:
+- Report only what you saw. A suspicion with no URL behind it is not a finding.
+- A competitor being negative is not abuse. A frustrated user is not abuse. Criticism is not abuse.
+- Do not name or target private individuals. Describe the account or the operation, not a person.
+- Severity is about exposure: critical = users are losing money or credentials right now; serious = an active impersonation with reach; warning = a lookalike or a stale scam post; good = handled or negligible.
+- The recommendation is one concrete action — which platform's report flow, which domain to register or contest, which community to warn.`;
+
+export async function findAbuse(
+  company: string, site: string, mentions: Mention[], servers: string[], emit: Emit,
+): Promise<AbuseFinding[]> {
+  const usable = orderServers(servers, ['bright-data', 'exa', 'reddit', 'hn']);
+  if (usable.length === 0) {
+    emit('warn', 'no search connector available — skipping the integrity sweep');
+    return [];
+  }
+  emit('info', `sweeping for impersonation and scams with ${usable.join(', ')}`);
+
+  const context = mentions.slice(0, 30).map((m) => ({ url: m.url, title: m.title, excerpt: m.excerpt.slice(0, 300) }));
+
+  const { findings } = await withRetry('abuse', emit, () =>
+    askJson<{ findings: Omit<AbuseFinding, 'id' | 'status' | 'firstSeen'>[] }>({
+      instructions: ABUSE_INSTRUCTIONS,
+      prompt: `Company: "${company}" (${site}).
+
+Search for misuse of this brand: impersonating accounts and Discord/Telegram servers, lookalike domains, phishing pages, giveaway and airdrop scams, fake support, counterfeit or cracked distributions, and packages published under the name.
+
+Check the obvious surfaces — the platforms the company itself is on, package registries, and any thread below that mentions being scammed or contacted by "support".
+
+Discussion already collected:
+${JSON.stringify(context)}`,
+      schema: abuseSchema,
+      servers: usable,
+      effort: 'high',
+      emit,
+    }),
+  );
+
+  const byUrl = new Map(mentions.map((m) => [m.url, m]));
+  return (findings ?? []).map((finding) => {
+    const dates = (finding.evidence ?? [])
+      .map((url) => byUrl.get(url)?.date)
+      .filter((d): d is string => Boolean(d))
+      .sort();
+    return {
+      ...finding,
+      id: randomUUID().slice(0, 8),
+      evidence: finding.evidence ?? [],
+      locations: finding.locations ?? [],
+      firstSeen: dates[0] ?? null,
       status: 'open' as const,
     };
   });

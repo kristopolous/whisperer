@@ -1,11 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import cors from 'cors';
 import express from 'express';
-import type { Scan, ScanEvent, Tracker } from '../shared/types.ts';
-import {
-  availableServers, buildBuzz, findIssues, findMentions, findPresence,
-  netSentiment, resolveSite, scoreBuzz,
-} from './pipeline.ts';
+import type { Scan, ScanEvent, Stage, Tracker } from '../shared/types.ts';
+import { STAGES } from '../shared/types.ts';
+import { availableServers, type Log } from './pipeline.ts';
+import { runStage, explainFailure } from './stages.ts';
 import * as store from './store.ts';
 import { buildPayload } from './trackers.ts';
 
@@ -26,23 +25,28 @@ app.get('/api/scans/:id', (req, res) => {
   res.json(scan);
 });
 
-/**
- * Runs a scan and streams progress as it goes.
- *
- * A full scan is four agent turns and takes minutes, so the client watches an
- * event stream rather than holding a request open with nothing to show.
- */
-app.get('/api/scans/:id/stream', async (req, res) => {
-  const company = String(req.query.company ?? '').trim();
-  if (!company) return res.status(400).end();
+const STAGE_KEYS: Stage[] = STAGES.map((s) => s.key);
 
+/** Set up an in-memory, streamed execution context for a scan id. */
+function openStream(res: import('express').Response, onEvent: (event: ScanEvent) => void) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
-  const emit = (event: ScanEvent) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+  return (event: ScanEvent) => { onEvent(event); res.write(`data: ${JSON.stringify(event)}\n\n`); };
+}
+
+/**
+ * Runs a full scan, streaming progress as it goes.
+ *
+ * A full scan is five agent turns and takes minutes, so the client watches an
+ * event stream rather than holding a request open with nothing to show.
+ */
+app.get('/api/scans/:id/stream', async (req, res) => {
+  const company = String(req.query.company ?? '').trim();
+  if (!company) return res.status(400).end();
 
   const scan: Scan = {
     id: req.params.id,
@@ -54,47 +58,99 @@ app.get('/api/scans/:id/stream', async (req, res) => {
     profiles: [],
     mentions: [],
     issues: [],
+    abuse: [],
     buzz: [],
+    log: [],
+    timings: {},
     verdict: '',
     net: { now: 0, delta: 0 },
   };
   store.put(scan);
 
+  const send = openStream(res, () => {});
+  const log: Log = (level, text) => {
+    scan.log.push({ at: new Date().toISOString(), level, stage: scan.stage, text });
+    send({ type: 'log', line: scan.log.at(-1)! });
+  };
+
   try {
     const servers = await availableServers();
+    log('info', `${servers.length} connectors: ${servers.join(', ') || 'none'}`);
+    if (servers.length === 0) log('warn', 'nothing to search with — run `npm run setup`');
 
-    emit({ type: 'stage', stage: 'presence' });
-    scan.site = await resolveSite(company, servers, emit);
-    emit({ type: 'patch', scan: { site: scan.site } });
-    scan.profiles = await findPresence(scan.site);
-    store.put({ ...scan, stage: 'presence' });
-    emit({ type: 'patch', scan: { profiles: scan.profiles } });
-
-    emit({ type: 'stage', stage: 'discovery' });
-    scan.mentions = await findMentions(company, scan.site, servers, emit);
-    store.put({ ...scan, stage: 'discovery' });
-    emit({ type: 'patch', scan: { mentions: scan.mentions } });
-
-    emit({ type: 'stage', stage: 'buzz' });
-    const buzz = await scoreBuzz(company, scan.mentions, emit);
-    scan.mentions = buzz.mentions;
-    scan.verdict = buzz.verdict;
-    scan.buzz = buildBuzz(scan.mentions);
-    scan.net = netSentiment(scan.buzz);
-    store.put({ ...scan, stage: 'buzz' });
-    emit({ type: 'patch', scan: { mentions: scan.mentions, buzz: scan.buzz, net: scan.net, verdict: scan.verdict } });
-
-    emit({ type: 'stage', stage: 'health' });
-    scan.issues = await findIssues(company, scan.mentions, emit);
+    for (const next of STAGE_KEYS) {
+      send({ type: 'stage', stage: next });
+      try {
+        await runStage({ scan, servers, log, send }, next);
+      } catch (error) {
+        const raw = error instanceof Error ? error.message : String(error);
+        const { message, detail } = explainFailure(next, raw);
+        log('error', `failed at ${next}: ${raw}`);
+        scan.status = 'error';
+        scan.stage = next;
+        scan.failedStage = next;
+        scan.error = message;
+        scan.errorDetail = detail;
+        store.put(scan);
+        send({ type: 'error', message, stage: next, detail });
+        res.end();
+        return;
+      }
+    }
 
     scan.status = 'done';
     scan.stage = 'done';
+    log('stage', 'done');
     store.put(scan);
-    emit({ type: 'done', scan });
+    send({ type: 'done', scan });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    log('error', message);
     store.put({ ...scan, status: 'error', error: message });
-    emit({ type: 'error', message });
+    send({ type: 'error', message });
+  } finally {
+    res.end();
+  }
+});
+
+/** Re-run a single stage on an existing scan, streamed. Each stage runs against
+ *  whatever the scan already holds, and patches just its own slice of data. */
+app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
+  const scan = store.get(req.params.id);
+  const next = req.params.stage as Stage;
+  if (!scan) return res.status(404).json({ error: 'no such scan' });
+  if (!(STAGE_KEYS as string[]).includes(next)) return res.status(400).json({ error: 'no such stage' });
+
+  const send = openStream(res, () => {});
+  const log: Log = (level, text) => {
+    scan.log.push({ at: new Date().toISOString(), level, stage: next, text });
+    send({ type: 'log', line: scan.log.at(-1)! });
+  };
+
+  try {
+    const servers = await availableServers();
+    scan.status = 'running';
+    scan.stage = next;
+    store.put(scan);
+    await runStage({ scan, servers, log, send }, next);
+    scan.status = 'done';
+    scan.stage = 'done';
+    store.put(scan);
+    send({ type: 'patch', scan: { status: 'done', stage: 'done' } });
+    send({ type: 'done', scan });
+  } catch (error) {
+    const raw = error instanceof Error ? error.message : String(error);
+    const { message, detail } = explainFailure(next, raw);
+    log('error', `failed at ${next}: ${raw}`);
+    store.put({
+      ...scan,
+      status: 'error',
+      stage: next,
+      failedStage: next,
+      error: message,
+      errorDetail: detail,
+    });
+    send({ type: 'error', message, stage: next, detail });
   } finally {
     res.end();
   }
@@ -123,6 +179,15 @@ app.post('/api/scans/:id/issues/:issueId/file', (req, res) => {
   issue.filedTo = { tracker, ref: req.body?.ref ?? 'pending', at: new Date().toISOString() };
   store.put(scan);
   res.json(issue);
+});
+
+app.post('/api/scans/:id/abuse/:findingId/status', (req, res) => {
+  const scan = store.get(req.params.id);
+  const finding = scan?.abuse.find((f) => f.id === req.params.findingId);
+  if (!scan || !finding) return res.status(404).json({ error: 'no such finding' });
+  finding.status = req.body.status;
+  store.put(scan);
+  res.json(finding);
 });
 
 app.post('/api/scans/:id/issues/:issueId/status', (req, res) => {
