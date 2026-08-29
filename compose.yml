@@ -1,0 +1,110 @@
+# Local MCP servers that TrueForge connects to over HTTP.
+#
+# Every service runs with network_mode: host. Containers on this machine's docker
+# bridge have no outbound route — not even to the gateway — so a bridged MCP
+# server registers fine and then fails every search. Host networking also means
+# each server binds its port directly: supergateway has no --host flag, so the
+# bridged servers (hn, signal, whatsapp) are reachable from the LAN. They hold no
+# credentials of their own, but do not run this on an untrusted network.
+services:
+  discord-mcp:
+    image: saseq/discord-mcp:latest
+    container_name: discord-mcp
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # "http" exposes one shared MCP endpoint instead of stdio-per-session.
+      SPRING_PROFILES_ACTIVE: http
+      DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+      # discord-mcp exits without a valid DISCORD_TOKEN — set it in .env first.
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+
+  reddit-mcp:
+    image: ghcr.io/jordanburke/reddit-mcp-server:latest
+    container_name: reddit-mcp
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # All four are optional: with none set the server runs anonymous and
+      # read-only at ~10 req/min. Client id/secret raise that to 60-100 req/min;
+      # username/password are additionally required for the write tools.
+      REDDIT_CLIENT_ID: ${REDDIT_CLIENT_ID:-}
+      REDDIT_CLIENT_SECRET: ${REDDIT_CLIENT_SECRET:-}
+      REDDIT_USERNAME: ${REDDIT_USERNAME:-}
+      REDDIT_PASSWORD: ${REDDIT_PASSWORD:-}
+
+  hn-mcp:
+    # mcp-hn is stdio-only; the image wraps it in supergateway to speak HTTP.
+    build:
+      context: ./docker
+      dockerfile: hn-mcp.Dockerfile
+      # Build-time DNS needs the host resolver on this machine.
+      network: host
+    image: local/hn-mcp:latest
+    container_name: hn-mcp
+    restart: unless-stopped
+    network_mode: host
+
+  linkedin-mcp:
+    image: stickerdaniel/linkedin-mcp-server:latest
+    container_name: linkedin-mcp
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      # Holds the browser profile and session cookie. Run the interactive login
+      # once before this is useful:
+      #   docker run -it --rm -v ~/.linkedin-mcp:/home/pwuser/.linkedin-mcp \
+      #     stickerdaniel/linkedin-mcp-server:latest --login
+      - ${HOME}/.linkedin-mcp:/home/pwuser/.linkedin-mcp
+    # On the host network it can bind loopback directly, which is what its own
+    # docs recommend outside Docker.
+    command: ["--transport", "streamable-http", "--host", "127.0.0.1", "--port", "8087", "--path", "/mcp"]
+
+  telegram-mcp:
+    # Builds straight from the upstream repo; it has a native HTTP transport.
+    build:
+      context: https://github.com/chigwell/telegram-mcp.git
+      network: host
+    image: local/telegram-mcp:latest
+    container_name: telegram-mcp
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MCP_TRANSPORT: http
+      # From https://my.telegram.org/apps, plus a session string generated with
+      # the repo's session_string_generator.py (QR or phone login).
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+      TELEGRAM_SESSION_STRING: ${TELEGRAM_SESSION_STRING:-}
+
+  signal-mcp:
+    build:
+      context: ./docker
+      dockerfile: signal-mcp.Dockerfile
+      network: host
+    image: local/signal-mcp:latest
+    container_name: signal-mcp
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SIGNAL_USER_ID: ${SIGNAL_USER_ID:-}
+    volumes:
+      # signal-cli's registration lives here. Register once before starting:
+      #   docker compose run --rm signal-mcp signal-cli -u +15551234567 register
+      #   docker compose run --rm signal-mcp signal-cli -u +15551234567 verify CODE
+      - ${HOME}/.local/share/signal-cli:/root/.local/share/signal-cli
+
+  whatsapp-mcp:
+    build:
+      context: ./docker
+      dockerfile: whatsapp-mcp.Dockerfile
+      network: host
+    image: local/whatsapp-mcp:latest
+    container_name: whatsapp-mcp
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - whatsapp-store:/app/whatsapp-bridge/store
+
+volumes:
+  whatsapp-store:

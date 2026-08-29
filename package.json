@@ -1,0 +1,39 @@
+{
+  "name": "whisperer",
+  "version": "1.0.0",
+  "description": "Listens to what the internet says about a company, and turns the complaints into issues.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "setup": "tsx --env-file=.env src/setup.ts",
+    "hello": "tsx --env-file=.env src/hello.ts",
+    "typecheck": "tsc",
+    "agent": "tsx --env-file=.env src/run-agent.ts",
+    "api": "tsx --env-file=.env --watch app/server/index.ts",
+    "web": "vite --config app/web/vite.config.ts",
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm:api\" \"npm:web\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@truefoundry/trueforge-sdk": "^0.1.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.4.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.5",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
+  }
+}
