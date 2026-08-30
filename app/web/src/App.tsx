@@ -42,7 +42,7 @@ function hashFor(id: string, tab: Tab): string {
 
 const BLANK: Scan = {
   id: '', company: '', site: '', createdAt: '', status: 'done', stage: 'queued',
-  profiles: [], mentions: [], issues: [], abuse: [], buzz: [], topics: [], feed: [], log: [], timings: {},
+  profiles: [], mentions: [], issues: [], abuse: [], buzz: [], topics: [], migrations: [], feed: [], log: [], timings: {},
   verdict: '', net: { now: 0, delta: 0 },
 };
 

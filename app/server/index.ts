@@ -109,6 +109,7 @@ app.get('/api/scans/:id/stream', async (req, res) => {
     abuse: [],
     buzz: [],
     topics: [],
+    migrations: [],
     feed: [],
     log: [],
     timings: {},

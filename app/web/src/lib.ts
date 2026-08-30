@@ -15,6 +15,7 @@ export function normalize(scan: Scan): Scan {
     abuse: scan.abuse ?? [],
     buzz: scan.buzz ?? [],
     topics: scan.topics ?? [],
+    migrations: scan.migrations ?? [],
     feed: scan.feed ?? [],
     log: scan.log ?? [],
     timings: scan.timings ?? {},

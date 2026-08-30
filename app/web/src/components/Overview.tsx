@@ -1,5 +1,6 @@
 import type { Scan } from '../../../shared/types.ts';
 import { Tape } from '../charts/Tape.tsx';
+import { MigrationFlow } from '../charts/MigrationFlow.tsx';
 import { TopicStack } from '../charts/TopicStack.tsx';
 import { fmtMonth, fmtScore } from '../lib.ts';
 
@@ -64,6 +65,20 @@ export function Overview({
             <div className="tape-foot">
               <span>Hover a band for the month's breakdown; click a topic to isolate it</span>
             </div>
+          </div>
+        </section>
+      )}
+
+      {scan.migrations.length > 0 && (
+        <section>
+          <div className="tape">
+            <div className="tape-head">
+              <h3>Who they switch to, and from</h3>
+              <span style={{ font: '400 11px var(--mono)', color: 'var(--ink-3)' }}>
+                stated moves · {scan.migrations.length} in the window
+              </span>
+            </div>
+            <MigrationFlow migrations={scan.migrations} />
           </div>
         </section>
       )}

@@ -154,6 +154,35 @@ export interface AbuseFinding {
   status: 'open' | 'reported' | 'dismissed';
 }
 
+/** Someone saying, in public, that they moved between this product and another.
+ *
+ *  Direction is from THIS product's point of view and the two are not
+ *  symmetric, so it is stored rather than inferred: `inbound` is a win (they
+ *  arrived here from the competitor), `outbound` is a loss (they left here for
+ *  the competitor). Getting this backwards would invert the single most
+ *  consequential number on the page, so the quote that justifies it is kept
+ *  alongside and shown in the UI.
+ *
+ *  `confidence` is low when the move is stated vaguely ("might switch",
+ *  "looking at alternatives") rather than as an accomplished fact. A stated
+ *  intention is not a migration, and counting it as one inflates churn. */
+export interface Migration {
+  id: string;
+  direction: 'inbound' | 'outbound';
+  /** The other product, as people actually name it. */
+  competitor: string;
+  /** Where they said it. */
+  url: string;
+  venue: Venue;
+  date: string | null;
+  author: string | null;
+  /** Verbatim. The claim is only as good as what they actually wrote. */
+  quote: string;
+  /** Why they moved, in a few words — the reason is the actionable part. */
+  reason: string;
+  confidence: 'high' | 'low';
+}
+
 /** How much was said about one product topic in one time bucket.
  *
  *  Sentiment answers "how do they feel"; this answers "about what". Stacked
@@ -217,6 +246,8 @@ export interface Scan {
   buzz: BuzzPoint[];
   /** Discussion volume per topic over time, for the stacked view. */
   topics: TopicPoint[];
+  /** Publicly stated moves to and from competing products. */
+  migrations: Migration[];
   /** Newest-first stream of the latest comments, videos and posts. */
   feed: FeedItem[];
   /** Everything the run printed, kept with the scan so a finished run can still

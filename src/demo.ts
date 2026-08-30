@@ -26,7 +26,8 @@ import { readFileSync } from 'node:fs';
 import { buildBuzz, netSentiment } from '../app/server/pipeline.ts';
 import * as store from '../app/server/store.ts';
 import type {
-  AbuseFinding, FeedItem, Issue, LoopEvent, LoopStep, Mention, Reporter, Scan, Sentiment, TopicPoint,
+  AbuseFinding, FeedItem, Issue, LoopEvent, LoopStep, Mention, Migration, Reporter, Scan, Sentiment,
+  TopicPoint,
 } from '../app/shared/types.ts';
 
 /** Words that reliably indicate which way a title leans. Keyword scoring is
@@ -403,6 +404,93 @@ function extraFeed(): FeedItem[] {
   ];
 }
 
+/** Publicly stated moves in and out, mocked.
+ *
+ *  The mix is deliberately not flattering. Inbound outnumbers outbound overall,
+ *  but two competitors run the other way, and those are the interesting rows:
+ *  a tool people leave *for* tells you what you are missing far more precisely
+ *  than an aggregate churn number does. A demo where every arrow points inward
+ *  would be a worse demo, because nobody would learn how to read it.
+ *
+ *  Reasons are carried per-move because the reason is the actionable part —
+ *  "left for Cursor" is a fact, "left for Cursor once the project outgrew
+ *  prompt-editing" is a roadmap item. */
+function migrationsMock(): Migration[] {
+  const rows: [Migration['direction'], string, string, string, Migration['venue'], string, string, Migration['confidence']][] = [
+    ['inbound', 'Replit', '2026-08-21', 'swyxio',
+      'reddit', "done with replit agent for greenfield stuff. spun up the same crud app in lovable in about 20 minutes vs an afternoon of babysitting. going to keep replit for the repl bit, that's still unbeaten",
+      'faster first working screen', 'high'],
+    ['inbound', 'Bubble', '2026-08-16', 'martacodes',
+      'reddit', "migrated our internal ops tool off bubble after four years. the thing that finally did it was wanting real code we could hand to a contractor. exported, cleaned it up, done",
+      'wanted real exportable code', 'high'],
+    ['inbound', 'Bubble', '2026-07-29', 'dgriffith',
+      'linkedin', 'Rebuilt in a week what took a quarter on Bubble. Not a knock on Bubble — our team just reads code faster than they read a visual canvas.',
+      'team prefers code over visual canvas', 'high'],
+    ['inbound', 'Webflow', '2026-07-11', 'anna.builds',
+      'x', "webflow is still better looking out of the box, but the moment i needed auth and a database it stopped being the right tool. moved the app half over, kept the marketing site there",
+      'needed auth and a database', 'high'],
+    ['inbound', 'Replit', '2026-06-24', 'kbhatt',
+      'hackernews', "Switched from Replit for prototyping. Both are good; the difference for us was that one of them gets a stakeholder-viewable thing in front of people in an hour.",
+      'faster stakeholder demos', 'high'],
+    ['inbound', 'v0', '2026-06-09', 'tinyrhino',
+      'reddit', "v0 is great at the component level but i kept having to assemble the app myself. came over for the whole-app generation",
+      'whole-app rather than components', 'high'],
+    ['inbound', 'Framer', '2026-05-18', 'jules_m',
+      'x', 'moved our client work over. framer for sites, lovable for anything with a login. that split has held up for six months',
+      'needed application logic, not a site', 'high'],
+    ['inbound', 'Bolt', '2026-04-30', 'p_nakamura',
+      'reddit', "tried both for a month each. ended up here mostly because the integrations actually stuck. ymmv, bolt was close",
+      'integrations more reliable', 'low'],
+    ['inbound', 'Base44', '2026-03-14', 'sam_ok',
+      'linkedin', 'Consolidated onto one builder this quarter after trialling three. Went with the one our non-engineers could actually operate unsupervised.',
+      'non-engineers could operate it', 'high'],
+    ['inbound', 'Replit', '2026-02-02', 'devonx',
+      'reddit', "replit's fine, i just got tired of the environment breaking between sessions. haven't had that here yet, touch wood",
+      'environment stability', 'low'],
+
+    ['outbound', 'Cursor', '2026-08-19', 'mattgreenrocks',
+      'hackernews', "I'm done with the prompt-editing loop for this project. Once it got past about forty files I want a real editor and an agent inside it. Moved to Cursor, kept the generated scaffold.",
+      'project outgrew prompt-editing', 'high'],
+    ['outbound', 'Cursor', '2026-07-22', 'lena_w',
+      'reddit', "loved it for the first month. then every edit started costing credits and taking minutes and i realised i was fighting it. cursor for me now",
+      'edit latency and credit cost at scale', 'high'],
+    ['outbound', 'Cursor', '2026-06-15', 'ben.h',
+      'x', 'the honeymoon ends when you have a real codebase. moved to cursor + claude. still recommend it for the first weekend of a project though',
+      'wanted a real codebase workflow', 'high'],
+    ['outbound', 'Supabase + Next.js', '2026-08-05', 'nadia_r',
+      'hackernews', "We hit the ceiling on the generated backend and rewrote on Supabase and Next directly. Kept about 60% of the frontend, which is more than I expected honestly.",
+      'hit the generated-backend ceiling', 'high'],
+    ['outbound', 'Bolt', '2026-05-27', 'chrisd',
+      'reddit', "moved to bolt. genuinely a coin flip between them, bolt was just cheaper for my usage pattern",
+      'pricing at their usage level', 'high'],
+    ['outbound', 'Replit', '2026-04-08', 'tomas_v',
+      'reddit', "went back to replit. i wanted the terminal and the always-on hosting more than i wanted the generation",
+      'wanted terminal and always-on hosting', 'high'],
+    ['outbound', 'v0', '2026-03-02', 'aisha.k',
+      'x', "might move to v0 for the design system work, still deciding. the component output there is cleaner for our case",
+      'cleaner component output', 'low'],
+  ];
+
+  return rows.map(([direction, competitor, date, author, venue, quote, reason, confidence]) => ({
+    id: randomUUID().slice(0, 8),
+    direction,
+    competitor,
+    url: venue === 'hackernews'
+      ? 'https://news.ycombinator.com/item?id=44377495'
+      : venue === 'reddit'
+        ? 'https://www.reddit.com/r/lovable/'
+        : venue === 'linkedin'
+          ? 'https://www.linkedin.com/feed/'
+          : 'https://x.com/search?q=lovable',
+    venue,
+    date: `${date}T12:00:00.000Z`,
+    author,
+    quote,
+    reason,
+    confidence,
+  }));
+}
+
 /** The richest completed scan available, used for its real retrieval data.
  *  Read straight off disk rather than through the store, because the store
  *  strips scan bodies down for its index. */
@@ -489,6 +577,7 @@ const demo: Scan = {
   abuse: abuseFrom(source.company, mentions),
   buzz,
   topics: topicsOver(buzz.map((point) => point.bucket)),
+  migrations: migrationsMock(),
   feed: [...extraFeed(), ...source.feed]
     .sort((a, b) => (b.date ?? '').localeCompare(a.date ?? '')),
   log: [
