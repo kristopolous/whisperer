@@ -55,7 +55,7 @@ export function OutboxPanel({ onClose }: { onClose?: () => void }) {
   const held = (entries ?? []).filter((e) => e.status === 'held');
 
   return (
-    <>
+    <section className="card-stack">
       {onClose && <button className="ghost back-to-scans" onClick={onClose}>← Back to scans</button>}
 
       <div className="rubric">
@@ -127,6 +127,6 @@ export function OutboxPanel({ onClose }: { onClose?: () => void }) {
           </div>
         </div>
       )}
-    </>
+    </section>
   );
 }

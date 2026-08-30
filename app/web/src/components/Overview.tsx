@@ -72,13 +72,20 @@ export function Overview({
         </section>
       )}
 
-      {scan.migrations.length > 0 && (
+      {/* Shown once the pass that produces it has run, empty or not. Hiding the
+          panel when nobody switched makes "we read the corpus and found no
+          stated moves" — a real and reassuring answer — look identical to a
+          stage that never ran. `timings.buzz` is written whether the stage
+          succeeded or failed, so its presence is a reliable "this was read". */}
+      {(scan.migrations.length > 0 || scan.timings?.buzz !== undefined) && (
         <section>
           <div className="tape">
             <div className="tape-head">
               <h3>Who they switch to, and from</h3>
               <span style={{ font: '400 11px var(--mono)', color: 'var(--ink-3)' }}>
-                stated moves · {scan.migrations.length} in the window
+                {scan.migrations.length > 0
+                  ? `stated moves · ${scan.migrations.length} in the window`
+                  : 'stated moves · none'}
               </span>
             </div>
             <MigrationFlow migrations={scan.migrations} />

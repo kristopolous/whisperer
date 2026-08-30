@@ -1,18 +1,23 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type {
-  AbuseFinding, BuzzPoint, FeedItem, Issue, LogLevel, Mention, Profile, Scan, ScanEvent, Stage,
-  Subject, TopicPoint, Venue,
+  AbuseFinding, BuzzPoint, FeedItem, Issue, LogLevel, Mention, Migration, Profile, Scan, ScanEvent,
+  Stage, Subject, TopicPoint, Venue,
 } from '../shared/types.ts';
 import { brandToken } from '../shared/name.ts';
 import { repoFor } from './repos.ts';
 import { fetchUpstreamIssues } from './upstream.ts';
+import { searchHackerNews } from './sources/hackernews.ts';
+import { searchGithubIssues } from './sources/github-issues.ts';
+import { findAppReviews } from './sources/appstore.ts';
+import { searchReddit } from './reddit.ts';
 import { crawlSite } from './agents/crawl-run.ts';
 import { fetchAll } from './content.ts';
 import { runAgent } from './agents/runtime.ts';
 import { abuseAgent } from './agents/abuse.ts';
 import { buzzAgent } from './agents/buzz.ts';
 import { healthAgent } from './agents/health.ts';
+import { migrationsAgent } from './agents/migrations.ts';
 import { topicsAgent } from './agents/topics.ts';
 import { verdictAgent } from './agents/verdict.ts';
 import {
@@ -368,6 +373,16 @@ async function upstreamMentions(company: string, site: string, emit: Emit): Prom
   }
 }
 
+/** The subject's own repository as `owner/name`, so a source that searches all
+ *  of GitHub can leave out the tracker upstream.ts already reads properly. */
+function ownRepoOf(subject?: Subject): string | null {
+  const url = subject?.repo;
+  if (!url) return null;
+  const path = url.replace(/\.git$/, '').replace(/^https?:\/\/[^/]+\//, '').replace(/\/+$/, '');
+  const [owner, repo] = path.split('/');
+  return owner && repo ? `${owner}/${repo}` : null;
+}
+
 export async function findMentions(
   company: string, site: string, profiles: Profile[], emit: Emit, subject?: Subject,
 ): Promise<Mention[]> {
@@ -423,6 +438,15 @@ export async function findMentions(
     `site:producthunt.com ${brand}`,
     `site:substack.com ${brand}`,
     `site:hashnode.dev ${brand}`,
+    // AngelList's product and company discussion moved to Wellfound, and the
+    // old domain still resolves — so both are asked rather than guessing which
+    // one a given company is written up under.
+    `site:wellfound.com ${brand}`,
+    `site:angel.co ${brand}`,
+    // MetaFilter is small and old and its Ask sub-site is unusually good for
+    // this: long-form, first-person, and moderated hard enough that a thread is
+    // people's actual experience rather than marketing.
+    `site:metafilter.com ${brand}`,
 
     // Opinion, in the words people use when they are not writing a review.
     `"${brand}" review`,
@@ -672,14 +696,34 @@ export async function findMentions(
     + `${fresh} from the last ${RECENT_MONTHS} months`,
   );
 
-  // The project's own tracker, folded in with the public discussion.
+  // Everything above came through a web search engine, which is a real ceiling
+  // rather than a tuning problem: the corpus is whatever a general-purpose
+  // ranker decided to surface for a `site:` query, and no amount of query
+  // craft gets past what it chose to index and rank. Several of these venues
+  // publish their own corpus and will answer directly, exactly, and for free.
+  // Asked directly, Hacker News has eleven thousand comments about GIMP; asked
+  // through a search engine, it had a couple of dozen links.
   //
-  // These are defects somebody already wrote up properly, with versions and
-  // steps. They go in as mentions rather than as ready-made issues so triage
-  // sees both halves at once and can merge them: four people grumbling about a
-  // crash plus the filed bug describing it is one issue with five pieces of
-  // evidence, and knowing a ticket already exists changes what to do about it.
-  const upstream = await upstreamMentions(company, site, emit);
+  // All four run at once. They are independent HTTP calls against four
+  // different hosts, and running them in series added most of a minute to the
+  // stage for no reason. A source that fails resolves to an empty list rather
+  // than taking the stage down with it.
+  const [upstream, hn, ghIssues, appReviews, reddit] = await Promise.all([
+    // The project's own tracker. These are defects somebody already wrote up
+    // properly, with versions and steps. They go in as mentions rather than as
+    // ready-made issues so triage sees both halves at once and can merge them:
+    // four people grumbling about a crash plus the filed bug describing it is
+    // one issue with five pieces of evidence, and knowing a ticket already
+    // exists changes what to do about it.
+    upstreamMentions(company, site, emit),
+    searchHackerNews(brand, emit, { days: 365, limit: 80 }).catch(() => []),
+    searchGithubIssues(brand, emit, { ownRepo: ownRepoOf(subject), limit: 40 }).catch(() => []),
+    findAppReviews(brand, site, emit, 60).catch(() => []),
+    // Reddit through its own API rather than through `site:reddit.com`. Null
+    // when there are no credentials, which is not an error — the search path
+    // still covers reddit.com, just less deeply.
+    searchReddit([brand], emit, 25).then((found) => found ?? []).catch(() => []),
+  ]);
 
   const searched = ordered.map((hit) => ({
       id: randomUUID().slice(0, 8),
@@ -699,25 +743,49 @@ export async function findMentions(
       complaint: fromComplaints.has(hit.url),
   }));
 
-  // Interleaved, not prepended.
+  // Interleaved, not concatenated, and each source guaranteed a share.
   //
   // GIMP's tracker alone returned 46 open issues, which put in front would have
   // taken 46 of the 60 slots the model can afford to read and left fourteen for
   // everything the public said. Filed bugs are the easy half — already written
   // up, already triaged by whoever filed them — and the product exists for the
-  // half that is not. Two of theirs to one of ours keeps both in view.
+  // half that is not.
+  //
+  // The same argument now applies four ways, so the pools are round-robined
+  // rather than ranked against each other. Ranking them together would be
+  // ranking incomparable things: an app-store review is always fresher than an
+  // accumulated forum thread, a filed issue always reads as more concrete than
+  // somebody's aside, and whichever axis is chosen, one whole source
+  // disappears below the cut. Round-robin means no source can be starved by
+  // another being louder.
+  const filed = [...upstream, ...ghIssues];
+  const voices = [...hn, ...appReviews, ...reddit]
+    // Complaint-shaped first within this pool: these arrive unranked, straight
+    // from a date-sorted index, so nothing else has already surfaced the ones
+    // that matter.
+    .sort((a, b) => Number(Boolean(b.complaint)) - Number(Boolean(a.complaint)));
+
   const corpus: Mention[] = [];
-  for (let i = 0; i < Math.max(upstream.length, searched.length); i += 1) {
-    if (i < upstream.length) corpus.push(upstream[i]!);
-    if (i * 2 < searched.length) corpus.push(searched[i * 2]!);
-    if (i * 2 + 1 < searched.length) corpus.push(searched[i * 2 + 1]!);
+  const seenUrls = new Set<string>();
+  const take = (mention: Mention | undefined) => {
+    if (!mention || seenUrls.has(mention.url)) return;
+    seenUrls.add(mention.url);
+    corpus.push(mention);
+  };
+  for (let i = 0; i < Math.max(filed.length, voices.length, Math.ceil(searched.length / 2)); i += 1) {
+    take(filed[i]);
+    take(voices[i]);
+    take(searched[i * 2]);
+    take(searched[i * 2 + 1]);
   }
 
   const head = corpus.slice(0, SCORE_BUDGET);
+  const share = (pool: Mention[]) => head.filter((m) => pool.includes(m)).length;
   emit(
     'info',
     `the model will read ${head.filter((m) => m.complaint).length}/${head.length} complaint-bearing `
-    + `(${head.filter((m) => upstream.includes(m)).length} filed issues, the rest public discussion)`,
+    + `— ${share(filed)} filed issues, ${share(voices)} first-person posts and reviews, `
+    + `${share(searched)} from search`,
   );
 
   return corpus.slice(0, MENTION_CAP);
@@ -1530,4 +1598,157 @@ export function netSentiment(buzz: BuzzPoint[]): Scan['net'] {
   const recent = buzz.slice(-Math.max(1, buzz.length - half));
   const earlier = buzz.slice(0, Math.max(1, half));
   return { now: weighted(recent), delta: weighted(recent) - weighted(earlier) };
+}
+
+
+/* --------------------------------------------------------- migrations ----
+ *
+ *  Who arrived, who left, and what they said the reason was.
+ */
+
+/** The vocabulary of a switching claim.
+ *
+ *  Deliberately loose. This decides only which posts are worth a model's
+ *  attention, and the cost of the two errors is not symmetric: a false positive
+ *  costs a line in a prompt, and a false negative means a real departure never
+ *  gets read at all. The model is told, at length, that most of what reaches it
+ *  will not qualify.
+ *
+ *  Word boundaries throughout — "moved" must not fire on "removed", and an
+ *  earlier substring version of this kind of check matched "Boltt Evo" for a
+ *  scan of Bolt. */
+const SWITCHING = [
+  /\bswitch(?:ed|ing)?\s+(?:from|to|over|away)\b/i,
+  /\bmov(?:ed|ing)\s+(?:from|to|off|over|away)\b/i,
+  /\bmigrat(?:ed|ing|ion)\s+(?:from|to|off|away)\b/i,
+  /\bditch(?:ed|ing)\b/i,
+  /\bdropp?(?:ed|ing)\s+(?:it\s+)?(?:for|in favou?r)\b/i,
+  /\breplac(?:ed|ing)\s+\w+\s+with\b/i,
+  /\b(?:went|going|go)\s+back\s+to\b/i,
+  /\bjump(?:ed|ing)\s+ship\b/i,
+  /\bcancel+ed\s+(?:my|our)\s+\w*\s*(?:subscription|plan|account)\b/i,
+  /\b(?:used|use)\s+to\s+use\b/i,
+  /\bgave\s+up\s+on\b/i,
+  /\bcame\s+(?:over\s+)?from\b/i,
+  /\bin\s+favou?r\s+of\b/i,
+];
+
+/** How many candidates are read. A local model reads a batch of a dozen posts
+ *  in about a minute, and this runs inside a stage that already has a sentiment
+ *  pass in it — so the candidates are ranked and the tail is cut rather than
+ *  queued behind an unbounded loop. */
+const MIGRATION_BUDGET = Number(process.env.MIGRATION_BUDGET ?? 36);
+const MIGRATION_BATCH = 12;
+const MIGRATION_TIMEOUT_MS = 150_000;
+
+/** Scrape boilerplate that uses switching vocabulary and means nothing by it.
+ *
+ *  x.com serves "Please enable JavaScript or switch to a supported browser" to
+ *  anything without a browser engine, so every X result that failed to render
+ *  arrives carrying a perfect switching phrase. On one run that was four out of
+ *  four candidates. Sending those to a model to be told they are not migrations
+ *  is a minute of generation to learn something a string match already knows. */
+const BOILERPLATE = [
+  /switch to a supported browser/i,
+  /javascript is (?:disabled|not available)/i,
+  /enable javascript/i,
+];
+
+const hasSwitchingLanguage = (text: string) =>
+  !BOILERPLATE.some((pattern) => pattern.test(text))
+  && SWITCHING.some((pattern) => pattern.test(text));
+
+/** Read switching claims out of the mentions this scan already collected.
+ *
+ *  Never throws. This is one panel on a dashboard whose other panels are
+ *  already populated by the time it runs, and taking the sentiment stage down
+ *  because a churn chart could not be built would be a bad trade. A failure is
+ *  logged and the panel stays honest about being empty.
+ */
+export async function findMigrations(
+  company: string, mentions: Mention[], emit: Emit,
+): Promise<Migration[]> {
+  const candidates = mentions
+    .filter((mention) => hasSwitchingLanguage(`${mention.title} ${mention.excerpt}`))
+    // Discussion first, then the ones with a date — an undated migration cannot
+    // be placed on the flow chart and is worth less than a dated one.
+    .sort((a, b) =>
+      Number(b.discussion ?? true) - Number(a.discussion ?? true)
+      || Number(Boolean(b.date)) - Number(Boolean(a.date))
+      || (b.date ?? '').localeCompare(a.date ?? ''))
+    .slice(0, MIGRATION_BUDGET);
+
+  if (candidates.length === 0) {
+    emit('info', 'migrations: nothing in the corpus uses switching language');
+    return [];
+  }
+
+  emit('info', `migrations: reading ${candidates.length} of ${mentions.length} mentions that mention switching`);
+
+  const found: Migration[] = [];
+  let read = 0;
+
+  for (let start = 0; start < candidates.length; start += MIGRATION_BATCH) {
+    const batch = candidates.slice(start, start + MIGRATION_BATCH);
+    try {
+      const result = await runAgent<{
+        migrations: {
+          index: number; direction: 'inbound' | 'outbound'; competitor: string;
+          quote: string; reason: string; confidence: 'high' | 'low';
+        }[];
+      }>(migrationsAgent, {
+        prompt: `Product: "${company}". Which of these ${batch.length} posts describe somebody `
+          + 'actually switching to or away from it?\n\n'
+          + batch.map((mention, index) =>
+            `${index}: ${mention.title}\n${mention.excerpt.slice(0, 700)}`).join('\n\n'),
+        items: batch.length,
+        note: `posts ${start + 1}–${start + batch.length}`,
+        timeoutMs: MIGRATION_TIMEOUT_MS,
+      });
+      read += batch.length;
+
+      for (const claim of result.migrations ?? []) {
+        const mention = batch[claim.index];
+        // An index outside the batch is a model error with no safe repair: there
+        // is no way to tell which post was meant, and attaching a stranger's
+        // words to the wrong URL is worse than dropping the claim.
+        if (!mention) continue;
+        const competitor = (claim.competitor ?? '').trim();
+        const quote = (claim.quote ?? '').trim();
+        // No competitor and no quote, no claim. A migration with nothing to
+        // point at is an assertion, and this panel is only worth having if
+        // every bar on it can be traced back to a sentence someone wrote.
+        if (!competitor || !quote) continue;
+        // "They moved from GIMP to GIMP" is a misread, not a migration.
+        if (competitor.toLowerCase() === company.trim().toLowerCase()) continue;
+
+        found.push({
+          id: randomUUID().slice(0, 8),
+          direction: claim.direction === 'outbound' ? 'outbound' : 'inbound',
+          competitor,
+          url: mention.url,
+          venue: mention.venue,
+          date: mention.date,
+          author: mention.author,
+          quote,
+          reason: (claim.reason ?? '').trim(),
+          confidence: claim.confidence === 'high' ? 'high' : 'low',
+        });
+      }
+    } catch (error) {
+      // One bad batch is not the whole pass. Say so, and keep reading.
+      emit('warn', `migrations: batch ${start / MIGRATION_BATCH + 1} failed — ${
+        error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (read === 0) {
+    emit('warn', 'migrations: every batch failed, so the chart is empty because nothing was read — not because nobody switched');
+    return [];
+  }
+
+  const inbound = found.filter((move) => move.direction === 'inbound').length;
+  emit('info', `migrations: ${found.length} switching claims from ${read} posts read `
+    + `(${inbound} in, ${found.length - inbound} out)`);
+  return found;
 }

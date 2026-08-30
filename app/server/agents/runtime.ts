@@ -16,12 +16,12 @@
  *  in the same record, as steps on the run.
  */
 
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import type { Stage } from '../../shared/types.ts';
 import { askJsonDirect } from '../model.ts';
+import { currentRun } from '../run-context.ts';
 import type { AgentDefinition } from './types.ts';
 
 export type RunStatus = 'running' | 'ok' | 'failed';
@@ -119,18 +119,11 @@ export function statsFor(agentName: string): AgentStats {
   };
 }
 
-/** Which scan and stage the current work belongs to.
- *
- *  Carried in async context rather than threaded through every pipeline
- *  function as an extra parameter. The stage functions already take a company,
- *  a corpus and a log callback; adding a scan id to all of them — and to every
- *  caller — to satisfy bookkeeping would put the bookkeeping in the signature
- *  of the work. This keeps attribution automatic and correct across awaits.
- */
-const context = new AsyncLocalStorage<{ scanId?: string; stage?: Stage }>();
-
-export const withRunContext = <T>(value: { scanId?: string; stage?: Stage }, fn: () => T): T =>
-  context.run(value, fn);
+/* The run context — which scan and stage this is, and its cancellation
+ * signal — lives in ../run-context.ts so the model and search clients can read
+ * it without importing this module, which imports them. Re-exported here
+ * because `withRunContext` reads as part of the agent runtime's surface. */
+export { withRunContext, type RunContext } from '../run-context.ts';
 
 export interface RunOptions {
   prompt: string;
@@ -152,8 +145,8 @@ export async function runAgent<T>(agent: AgentDefinition, options: RunOptions): 
     id: randomUUID().slice(0, 8),
     agent: agent.name,
     title: agent.title,
-    scanId: options.scanId ?? context.getStore()?.scanId,
-    stage: options.stage ?? context.getStore()?.stage ?? agent.stage,
+    scanId: options.scanId ?? currentRun()?.scanId,
+    stage: options.stage ?? currentRun()?.stage ?? agent.stage,
     note: options.note,
     startedAt: new Date().toISOString(),
     status: 'running',

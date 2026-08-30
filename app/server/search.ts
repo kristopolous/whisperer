@@ -12,9 +12,11 @@
  */
 
 import { cleanText } from '../shared/html.ts';
-import { cached, HOUR } from './cache.ts';
+import { cached, DAY, HOUR } from './cache.ts';
 import { usableConnectors } from './config.ts';
 import { unwrapUntrusted } from './content.ts';
+import { bindingFor, connectorsForRole } from './roles.ts';
+import { abortable, throwIfCancelled } from './run-context.ts';
 import { callTool } from './mcp.ts';
 import { secret } from './secrets.ts';
 import type { Venue } from '../shared/types.ts';
@@ -158,6 +160,15 @@ const COMPLAINT_LANGUAGE = new RegExp([
 export const looksLikeComplaint = (hit: SearchHit): boolean =>
   COMPLAINT_LANGUAGE.test(`${hit.title} ${hit.description}`);
 
+/** The same test against plain text, for sources that are not search hits.
+ *
+ *  Exported so that a Hacker News comment, an app-store review and a Brave
+ *  result are all judged complaint-shaped by one rule. Two vocabularies would
+ *  drift, and the corpus would then mean something slightly different depending
+ *  on which source a mention came from — which is exactly the kind of thing
+ *  nobody notices until a count looks wrong. */
+export const complaintLanguage = (text: string): boolean => COMPLAINT_LANGUAGE.test(text);
+
 /** A bare domain root is a homepage, never a specific post or thread. */
 export function isHomepage(url: string): boolean {
   try {
@@ -172,6 +183,44 @@ export function isHomepage(url: string): boolean {
  *  re-running a scan while working on a downstream stage is free, short enough
  *  that a feed of "the newest discussion" is still newest. */
 const SEARCH_TTL = 6 * HOUR;
+
+/** How long a result stays good, by how narrow a window it asked for.
+ *
+ *  One TTL for every query was the expensive mistake. Six hours is right for
+ *  "what was said in the last day" and far too short for "what was ever said
+ *  about GIMP" — and the second kind is most of them. Measured on this
+ *  project's own cache: 679 of 1,246 entries had aged out at six hours, and
+ *  every one of those is a full-price request the next scan pays again. That is
+ *  how a 2,000-query monthly allowance went in a few days of iterating.
+ *
+ *  The window is already part of the cache key, so scaling the TTL to it costs
+ *  nothing and cannot make a fresh query stale: a `pd` search still expires in
+ *  hours, because that genuinely is a different answer tomorrow. An all-time
+ *  search is not. */
+const TTL_BY_WINDOW: Record<string, number> = {
+  pd: 6 * HOUR,
+  pw: 24 * HOUR,
+  pm: 3 * DAY,
+  py: 7 * DAY,
+  all: 7 * DAY,
+};
+
+const ttlFor = (freshness?: Freshness) => TTL_BY_WINDOW[freshness ?? 'all'] ?? SEARCH_TTL;
+
+/** Brave's free plan has a monthly quota as well as a per-second rate limit,
+ *  and 429s both of them. They need completely different responses: a rate
+ *  limit clears in a second, a spent quota does not clear this month.
+ *
+ *  Treating them the same is why a scan kept paying a wasted round trip per
+ *  query after the allowance was gone — a 0.7s request that could only fail,
+ *  plus 1.1s in the pacer behind it, on every one of ~250 queries. Once Brave
+ *  says the quota is spent, this stops asking and goes straight to the
+ *  connectors that hold the `search` role. */
+let braveQuotaSpent: { at: string; detail: string } | null = null;
+
+export const braveExhausted = () => braveQuotaSpent;
+
+const QUOTA_SPENT = /quota|QUOTA_LIMITED/i;
 
 /** Brave's freshness filter: pd/pw/pm/py, or an explicit `YYYY-MM-DDtoYYYY-MM-DD`. */
 export type Freshness = 'pd' | 'pw' | 'pm' | 'py' | (string & {});
@@ -200,38 +249,96 @@ export const MAX_COUNT = 20;
  *  fallback returns the first page only. A thinner result from the backup beats
  *  an empty one from the primary.
  */
-async function brightDataSearch(
+/** Read whatever shape a search server answered in.
+ *
+ *  There is no standard. Bright Data returns `{organic: [{link, title,
+ *  description, date}]}`; others return `{results: [...]}`, a bare array, or
+ *  `{items: [{url, snippet}]}`. Rather than a driver per server, this looks for
+ *  the first array of objects that have something URL-shaped on them and reads
+ *  the fields by the names they are commonly given. A server whose output it
+ *  cannot read yields nothing and says so at the call site — which is the same
+ *  outcome as not having it, and better than a driver that silently
+ *  misinterprets a field. */
+function readSearchPayload(text: string): SearchHit[] {
+  let parsed: unknown;
+  try {
+    const body = unwrapUntrusted(text);
+    const start = body.search(/[[{]/);
+    if (start === -1) return [];
+    parsed = JSON.parse(body.slice(start, Math.max(body.lastIndexOf('}'), body.lastIndexOf(']')) + 1));
+  } catch {
+    return [];
+  }
+
+  const pick = (row: Record<string, unknown>, names: string[]): string | null => {
+    for (const name of names) {
+      const value = row[name];
+      if (typeof value === 'string' && value.trim()) return value;
+    }
+    return null;
+  };
+
+  const rowsOf = (value: unknown): Record<string, unknown>[] => {
+    if (Array.isArray(value)) {
+      return value.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object');
+    }
+    if (value && typeof value === 'object') {
+      for (const key of ['organic', 'results', 'items', 'hits', 'data', 'web']) {
+        const found = rowsOf((value as Record<string, unknown>)[key]);
+        if (found.length) return found;
+      }
+    }
+    return [];
+  };
+
+  return rowsOf(parsed)
+    .map((row) => {
+      const url = pick(row, ['link', 'url', 'href', 'uri']);
+      if (!url) return null;
+      const age = pick(row, ['date', 'published', 'published_at', 'age']);
+      return {
+        title: cleanText(pick(row, ['title', 'name', 'heading']) ?? ''),
+        url,
+        description: cleanText(pick(row, ['description', 'snippet', 'summary', 'excerpt', 'text']) ?? ''),
+        age,
+        date: age ? parseAge(age, undefined) : null,
+      };
+    })
+    .filter((hit): hit is SearchHit => Boolean(hit));
+}
+
+/** Ask every connector that declares the `search` role, in config order, until
+ *  one answers with something.
+ *
+ *  This is what makes the role load-bearing rather than a label: installing an
+ *  MCP search server and marking it `search` is the whole of putting it into
+ *  discovery. Nothing here names a server. */
+async function mcpSearch(
   query: string, freshness?: Freshness,
 ): Promise<SearchHit[] | null> {
-  const connector = usableConnectors().find((c) => c.name === 'bright-data');
-  if (!connector) return null;
-
   const since = freshness === 'pd' ? 1 : freshness === 'pw' ? 7 : freshness === 'pm' ? 31 : freshness === 'py' ? 365 : 0;
+  // Freshness becomes Google's `after:` operator — coarser than Brave's
+  // windows but real, and understood by every general web search.
   const dated = since
     ? `${query} after:${new Date(Date.now() - since * 86_400_000).toISOString().slice(0, 10)}`
     : query;
 
-  try {
-    const result = await callTool(connector, 'search_engine', { query: dated, engine: 'google' }, 60_000);
-    if (result.isError) return null;
-
-    const body = unwrapUntrusted(result.text);
-    const parsed = JSON.parse(body.slice(body.indexOf('{'), body.lastIndexOf('}') + 1)) as {
-      organic?: { link?: string; title?: string; description?: string; date?: string }[];
-    };
-
-    return (parsed.organic ?? [])
-      .filter((row): row is typeof row & { link: string } => Boolean(row.link))
-      .map((row) => ({
-        title: cleanText(row.title ?? ''),
-        url: row.link,
-        description: cleanText(row.description ?? ''),
-        age: row.date ?? null,
-        date: row.date ? parseAge(row.date, undefined) : null,
-      }));
-  } catch {
-    return null;
+  for (const connector of connectorsForRole('search')) {
+    const binding = bindingFor(connector, 'search');
+    if (!binding) continue;
+    try {
+      const result = await callTool(
+        connector, binding.tool, { ...(binding.extra ?? {}), [binding.arg]: dated }, 60_000,
+      );
+      if (result.isError) continue;
+      const hits = readSearchPayload(result.text);
+      if (hits.length) return hits;
+    } catch {
+      // Try the next one. A search connector that is down is a reason to use
+      // another, not a reason to fail the query.
+    }
   }
+  return null;
 }
 
 export async function braveSearch(
@@ -246,24 +353,85 @@ export async function braveSearch(
   // Freshness is part of the cache key: the same query restricted to the last
   // year is a different question with a different answer.
   const cacheKey = `brave:${count}:${freshness ?? 'all'}:${offset}:${query}`;
-  return cached(`search`, cacheKey, SEARCH_TTL, () => serialize(async () => {
+  return cached(`search`, cacheKey, ttlFor(freshness), async () => {
+    // Checked here rather than only between stages. Discovery is hundreds of
+    // queries paced at one per 1.1 seconds, so a cancel that only took effect
+    // at the next stage boundary could be four minutes away — long enough that
+    // the button would read as broken.
+    throwIfCancelled();
+    // Nothing is left to ask Brave with, so do not spend a round trip finding
+    // that out again. The cache is still consulted above, which is the point —
+    // an exhausted quota does not make already-fetched results worthless.
+    if (braveQuotaSpent) {
+      const backup = await mcpSearch(query, freshness);
+      if (backup && backup.length) return backup;
+      throw new Error(`brave's monthly quota is spent and no search connector answered "${query}"`);
+    }
+
+    try {
+      return await serialize(() => braveCall(query, key, count, freshness, offset));
+    } catch (error) {
+      // The backup runs OUTSIDE the gate, which is the whole point of it.
+      //
+      // It used to run inside: the fallback was invoked from within the
+      // serialized Brave call, so every Bright Data request queued behind
+      // Brave's one-per-1.1s pacer AND held that pacer for its own round trip.
+      // The escape hatch inherited the exact rate limit it exists to escape,
+      // and a run that was 429ing on every query — which is what a large scan
+      // does — paid 1.1s of dead time before each backup call and blocked every
+      // other query while it ran. Out here the two providers are independent,
+      // and Brave being throttled costs nothing but Brave.
+      if (error instanceof RecoverableSearchError) {
+        const backup = await mcpSearch(query, freshness);
+        if (backup && backup.length) return backup;
+      }
+      throw error;
+    }
+  });
+}
+
+/** Rate limits and outages are what the backup is for. Anything else — a bad
+ *  key, a malformed query — would fail the same way there, so only the
+ *  recoverable ones are worth a second provider and a second wait. */
+class RecoverableSearchError extends Error {}
+
+async function braveCall(
+  query: string, key: string, count: number, freshness: Freshness | undefined, offset: number,
+): Promise<SearchHit[]> {
+  {
     const url = `${BRAVE_ENDPOINT}?${new URLSearchParams({
       q: query,
       count: String(Math.min(count, MAX_COUNT)),
       ...(offset ? { offset: String(Math.min(offset, MAX_PAGES - 1)) } : {}),
       ...(freshness ? { freshness } : {}),
     })}`;
-    const response = await fetch(url, {
-      headers: { 'X-Subscription-Token': key, Accept: 'application/json' },
-      signal: AbortSignal.timeout(20_000),
-    });
+    // A transport failure — timeout, connection reset, DNS — is as good a
+    // reason to try the other provider as a 429 is. Left unwrapped it
+    // propagates as a plain Error and skips the backup entirely, which is the
+    // one moment the backup is most obviously wanted.
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        headers: { 'X-Subscription-Token': key, Accept: 'application/json' },
+        signal: abortable(20_000),
+      });
+    } catch (error) {
+      throw new RecoverableSearchError(
+        `brave unreachable for "${query}": ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     if (!response.ok) {
-      // Rate limits and outages are exactly what the backup is for. Anything
-      // else — a bad key, a malformed query — would fail the same way there,
-      // so only the recoverable ones fall through.
       if (response.status === 429 || response.status >= 500) {
-        const backup = await brightDataSearch(query, freshness);
-        if (backup && backup.length) return backup;
+        // A 429 is two different problems wearing the same number. Brave says
+        // which in the body: `QUOTA_LIMITED` with a `quota_current` past the
+        // limit is the month gone, not a burst.
+        if (response.status === 429) {
+          const body = await response.text().catch(() => '');
+          if (QUOTA_SPENT.test(body)) {
+            braveQuotaSpent = { at: new Date().toISOString(), detail: body.slice(0, 300) };
+          }
+        }
+        throw new RecoverableSearchError(`brave ${response.status} for "${query}"`);
       }
       throw new Error(`brave ${response.status} for "${query}"`);
     }
@@ -284,7 +452,7 @@ export async function braveSearch(
         age: r.age ?? null,
         date: parseAge(r.age, r.page_age),
       }));
-  }));
+  }
 }
 
 /** Windows to try, narrowest first.
@@ -427,7 +595,10 @@ export function venueOf(url: string): Venue {
   if (onDomain(h, 'linkedin.com')) return 'linkedin';
   if (onDomain(h, 't.me')) return 'telegram';
   if (/review|trustpilot|g2\.com|capterra|producthunt/.test(h)) return 'review';
-  if (/forum|community|discourse|stackoverflow|stackexchange/.test(h)) return 'forum';
+  // MetaFilter named explicitly: it is a forum by every measure that matters
+  // here and by none that this pattern would catch — no "forum", "community" or
+  // "discourse" anywhere in the hostname.
+  if (/forum|community|discourse|stackoverflow|stackexchange|metafilter/.test(h)) return 'forum';
   if (/blog|medium\.com|substack|dev\.to|hashnode/.test(h)) return 'blog';
   return 'other';
 }
@@ -553,7 +724,13 @@ export function isLexicalNoise(hit: SearchHit): boolean {
  *  star averages, regenerated constantly so they always look fresh, which makes
  *  them the single most misleading thing that can reach the top of a
  *  recency-sorted brand watch. */
-const LISTING_HOSTS = /capterra|g2\.com|getapp|softwareadvice|trustradius|trustpilot|crozdesk|saasworthy|alternativeto|stackshare|slashdot|sourceforge|producthunt|product-hunt|gartner|softwaresuggest|goodfirms|aws\.amazon\.com\/marketplace/;
+// Wellfound and angel.co sit here with Product Hunt for the same reason: their
+// company pages are directory entries, so a hit is the product's own profile
+// rather than anybody's opinion of it. Still worth searching — a discussion
+// thread on one of them does turn up — but it must not be counted as discussion
+// by default. MetaFilter is deliberately absent: it is threads all the way
+// down, which is the whole reason to ask it.
+const LISTING_HOSTS = /capterra|g2\.com|getapp|softwareadvice|trustradius|trustpilot|crozdesk|saasworthy|alternativeto|stackshare|slashdot|sourceforge|producthunt|product-hunt|wellfound|angel\.co|gartner|softwaresuggest|goodfirms|aws\.amazon\.com\/marketplace/;
 
 /** Titles that mark a page as written for search engines rather than by someone
  *  with something to say. Deliberately aggressive: this only decides ranking,

@@ -17,6 +17,7 @@ import { fileTicketAgent } from './file-ticket.ts';
 import { fixAgent } from './fix.ts';
 import { footprintAgent } from './footprint.ts';
 import { healthAgent } from './health.ts';
+import { migrationsAgent } from './migrations.ts';
 import { resolveAgent } from './resolve.ts';
 import { respondAgent } from './respond-to-user.ts';
 import { siteAgent } from './site.ts';
@@ -35,6 +36,7 @@ export const AGENTS: AgentDefinition[] = [
   buzzAgent,
   verdictAgent,
   topicsAgent,
+  migrationsAgent,
   healthAgent,
   abuseAgent,
   fileTicketAgent,

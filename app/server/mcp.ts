@@ -15,6 +15,7 @@
  */
 
 import { enabledConnectors, missingCredentials, usableConnectors, type ConnectorConfig } from './config.ts';
+import type { ConnectorRole } from './roles.ts';
 
 /** MCP endpoints answer as plain JSON or as SSE frames depending on the server
  *  and the Accept header it decided to honour. Accept both. */
@@ -127,6 +128,10 @@ async function rpc<T>(
 export interface McpTool {
   name: string;
   description?: string;
+  /** The tool's declared arguments. Read when binding a tool to a role, so the
+   *  argument the query goes in is taken from the server's own schema rather
+   *  than assumed. */
+  inputSchema?: { properties?: Record<string, unknown>; required?: string[] };
 }
 
 /** Dialling the server is the only honest health check, so listing tools is
@@ -140,13 +145,61 @@ export interface ToolResult {
   isError: boolean;
 }
 
+/** Every tool call this process has made, per connector and tool.
+ *
+ *  Exists because the only way to find out what a metered connector had cost
+ *  was to log into the vendor's dashboard. Bright Data's counter said 553 of
+ *  5,000 units used and nothing here could account for a single one of them —
+ *  which also meant nothing could answer the more useful question, "is the
+ *  budget going where it should".
+ *
+ *  Deliberately in memory and per-process, like the connector session map. This
+ *  is for "what is this run spending", not billing; the vendor is the authority
+ *  on the total. */
+export interface ToolUsage {
+  connector: string;
+  tool: string;
+  calls: number;
+  errors: number;
+  ms: number;
+  lastAt: string;
+}
+
+const usage = new Map<string, ToolUsage>();
+
+export const toolUsage = (): ToolUsage[] =>
+  [...usage.values()].sort((a, b) => b.calls - a.calls);
+
+export const resetToolUsage = () => usage.clear();
+
+function record(connector: string, tool: string, ms: number, failed: boolean) {
+  const key = `${connector}:${tool}`;
+  const row = usage.get(key) ?? { connector, tool, calls: 0, errors: 0, ms: 0, lastAt: '' };
+  row.calls += 1;
+  if (failed) row.errors += 1;
+  row.ms += ms;
+  row.lastAt = new Date().toISOString();
+  usage.set(key, row);
+}
+
 /** Call one tool and flatten its content blocks to text. */
 export async function callTool(
   connector: ConnectorConfig, tool: string, args: Record<string, unknown>, timeoutMs = 60_000,
 ): Promise<ToolResult> {
-  const result = await rpc<{ content?: { type?: string; text?: string }[]; isError?: boolean }>(
-    connector, 'tools/call', { name: tool, arguments: args }, timeoutMs,
-  );
+  const started = Date.now();
+  let result: { content?: { type?: string; text?: string }[]; isError?: boolean };
+  try {
+    result = await rpc<{ content?: { type?: string; text?: string }[]; isError?: boolean }>(
+      connector, 'tools/call', { name: tool, arguments: args }, timeoutMs,
+    );
+  } catch (error) {
+    // Counted even when it fails. A metered provider generally bills the
+    // request, not the answer, so a call that errored is spend — and a
+    // connector burning budget on failures is precisely what this is for.
+    record(connector.name, tool, Date.now() - started, true);
+    throw error;
+  }
+  record(connector.name, tool, Date.now() - started, Boolean(result.isError));
   const text = (result.content ?? [])
     .filter((part) => part.type === 'text' && part.text)
     .map((part) => part.text!)
@@ -178,11 +231,26 @@ export interface ConnectorStatus {
   /** Round-trip time of the probe, so a connector that is technically up but
    *  takes nine seconds to list its tools is visible as such. */
   ms?: number;
+  url: string;
+  /** What this connector is declared to be for. */
+  roles: ConnectorRole[];
+  /** The subset of those that resolve to an actual tool, and therefore run. */
+  bound: ConnectorRole[];
 }
 
 async function probe(connector: ConnectorConfig): Promise<ConnectorStatus> {
   const missing = missingCredentials(connector);
-  const base = { name: connector.name, description: connector.description, missing };
+  const base = {
+    name: connector.name,
+    description: connector.description,
+    missing,
+    url: connector.url,
+    roles: connector.roles ?? [],
+    // Which of those roles actually resolve to a tool. A role declared but not
+    // bound is the state worth showing, because it looks configured and does
+    // nothing — which is what the whole connector list used to be.
+    bound: (connector.roles ?? []).filter((role) => Boolean(connector.bindings?.[role]?.tool)),
+  };
 
   if (missing.length) return { ...base, status: 'unconfigured', tools: 0 };
 

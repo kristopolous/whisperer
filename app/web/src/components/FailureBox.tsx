@@ -2,7 +2,7 @@ import { useCallback, useState } from 'react';
 import { STAGES, type Stage } from '../../../shared/types.ts';
 import { api } from '../lib.ts';
 
-type ErrorKind = 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'other';
+type ErrorKind = 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'busy' | 'other';
 
 interface ConnectorStatus {
   name: string;
@@ -23,6 +23,8 @@ export function FailureBox({
   running,
   onRetry,
   onRerunAll,
+  onStop,
+  stopping,
 }: {
   stage?: Stage;
   message: string;
@@ -31,6 +33,10 @@ export function FailureBox({
   running: boolean;
   onRetry: () => void;
   onRerunAll: () => void;
+  /** Offered on the busy notice — the run this refused to start on top of is
+   *  the one the person wants gone. */
+  onStop?: () => void;
+  stopping?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [connectors, setConnectors] = useState<ConnectorStatus[] | null>(null);
@@ -38,6 +44,31 @@ export function FailureBox({
 
   const label = stage ? (STAGES.find((s) => s.key === stage)?.label ?? stage) : 'pipeline';
   const hasConnectorRemedy = kind === 'connector' || kind === 'auth';
+
+  // Being busy is not a failure, and dressing it as one is actively misleading:
+  // it puts a red "didn't finish" header and a "most failures here are
+  // transient, hit Rerun" instruction on top of a run that is working fine.
+  // Following that advice is the one thing that cannot help — the second run is
+  // refused for the same reason, so the box reappears and reads as a loop.
+  if (kind === 'busy') {
+    return (
+      <div className="panel">
+        <div className="notice">
+          <span className="tag warning">already running</span>
+          <span>
+            {message} It keeps going on the server whether or not the dashboard is watching, so its
+            results will be there when it finishes — reload to watch it, or stop it and keep
+            whatever it has collected so far.
+          </span>
+          {onStop && (
+            <button className="rerun" onClick={onStop} disabled={stopping}>
+              {stopping ? 'Stopping…' : '■ Stop it'}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   const check = useCallback(async (reconnect: boolean) => {
     setChecking(true);

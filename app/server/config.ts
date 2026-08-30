@@ -26,6 +26,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { hasSecret, secret } from './secrets.ts';
+import type { ConnectorRole, RoleBinding } from './roles.ts';
 
 const CONFIG_DIR = path.resolve(import.meta.dirname, '../../config');
 
@@ -77,7 +78,7 @@ export function loadConfig<T>(name: string): LoadedConfig<T> {
  *  with the real key, so saving it would quietly bake a live secret into a file
  *  that only stays out of git because of a gitignore rule. Edit the raw text,
  *  write the raw text. */
-function loadRaw<T>(name: string): { value: T; wroteFrom: 'real' | 'example' } {
+export function loadRaw<T>(name: string): { value: T; wroteFrom: 'real' | 'example' } {
   const real = path.join(CONFIG_DIR, `${name}.json`);
   const example = path.join(CONFIG_DIR, `${name}.example.json`);
   const source = existsSync(real) ? real : example;
@@ -89,7 +90,7 @@ function loadRaw<T>(name: string): { value: T; wroteFrom: 'real' | 'example' } {
 
 /** Save to `config/<name>.json`, never to the committed example. The first
  *  edit on a machine running off the example seeds the real file from it. */
-function writeRaw<T>(name: string, value: T): void {
+export function writeRaw<T>(name: string, value: T): void {
   writeFileSync(path.join(CONFIG_DIR, `${name}.json`), JSON.stringify(value, null, 2) + '\n');
 }
 
@@ -114,6 +115,14 @@ export interface ConnectorConfig {
     | { type: 'query'; param: string; value: string };
   /** Set false to keep an entry documented but out of the running set. */
   enabled?: boolean;
+  /** What this connector is for, and therefore where the pipeline uses it.
+   *  A list: bright-data really is both a search engine and a scraper. See
+   *  app/server/roles.ts. */
+  roles?: ConnectorRole[];
+  /** Which tool serves each declared role, and what its argument is called.
+   *  Bound once when the server is added rather than guessed per call, so a
+   *  renamed tool is a visible settings error instead of a silent empty. */
+  bindings?: Partial<Record<ConnectorRole, RoleBinding>>;
 }
 
 let connectorCache: LoadedConfig<{ connectors: ConnectorConfig[] }> | null = null;
@@ -157,8 +166,75 @@ export const usableConnectors = (): ConnectorConfig[] =>
  *  Only the fields a person can sensibly own from a UI: where it lives, and
  *  whether it is in play. Credentials are deliberately not editable here —
  *  those belong in .env, and `requires` is what ties the two together. */
+/** Install a new MCP server.
+ *
+ *  Writes to the raw config so a `${VAR}` in an existing entry is not flattened
+ *  into its resolved value on the way past — the same discipline every other
+ *  writer here follows, and the reason credentials survive an edit.
+ *
+ *  Deliberately does NOT probe. Adding the row and finding out whether it
+ *  answers are separate steps with separate failures: a server that is added
+ *  but unreachable is a real, common state (it is not running yet, the token is
+ *  not pasted yet) and refusing to record it means the person has nowhere to
+ *  put the URL while they fix that. */
+export function addConnector(entry: {
+  name: string;
+  url: string;
+  description?: string;
+  requires?: string[];
+  roles?: ConnectorRole[];
+  auth?: ConnectorConfig['auth'];
+}): ConnectorConfig {
+  const name = entry.name.trim();
+  // The name is an identifier: it keys the session map, the run trace and the
+  // credential list, and it appears in a URL path.
+  if (!/^[a-z0-9][a-z0-9._-]{0,48}$/i.test(name)) {
+    throw new Error('a connector name must be letters, numbers, dot, dash or underscore');
+  }
+  try {
+    new URL(entry.url);
+  } catch {
+    throw new Error(`"${entry.url}" is not a valid URL`);
+  }
+
+  const raw = loadRaw<{ connectors: ConnectorConfig[] }>('connectors');
+  if (raw.value.connectors.some((c) => c.name.toLowerCase() === name.toLowerCase())) {
+    throw new Error(`there is already a connector called "${name}"`);
+  }
+
+  const connector: ConnectorConfig = {
+    name,
+    url: entry.url,
+    description: entry.description?.trim() || 'Added from the settings screen.',
+    ...(entry.requires?.length ? { requires: entry.requires } : {}),
+    ...(entry.roles?.length ? { roles: entry.roles } : {}),
+    ...(entry.auth ? { auth: entry.auth } : {}),
+  };
+  raw.value.connectors.push(connector);
+  writeRaw('connectors', raw.value);
+  reloadConfig();
+  return connector;
+}
+
+/** Remove a connector. Only ever called for one somebody added by hand — the
+ *  shipped entries are documentation as much as configuration. */
+export function removeConnector(name: string): void {
+  const raw = loadRaw<{ connectors: ConnectorConfig[] }>('connectors');
+  const before = raw.value.connectors.length;
+  raw.value.connectors = raw.value.connectors.filter((c) => c.name !== name);
+  if (raw.value.connectors.length === before) throw new Error(`no connector named "${name}"`);
+  writeRaw('connectors', raw.value);
+  reloadConfig();
+}
+
 export function patchConnector(
-  name: string, changes: { url?: string; enabled?: boolean },
+  name: string,
+  changes: {
+    url?: string;
+    enabled?: boolean;
+    roles?: ConnectorRole[];
+    bindings?: Partial<Record<ConnectorRole, RoleBinding>>;
+  },
 ): ConnectorConfig {
   const raw = loadRaw<{ connectors: ConnectorConfig[] }>('connectors');
   const connector = raw.value.connectors.find((c) => c.name === name);
@@ -175,6 +251,12 @@ export function patchConnector(
     connector.url = changes.url;
   }
   if (changes.enabled !== undefined) connector.enabled = changes.enabled;
+  if (changes.roles !== undefined) connector.roles = changes.roles;
+  if (changes.bindings !== undefined) {
+    // Merged, not replaced: binding a server's search tool must not silently
+    // drop the scrape binding it already had.
+    connector.bindings = { ...(connector.bindings ?? {}), ...changes.bindings };
+  }
 
   writeRaw('connectors', raw.value);
   connectorCache = null;
@@ -206,6 +288,9 @@ export interface InferenceHost {
  *  worse at the second, so pinning both to one endpoint means either paying
  *  for a coding model to score tweets or asking a chat model to patch C. */
 export type ModelRole = 'general' | 'coding';
+
+/** Every role, so a save can reason about the ones a host did NOT claim. */
+export const MODEL_ROLES: ModelRole[] = ['general', 'coding'];
 
 export interface InferenceConfig {
   /** Key into `hosts`, used when a role has no host of its own. */
@@ -279,8 +364,20 @@ export function patchInferenceHost(
   config.hosts[hostKey] = host;
   if (changes.makeDefault) config.default = hostKey;
   if (changes.roles) {
+    // The list is the complete set of roles THIS host handles, so a role
+    // missing from it must be taken away — not merely left alone.
+    //
+    // The loop here only ever assigned, which made unticking a role a no-op
+    // that looked like a failed save: the box came back ticked because nothing
+    // had in fact changed. Roles it does not claim are deleted rather than
+    // pointed somewhere else, so they fall back to `default` — which is what
+    // "this host no longer does the coding" should mean when no other host has
+    // volunteered for it.
     config.roles = { ...config.roles };
-    for (const role of changes.roles) config.roles[role] = hostKey;
+    for (const role of MODEL_ROLES) {
+      if (changes.roles.includes(role)) config.roles[role] = hostKey;
+      else if (config.roles[role] === hostKey) delete config.roles[role];
+    }
   }
 
   writeRaw('inference', config);

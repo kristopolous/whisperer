@@ -42,6 +42,21 @@ function hashFor(id: string, tab: Tab): string {
   return `#/scan/${id}/${tab}`;
 }
 
+/** The full-page views that are not a scan.
+ *
+ *  These used to be React state with `#/` in the location, so the URL said
+ *  nothing about what was on screen: a reload from Settings — or ctrl+R, or a
+ *  restored session, or sending someone the link — landed back on the scan
+ *  view. They are real destinations, so they get real routes. */
+const VIEWS = ['settings', 'agents', 'outbox'] as const;
+type View = (typeof VIEWS)[number];
+const VIEW_RE = /^#\/(settings|agents|outbox)\b/i;
+
+function parseView(): View | null {
+  const m = window.location.hash.match(VIEW_RE);
+  return m ? (m[1]!.toLowerCase() as View) : null;
+}
+
 const BLANK: Scan = {
   id: '', company: '', site: '', createdAt: '', status: 'done', stage: 'queued',
   profiles: [], mentions: [], issues: [], abuse: [], buzz: [], topics: [], migrations: [], reviews: [],
@@ -82,38 +97,51 @@ export function App() {
   const [stageStart, setStageStart] = useState<number>(Date.now());
   const [clock, setClock] = useState<number>(Date.now());
 
-  const openSettings = useCallback(() => {
-    setShowSettings(true);
-    setShowAgents(false);
-    setShowOutbox(false);
-    source.current?.close();
-    window.location.hash = '#/';
+  /** Put one of the full-page views on screen. Exactly one at a time. */
+  const applyView = useCallback((view: View | null) => {
+    setShowSettings(view === 'settings');
+    setShowAgents(view === 'agents');
+    setShowOutbox(view === 'outbox');
   }, []);
 
-  const closeSettings = useCallback(() => setShowSettings(false), []);
+  /** Open a full-page view by navigating to it.
+   *
+   *  Only the hash is set here; the hashchange listener applies the state. One
+   *  path in means the URL and what is rendered cannot disagree, which is
+   *  exactly what went wrong when these were state-only — and it makes the
+   *  back button work for free. */
+  const openView = useCallback((view: View) => {
+    source.current?.close();
+    const target = `#/${view}`;
+    if (window.location.hash === target) applyView(view);
+    else window.location.hash = target;
+  }, [applyView]);
+
+  const openSettings = useCallback(() => openView('settings'), [openView]);
+
+  /** Leaving a full-page view goes back to the scan that was open, when there
+   *  was one — the hash is the only record of that, and dropping to `#/` would
+   *  make "back to scans" quietly mean "back to nothing". */
+  const closeView = useCallback(() => {
+    const id = scanIdRef.current;
+    window.location.hash = id ? hashFor(id, 'overview') : '#/';
+    setShowSettings(false);
+    setShowAgents(false);
+    setShowOutbox(false);
+  }, []);
+
+  const closeSettings = closeView;
 
   // The agent list is deliberately not a scan tab: it is about the machinery
   // rather than about one company's results, and it stays useful — arguably is
   // most useful — when a scan has just failed and there is nothing to show.
-  const openOutbox = useCallback(() => {
-    setShowOutbox(true);
-    setShowAgents(false);
-    setShowSettings(false);
-    source.current?.close();
-    window.location.hash = '#/';
-  }, []);
+  const openOutbox = useCallback(() => openView('outbox'), [openView]);
 
-  const closeOutbox = useCallback(() => setShowOutbox(false), []);
+  const closeOutbox = closeView;
 
-  const openAgents = useCallback(() => {
-    setShowAgents(true);
-    setShowOutbox(false);
-    setShowSettings(false);
-    source.current?.close();
-    window.location.hash = '#/';
-  }, []);
+  const openAgents = useCallback(() => openView('agents'), [openView]);
 
-  const closeAgents = useCallback(() => setShowAgents(false), []);
+  const closeAgents = closeView;
 
   /** Delete a company's scans, then reconcile the view.
    *
@@ -136,6 +164,31 @@ export function App() {
       window.location.hash = '#/';
     }
   }, []);
+
+  const [stopping, setStopping] = useState(false);
+
+  /** Ask the running scan to stop.
+   *
+   *  Optimistic only as far as the button label: the run is not marked
+   *  cancelled here. It stops at its own next checkpoint and reports that over
+   *  the stream, so what the dashboard shows is what actually happened rather
+   *  than what was requested. */
+  const stop = useCallback(async () => {
+    const id = scanIdRef.current;
+    if (!id) return;
+    setStopping(true);
+    try {
+      await api<{ stopping: boolean }>(`api/scans/${id}/cancel`, { method: 'POST', body: '{}' });
+    } catch {
+      // Nothing to do about a failed cancel but let the run carry on; the
+      // stream will say what it is doing.
+      setStopping(false);
+    }
+  }, []);
+
+  // The button resets when the run settles, however it settled — cancelled,
+  // finished, or failed on its own before the cancel arrived.
+  useEffect(() => { if (!running) setStopping(false); }, [running]);
 
   const login = useCallback(() => {
     sessionStorage.setItem('whisperer.auth', '1');
@@ -171,6 +224,18 @@ useEffect(() => {
   }, [running]);
   const applyHash = useCallback(async (id: string, tab: Tab) => {
     source.current?.close();
+    // Opening a scan means leaving whatever full-page view was up: settings,
+    // the agent list and the outbox all render instead of the scan, so a rail
+    // click behind one of them would load the scan invisibly and read as the
+    // click having done nothing.
+    //
+    // Belt and braces with the hash sync, which also clears them. This path can
+    // be reached without a hashchange — `open` calls straight through when the
+    // hash already names the scan — and a stale view flag here means a loaded
+    // scan that cannot be seen.
+    setShowSettings(false);
+    setShowAgents(false);
+    setShowOutbox(false);
     // Update the selection synchronously (before the async fetch yields) so any
     // rerun / tab action taken in the load window targets THIS scan, not the
     // one that was on screen a moment ago.
@@ -189,15 +254,24 @@ useEffect(() => {
     }
   }, []);
 
+  // The single place the URL becomes state, for every kind of destination.
+  // Runs once on mount too, which is what makes ctrl+R come back to where you
+  // were rather than to the scan view.
   useEffect(() => {
     const sync = () => {
+      const view = parseView();
+      if (view) {
+        applyView(view);
+        return;
+      }
+      applyView(null);
       const hit = parseHash();
       if (hit) void applyHash(hit.id, hit.tab);
     };
     sync();
     window.addEventListener('hashchange', sync);
     return () => window.removeEventListener('hashchange', sync);
-  }, [applyHash]);
+  }, [applyHash, applyView]);
 
   /** Open a scan from the rail: point the URL at it and let the hash change load it. */
   const open = useCallback((id: string) => {
@@ -430,7 +504,9 @@ useEffect(() => {
         <div className="masthead-tag">reputation forensics</div>
         <div className="rig">
           <span className={`lamp ${running ? 'busy' : rig ? 'live' : ''}`} />
-          {rig ? `${rig.model} · ${rig.servers.length} connectors` : 'no api'}
+          <span className="rig-model" title={rig ? `${rig.model} · ${rig.servers.length} connectors` : 'no api'}>
+            {rig ? `${rig.model} · ${rig.servers.length} connectors` : 'no api'}
+          </span>
           <button className="logout" onClick={openAgents} title="Agents and their runs">agents</button>
           <button className="logout" onClick={openOutbox} title="Replies drafted but never sent">outbox</button>
           <button className="logout" onClick={openSettings} title="Connector API keys">settings</button>
@@ -495,6 +571,21 @@ useEffect(() => {
             </div>
           )}
 
+          {/* Said once, at the top, before any number below it is read. The
+              fixture's retrieval data is real and its judgements are not, and
+              that is not a distinction anyone can make by looking at a chart. */}
+          {scan.fixture && (
+            <div className="notice">
+              <span className="tag warning">demonstration</span>
+              <span>
+                A seeded fixture, not a scan. The accounts, mentions and links are real and were
+                collected by a genuine run; the sentiment scores, the issues and the verdict were
+                written by hand to show a populated dashboard. Nothing here is a finding about
+                {' '}{scan.company}.
+              </span>
+            </div>
+          )}
+
           {(hasScan || running) && (
             <div className="subject">
               <h1>{scan.company}</h1>
@@ -527,6 +618,12 @@ useEffect(() => {
                       <span className="clock-label">total</span>
                       <span className={`clock-time ${clock - runStart > 25 * 60_000 ? 'warn' : ''}`}>{fmtElapsed(clock - runStart)}</span>
                     </span>
+                    {/* Next to the clock deliberately: the moment somebody
+                        wants to stop a run is the moment they are watching how
+                        long it has taken. */}
+                    <button className="rerun" onClick={stop} disabled={stopping}>
+                      {stopping ? 'Stopping…' : '■ Stop'}
+                    </button>
                   </div>
                   <span className="steps">
                     {STAGES.map((step, i) => {
@@ -577,6 +674,8 @@ useEffect(() => {
               running={rerunningStage !== null}
               onRetry={() => scan.failedStage && rerun([scan.failedStage])}
               onRerunAll={() => rerun(STAGES.map((s) => s.key))}
+              onStop={stop}
+              stopping={stopping}
             />
           )}
 
@@ -681,6 +780,7 @@ useEffect(() => {
                       onChange={(issue: Issue) =>
                         setScan((s) => ({ ...s, issues: s.issues.map((i) => (i.id === issue.id ? issue : i)) }))
                       }
+                      onScan={(changes) => setScan((s) => ({ ...s, ...changes }))}
                     />
                   </section>
                 )}

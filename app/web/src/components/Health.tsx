@@ -16,7 +16,11 @@ const SEVERITY_ORDER: Issue['severity'][] = ['critical', 'serious', 'warning', '
 /** Health is a docket: the catalogue on the left, the incident report on the
  *  right. One issue is selected at all times so the report is never an empty
  *  frame waiting for a click. */
-export function Health({ scan, onChange }: { scan: Scan; onChange: (issue: Issue) => void }) {
+export function Health({ scan, onChange, onScan }: {
+  scan: Scan;
+  onChange: (issue: Issue) => void;
+  onScan: (changes: Partial<Scan>) => void;
+}) {
   const [query, setQuery] = useState('');
   const all = [...scan.issues].sort(
     (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity),
@@ -103,6 +107,7 @@ export function Health({ scan, onChange }: { scan: Scan; onChange: (issue: Issue
 
   return (
     <div className="panel">
+      <WriteTarget scan={scan} onScan={onScan} />
       <div className="docket">
         <div className="docket-list" role="listbox" aria-label="Issue catalogue">
           <Filter
@@ -134,7 +139,7 @@ export function Health({ scan, onChange }: { scan: Scan; onChange: (issue: Issue
             </button>
           ))}
         </div>
-        <Report scan={scan} issue={issue} onChange={onChange} />
+        <Report scan={scan} issue={issue} onChange={onChange} onScan={onScan} />
       </div>
     </div>
   );
@@ -142,7 +147,13 @@ export function Health({ scan, onChange }: { scan: Scan; onChange: (issue: Issue
 
 interface Payload { tracker: Tracker; title: string; body: string; labels: string[]; endpoint: string }
 
-function Report({ scan, issue, onChange }: { scan: Scan; issue: Issue; onChange: (issue: Issue) => void }) {
+function Report({ scan, issue, onChange, onScan }: {
+  scan: Scan; issue: Issue; onChange: (issue: Issue) => void; onScan: (changes: Partial<Scan>) => void;
+}) {
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [pr, setPr] = useState<{ number: number; url: string } | null>(null);
+  const [opening, setOpening] = useState(false);
+  const [prError, setPrError] = useState<string | null>(null);
   const [payload, setPayload] = useState<Payload | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -162,7 +173,8 @@ function Report({ scan, issue, onChange }: { scan: Scan; issue: Issue; onChange:
   // say so instead of failing when pressed.
   // Either configured, or worked out from what was typed in — pasting a repo
   // URL should be enough to get a diagnosis without also editing a config file.
-  const hasRepo = Boolean(scan.subject?.repo)
+  const hasRepo = Boolean(scan.workspace)
+    || Boolean(scan.subject?.repo)
     || (repos ?? []).some((r) => r.company.toLowerCase() === scan.company.trim().toLowerCase());
 
   /** Read the source, then patch it, in one go.
@@ -240,16 +252,36 @@ function Report({ scan, issue, onChange }: { scan: Scan; issue: Issue; onChange:
     } finally { setBusy(false); }
   };
 
+  /** File it — which for GitHub now means actually filing it.
+   *
+   *  The other trackers still only record that a person filed it by hand, and
+   *  the button says which of the two is happening. Marking an issue "filed"
+   *  when nothing was sent is the kind of lie this panel exists to prevent, so
+   *  a GitHub attempt that is refused (no fork, no token) reports the refusal
+   *  rather than quietly falling back to the marker. */
   const file = async () => {
     if (!payload) return;
     setBusy(true);
+    setFileError(null);
     try {
+      if (payload.tracker === 'github') {
+        const result = await api<{ filed: boolean; reason: string; issue: Issue }>(
+          `api/scans/${scan.id}/issues/${issue.id}/ticket`,
+          { method: 'POST', body: JSON.stringify({ tracker: 'github', submit: true }) },
+        );
+        if (!result.filed) { setFileError(result.reason); return; }
+        onChange(result.issue);
+        return;
+      }
+
       if (payload.tracker === 'clipboard') {
         await navigator.clipboard.writeText(`${payload.title}\n\n${payload.body}`);
       }
       onChange(await api(`api/scans/${scan.id}/issues/${issue.id}/file`, {
         method: 'POST', body: JSON.stringify({ tracker: payload.tracker }),
       }));
+    } catch (error) {
+      setFileError(String(error).replace(/^Error:\s*/, '').slice(0, 300));
     } finally { setBusy(false); }
   };
 
@@ -289,10 +321,12 @@ function Report({ scan, issue, onChange }: { scan: Scan; issue: Issue; onChange:
       <ResolutionLoop issue={issue} />
 
       <h5>Go into the source</h5>
+      <WorkspacePicker scan={scan} onScan={onScan} />
       {!hasRepo ? (
         <p className="q">
-          No repository is configured for <b>{scan.company}</b>. Add it to <code>config/repos.json</code>
-          {' '}to diagnose this against real code.
+          No public repository is known for <b>{scan.company}</b>, and no workspace checkout is
+          selected — so there is nothing to read this against yet. Pick one above, or add the
+          repository to <code>config/repos.json</code>.
         </p>
       ) : (
         <>
@@ -318,6 +352,57 @@ function Report({ scan, issue, onChange }: { scan: Scan; issue: Issue; onChange:
       {issue.diagnosis && <DiagnosisView diagnosis={issue.diagnosis} />}
       {issue.fix && <FixView fix={issue.fix} />}
 
+      {issue.fix && (
+        <>
+          {/* A pull request is only offered for a patch that earned one. A
+              green suite on a test that never failed proves nothing, and
+              opening a PR on the strength of it is how a wrong fix gets
+              merged — so the button is not there to be pressed hopefully. */}
+          {!issue.fix.tests.passed ? (
+            <p className="q">
+              The suite did not pass on this patch, so there is no pull request to open. Try again, or
+              read the failure above.
+            </p>
+          ) : !scan.fork ? (
+            <p className="q">
+              Fork the project first — the button is at the top of this panel. Every pull request this
+              writes goes to your own fork, never to {scan.company}.
+            </p>
+          ) : (
+            <>
+              <div className="actions">
+                <button
+                  className="primary"
+                  disabled={opening || Boolean(pr)}
+                  onClick={async () => {
+                    setOpening(true);
+                    setPrError(null);
+                    try {
+                      const result = await api<{ pr: { number: number; url: string }; issue: Issue }>(
+                        `api/scans/${scan.id}/issues/${issue.id}/pr`, { method: 'POST', body: '{}' },
+                      );
+                      setPr(result.pr);
+                      onChange(result.issue);
+                    } catch (error) {
+                      setPrError(String(error).replace(/^Error:\s*/, '').slice(0, 300));
+                    } finally { setOpening(false); }
+                  }}
+                >
+                  {opening ? 'Opening…' : pr ? `Opened #${pr.number}` : `Open a pull request on ${scan.fork}`}
+                </button>
+                {pr && <a className="conn-meta" href={pr.url} target="_blank" rel="noreferrer">view it</a>}
+              </div>
+              <p className="q">
+                Commits the patched files to a new branch on <code>{scan.fork}</code> and opens the pull
+                request against that fork's own default branch. The upstream project is not touched and
+                is never notified.
+              </p>
+              {prError && <p className="conn-err">{prError}</p>}
+            </>
+          )}
+        </>
+      )}
+
       <h5>Reply to the people who raised it</h5>
       <p className="reply">{issue.draftReply}</p>
 
@@ -340,11 +425,26 @@ function Report({ scan, issue, onChange }: { scan: Scan; issue: Issue; onChange:
           <pre className="payload">{`# ${payload.title}\nlabels: ${payload.labels.join(', ')}\nvia: ${payload.endpoint}\n\n${payload.body}`}</pre>
           <div className="actions">
             <button className="primary" onClick={file} disabled={busy}>
-              {payload.tracker === 'clipboard' ? 'Copy and mark filed' : `Send to ${payload.tracker}`}
+              {busy && payload.tracker === 'github' ? 'Writing the ticket…'
+                : payload.tracker === 'clipboard' ? 'Copy and mark filed'
+                  : payload.tracker === 'github' ? `File on ${scan.fork ?? 'your fork'}`
+                    : `Send to ${payload.tracker}`}
             </button>
             <button onClick={() => setPayload(null)}>Discard</button>
           </div>
-          {payload.tracker !== 'clipboard' && (
+          {fileError && <p className="conn-err">{fileError}</p>}
+          {payload.tracker === 'github' && (
+            <div className="notice ok" style={{ marginTop: 10 }}>
+              <span className="tag good">this one really files</span>
+              <span>
+                The ticket is rewritten from what the reporters actually wrote — repro steps,
+                expected and actual — and opened on your fork, with the audit header saying who
+                raised it and whether they have been contacted. Every later step of the loop is
+                appended to it as a comment.
+              </span>
+            </div>
+          )}
+          {payload.tracker !== 'clipboard' && payload.tracker !== 'github' && (
             <div className="notice" style={{ marginTop: 10 }}>
               <span className="tag warning">not connected</span>
               <span>
@@ -455,6 +555,180 @@ function FixView({ fix }: { fix: NonNullable<Issue['fix']> }) {
       {fix.diff && <pre className="payload">{fix.diff.slice(0, 6000)}</pre>}
       {!fix.tests.passed && <pre className="payload">{fix.tests.output.slice(0, 2000)}</pre>}
       {fix.notes && <p className="q">{fix.notes}</p>}
+    </div>
+  );
+}
+
+/** Where anything this panel writes will land.
+ *
+ *  This band exists because the answer is not obvious and getting it wrong is
+ *  the one unrecoverable mistake here. Filing a model-written ticket, or
+ *  opening a model-written pull request, on somebody else's project wastes a
+ *  maintainer's afternoon and cannot be undone by deleting it — they have
+ *  already read it. So the destination is stated before either action is
+ *  offered, in the same place the actions are.
+ *
+ *  The write path refuses a repository the token does not own regardless of
+ *  what this says (see channels/fork.ts). This is the part that means you never
+ *  have to find that out by being refused.
+ */
+function WriteTarget({ scan, onScan }: { scan: Scan; onScan: (changes: Partial<Scan>) => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const upstream = scan.subject?.repo;
+  if (!upstream) return null;
+
+  const short = upstream.replace(/^https?:\/\/(www\.)?github\.com\//i, '').replace(/\.git$/, '');
+
+  if (scan.fork) {
+    return (
+      <div className="notice ok">
+        <span className="tag good">writing to your fork</span>
+        <span>
+          Tickets and pull requests go to{' '}
+          <a href={`https://github.com/${scan.fork}`} target="_blank" rel="noreferrer"><code>{scan.fork}</code></a>,
+          a fork of <code>{short}</code>. The project itself is never written to.
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="notice">
+      <span className="tag warning">nowhere to file</span>
+      <span>
+        This scan's project is <code>{short}</code>, which is not yours to write to. Fork it and
+        everything from here — tickets, comments, pull requests — goes to your copy instead.
+      </span>
+      <button
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          setError(null);
+          try {
+            const result = await api<{ fork: { fullName: string } }>(
+              `api/scans/${scan.id}/fork`, { method: 'POST', body: '{}' },
+            );
+            onScan({ fork: result.fork.fullName });
+          } catch (e) {
+            setError(String(e).replace(/^Error:\s*/, '').slice(0, 300));
+          } finally { setBusy(false); }
+        }}
+      >
+        {busy ? 'Forking…' : 'Fork it'}
+      </button>
+      {error && <span className="conn-err">{error}</span>}
+    </div>
+  );
+}
+
+interface WorkspaceRow { name: string; remote: string | null; branch: string | null; updated: string | null }
+
+/** Choose which checkout to diagnose against.
+ *
+ *  This is the answer for closed source, and the shape of it is the point:
+ *  there is no field here for a repository URL and no field for a key. Somebody
+ *  with access clones the private repository into the workspace directory
+ *  themselves, using their own credentials — which is also the only thing that
+ *  works when the key has a passphrase on it — and this list is what showed up.
+ *  Nothing this app stores can reach anybody's source.
+ */
+function WorkspacePicker({ scan, onScan }: { scan: Scan; onScan: (changes: Partial<Scan>) => void }) {
+  const [data, setData] = useState<{ root: string; workspaces: WorkspaceRow[] } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+
+  const load = () => api<{ root: string; workspaces: WorkspaceRow[] }>('api/workspaces')
+    .then(setData).catch(() => setData(null));
+  useEffect(() => { void load(); }, []);
+
+  const choose = async (name: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api<{ workspace: string | null }>(`api/scans/${scan.id}/workspace`, {
+        method: 'POST', body: JSON.stringify({ workspace: name }),
+      });
+      onScan({ workspace: result.workspace ?? undefined });
+      setOpen(false);
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, '').slice(0, 300));
+    } finally { setBusy(false); }
+  };
+
+  if (scan.workspace) {
+    const row = data?.workspaces.find((w) => w.name === scan.workspace);
+    return (
+      <div className="notice ok" style={{ marginBottom: 12 }}>
+        <span className="tag good">local checkout</span>
+        <span>
+          Reading <code>{scan.workspace}</code>
+          {row?.remote ? <> — <span className="q">{row.remote}</span></> : null}
+          {row?.branch ? <> on <code>{row.branch}</code></> : null}
+          . Nothing is cloned or fetched, and no credential for this repository is stored here.
+        </span>
+        <button disabled={busy} onClick={() => choose('')}>Use something else</button>
+      </div>
+    );
+  }
+
+  const rows = data?.workspaces ?? [];
+
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div className="actions">
+        <button onClick={() => { setOpen(!open); if (!open) void load(); }}>
+          {open ? 'Cancel' : 'Use a local checkout…'}
+        </button>
+        {!open && (
+          <span className="conn-meta">
+            for private code — clone it yourself, nothing here holds a key to it
+          </span>
+        )}
+      </div>
+
+      {open && (
+        <div className="conn-detail">
+          {rows.length === 0 ? (
+            <p className="q">
+              The workspace is empty. Clone the repository into it with your own credentials — this
+              app never sees them, which is also the only thing that works when the key has a
+              passphrase:
+              <br />
+              <code>git clone &lt;your-private-repo&gt; {data?.root ?? '<workspace>'}/&lt;name&gt;</code>
+              <br />
+              Then reopen this list.
+            </p>
+          ) : (
+            <>
+              <p className="q">
+                Checkouts found in <code>{data?.root}</code>. Only this directory is readable — a
+                name that points anywhere else is refused.
+              </p>
+              <ul className="evidence">
+                {rows.map((w) => (
+                  <li key={w.name}>
+                    <button className="ghost conn-link" disabled={busy} onClick={() => choose(w.name)}>
+                      <code>{w.name}</code>
+                    </button>
+                    <div className="q">
+                      {w.remote ?? 'no origin remote'}
+                      {w.branch ? ` · ${w.branch}` : ''}
+                      {w.updated ? ` · last commit ${fmtDate(w.updated)}` : ''}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          <div className="actions">
+            <button className="ghost" onClick={() => void load()}>Rescan the workspace</button>
+          </div>
+          {error && <p className="conn-err">{error}</p>}
+        </div>
+      )}
     </div>
   );
 }

@@ -566,6 +566,7 @@ const issues: Issue[] = baseIssues.map((issue, index) => {
 
 const demo: Scan = {
   id: DEMO_ID,
+  fixture: true,
   company: source.company,
   site: source.site,
   createdAt: new Date().toISOString(),

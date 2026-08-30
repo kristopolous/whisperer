@@ -189,6 +189,43 @@ export const topicsSchema = {
   },
 } as const;
 
+/** Switching claims read out of already-collected discussion.
+ *
+ *  The post is referred to by index rather than by URL for the same reason the
+ *  topics schema does: a copied URL is the slowest possible thing for a local
+ *  model to emit and the easiest to get subtly wrong, and a wrong index can be
+ *  discarded where a wrong URL would silently attribute a stranger's words to
+ *  the wrong post. */
+export const migrationsSchema = {
+  name: 'migrations',
+  schema: {
+    type: 'object',
+    required: ['migrations'],
+    properties: {
+      migrations: {
+        type: 'array',
+        description: 'Only the posts that really are switching claims. May be empty.',
+        items: {
+          type: 'object',
+          required: ['index', 'direction', 'competitor', 'quote', 'reason', 'confidence'],
+          properties: {
+            index: { type: 'integer', description: 'The index number of the post this came from' },
+            direction: {
+              type: 'string',
+              enum: ['inbound', 'outbound'],
+              description: 'inbound: they moved TO the named product. outbound: they moved AWAY from it.',
+            },
+            competitor: { type: 'string', description: 'The other product, named as the author names it' },
+            quote: { type: 'string', description: "The author's own sentence establishing the move, copied exactly" },
+            reason: { type: 'string', description: 'Why they moved, in a few words. Empty string if unstated.' },
+            confidence: { type: 'string', enum: ['high', 'low'] },
+          },
+        },
+      },
+    },
+  },
+} as const;
+
 export const diagnoseSchema = {
   name: 'diagnosis',
   schema: {

@@ -25,6 +25,7 @@
  */
 
 import { inferenceHost, type ModelRole } from './config.ts';
+import { abortable } from './run-context.ts';
 
 interface Endpoint {
   baseUrl: string;
@@ -154,8 +155,11 @@ export async function askJsonDirect<T>(options: AskOptions): Promise<T> {
       },
     }),
     // Local models are slow: a batch of a dozen items is a minute and a half of
-    // generation, and cutting that off mid-stream loses the whole batch.
-    signal: AbortSignal.timeout(options.timeoutMs ?? 600_000),
+    // generation, and cutting that off mid-stream loses the whole batch. So the
+    // timeout is generous — and precisely because it is, a cancel has to be
+    // able to interrupt it, or stopping a scan would mean waiting out a
+    // ten-minute ceiling.
+    signal: abortable(options.timeoutMs ?? 600_000),
   });
 
   if (!response.ok || !response.body) {

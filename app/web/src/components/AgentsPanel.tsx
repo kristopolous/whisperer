@@ -79,7 +79,7 @@ export function AgentsPanel({ onClose }: { onClose?: () => void }) {
   const saved = (agents ?? []).filter((a) => !a.inPipeline);
 
   return (
-    <>
+    <section className="card-stack">
       {onClose && (
         <button className="ghost back-to-scans" onClick={onClose}>← Back to scans</button>
       )}
@@ -153,7 +153,7 @@ export function AgentsPanel({ onClose }: { onClose?: () => void }) {
           </div>
         )}
       </div>
-    </>
+    </section>
   );
 }
 

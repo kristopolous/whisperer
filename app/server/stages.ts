@@ -1,9 +1,10 @@
 import type { Scan, ScanEvent, Stage } from '../shared/types.ts';
 import {
-  buildBuzz, findAbuse, findFeed, findIssues, findMentions, findPresence, groupTopics,
-  netSentiment, resolveSite, scoreBuzz, type Log,
+  buildBuzz, findAbuse, findFeed, findIssues, findMentions, findMigrations, findPresence,
+  groupTopics, netSentiment, resolveSite, scoreBuzz, type Log,
 } from './pipeline.ts';
 import { withRunContext } from './agents/runtime.ts';
+import { throwIfCancelled, wasCancelled } from './run-context.ts';
 import { resolveSubject } from './agents/resolve-run.ts';
 import { findReviewScores } from './reviews.ts';
 import { brandToken } from '../shared/name.ts';
@@ -13,6 +14,8 @@ export interface StageCtx {
   scan: Scan;
   log: Log;
   send: (event: ScanEvent) => void;
+  /** Fires when the run is cancelled, so the slow work inside can stop. */
+  signal?: AbortSignal;
 }
 
 export const STAGE_LABELS: Record<Stage, string> = {
@@ -113,8 +116,12 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
   // Everything below runs inside this context, so an agent fired anywhere down
   // the call tree is attributed to this scan and stage without the stage
   // functions having to carry the ids around in their signatures.
-  return withRunContext({ scanId: scan.id, stage: next }, async () => {
+  return withRunContext({ scanId: scan.id, stage: next, signal: ctx.signal }, async () => {
     try {
+      // Before the stage does anything. Cancelling between stages is the cheap
+      // case: nothing is half-written and whatever the previous stages produced
+      // is already persisted.
+      throwIfCancelled();
       switch (next) {
       case 'presence': {
         // Settle what the input actually is, before thirty searches quote it.
@@ -163,6 +170,15 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
         );
 
         send({ type: 'patch', scan: { mentions: scan.mentions, buzz: scan.buzz, net: scan.net, verdict: scan.verdict, topics: scan.topics } });
+
+        // Built here for the same reason topics is: it reads mentions that are
+        // already in hand, fetches nothing, and belongs with the other pass
+        // that reads them. It comes last because it is the least important
+        // thing in the stage and the most likely to be slow — everything above
+        // has already been patched out to the dashboard, so if this runs long
+        // it delays only itself.
+        scan.migrations = await findMigrations(scan.company, scan.mentions, log);
+        send({ type: 'patch', scan: { migrations: scan.migrations } });
         break;
       }
       case 'health': {
@@ -209,6 +225,16 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
         return;
       }
     } catch (error) {
+      // A cancellation is not a stage failure and must not be recorded as one.
+      // Re-thrown so the run loop above can stop rather than step to the next
+      // stage — which is what it does for every genuine failure.
+      if (wasCancelled(error)) {
+        log('warn', `${next} stopped — cancelled`);
+        scan.timings[next] = Date.now() - started;
+        scan.stage = next;
+        store.put(scan);
+        throw error;
+      }
       const raw = error instanceof Error ? error.message : String(error);
       const { message, kind } = explainFailure(next, raw);
       log('error', `failed at ${next}: ${raw}`);

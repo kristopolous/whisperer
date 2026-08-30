@@ -15,6 +15,7 @@ export interface RunSummary {
   net: { now: number; delta: number };
   verdict: string;
   sessionId?: string;
+  fixture?: boolean;
 }
 
 const STAGE_KEYS: Stage[] = ['presence', 'discovery', 'buzz', 'health', 'abuse'];
@@ -93,6 +94,7 @@ export function RunDashboard({
                 onError={(e) => { e.currentTarget.style.visibility = 'hidden'; }}
               />
               <span className="t-name">{cleanName(run.company)}</span>
+              {run.fixture && <span className="tag plain" style={{ fontSize: 9.5 }}>demo</span>}
               <span className={`st-dot ${run.status === 'done' ? 'ok' : run.status === 'error' ? 'bad' : 'warn'}`} />
             </span>
             <span className="s">

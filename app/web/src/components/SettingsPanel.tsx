@@ -13,6 +13,9 @@ interface ConnectorStatus {
   missing: string[];
   error?: string;
   ms?: number;
+  url: string;
+  roles: ConnectorRole[];
+  bound: ConnectorRole[];
 }
 
 interface Credential {
@@ -27,6 +30,8 @@ interface Credential {
   /** False for usernames, domains and switches — shown as plain text, because
    *  masking a non-secret hides transpositions and protects nothing. */
   secret: boolean;
+  url?: string;
+  billingUrl?: string;
 }
 
 interface ChannelState {
@@ -67,6 +72,7 @@ interface Health {
   servers: string[];
   model: string;
   inference: { host: string; baseUrl: string; isExample: boolean };
+  search?: { braveQuotaSpent: { at: string; detail: string } | null };
 }
 
 const STATUS_LABEL: Record<ConnectorStatus['status'], string> = {
@@ -110,6 +116,29 @@ const READINESS_TAG: Record<ChannelState['readiness'], string> = {
  *  go find a matching name in a list of identical boxes. That split is how a
  *  GitHub token ended up in the Bright Data field. A credential belongs to the
  *  thing that needs it, so it is entered there. */
+type ConnectorRole = 'search' | 'scrape' | 'contact' | 'ticket' | 'exec';
+
+interface RoleInfo { id: ConnectorRole; label: string; uses: string; wired: boolean }
+
+interface Inspection {
+  reachable: boolean;
+  error?: string;
+  tools: { name: string; description: string; args: string[] }[];
+  suggested: Partial<Record<ConnectorRole, { tool: string; arg: string }>>;
+}
+
+interface SourceState {
+  id: string;
+  label: string;
+  notes: string;
+  requires: string[];
+  optional?: string[];
+  missing: string[];
+  readiness: 'ready' | 'needs-credentials' | 'exhausted';
+  exhaustedReason?: string;
+  links: { name: string; get?: string; billing?: string }[];
+}
+
 function CredentialFields({
   names,
   credentials,
@@ -140,7 +169,20 @@ function CredentialFields({
               )}
             </span>
             {cred?.what && <span className="cred-what">{cred.what}</span>}
-            {cred?.where && <span className="cred-where">{cred.where}</span>}
+            {(cred?.where || cred?.url) && (
+              <span className="cred-where">
+                {cred.where}
+                {cred.url && (
+                  <>
+                    {cred.where ? ' · ' : ''}
+                    <a href={cred.url} target="_blank" rel="noreferrer">get a key ↗</a>
+                  </>
+                )}
+                {cred.billingUrl && (
+                  <> · <a href={cred.billingUrl} target="_blank" rel="noreferrer">plan &amp; usage ↗</a></>
+                )}
+              </span>
+            )}
             <input
               type={cred?.secret === false ? 'text' : 'password'}
               className="conn-url"
@@ -174,6 +216,89 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
   const [keyMessage, setKeyMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
   const [channels, setChannels] = useState<ChannelState[] | null>(null);
+  const [sources, setSources] = useState<SourceState[] | null>(null);
+  const [roleInfo, setRoleInfo] = useState<RoleInfo[]>([]);
+  /** Tool list for the row being bound, keyed by connector name. */
+  const [inspection, setInspection] = useState<Record<string, Inspection>>({});
+  const [draftRolesFor, setDraftRolesFor] = useState<Record<string, ConnectorRole[]>>({});
+  const [draftBindings, setDraftBindings] = useState<Record<string, Partial<Record<ConnectorRole, { tool: string; arg: string }>>>>({});
+  const [addOpen, setAddOpen] = useState(false);
+  const [newServer, setNewServer] = useState({ name: '', url: '', description: '' });
+  const [adding, setAdding] = useState(false);
+  const [addMessage, setAddMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+
+  /** Dial a server and read its tools, so roles can be bound to real names
+   *  rather than typed from memory. */
+  const inspect = async (name: string) => {
+    try {
+      const result = await api<Inspection>(`api/connectors/${encodeURIComponent(name)}/tools`);
+      setInspection((current) => ({ ...current, [name]: result }));
+    } catch {
+      setInspection((current) => ({
+        ...current, [name]: { reachable: false, error: 'could not reach it', tools: [], suggested: {} },
+      }));
+    }
+  };
+
+  const saveRoles = async (name: string) => {
+    try {
+      const roles = draftRolesFor[name] ?? [];
+      const bindings = Object.fromEntries(
+        Object.entries(draftBindings[name] ?? {}).filter(([role]) => roles.includes(role as ConnectorRole)),
+      );
+      setConnectors(await api<ConnectorStatus[]>(`api/connectors/${encodeURIComponent(name)}`, {
+        method: 'PUT', body: JSON.stringify({ roles, bindings }),
+      }));
+      setKeyMessage({ kind: 'ok', text: 'Roles saved — they take effect on the next scan.' });
+    } catch (error) {
+      setKeyMessage({ kind: 'err', text: String(error).replace(/^Error:\s*/, '').slice(0, 240) });
+    }
+  };
+
+  const addServer = async () => {
+    setAdding(true);
+    setAddMessage(null);
+    try {
+      const result = await api<{ connector: { name: string } } & Inspection>('api/connectors', {
+        method: 'POST', body: JSON.stringify(newServer),
+      });
+      setInspection((current) => ({ ...current, [result.connector.name]: result }));
+      setDraftBindings((current) => ({ ...current, [result.connector.name]: result.suggested }));
+      setAddMessage(result.reachable
+        ? { kind: 'ok', text: `Added. It answered with ${result.tools.length} tools — open its row to give it a role.` }
+        : { kind: 'err', text: `Added, but it did not answer: ${result.error ?? 'no response'}. Fix that, then bind its roles.` });
+      setNewServer({ name: '', url: '', description: '' });
+      setAddOpen(false);
+      await refreshConnectors();
+      setOpenRow(result.connector.name);
+    } catch (error) {
+      setAddMessage({ kind: 'err', text: String(error).replace(/^Error:\s*/, '').slice(0, 240) });
+    } finally { setAdding(false); }
+  };
+
+  const removeServer = async (name: string) => {
+    try {
+      setConnectors(await api<ConnectorStatus[]>(`api/connectors/${encodeURIComponent(name)}`, { method: 'DELETE' }));
+      setOpenRow(null);
+    } catch (error) {
+      setKeyMessage({ kind: 'err', text: String(error).replace(/^Error:\s*/, '').slice(0, 240) });
+    }
+  };
+  const [testing, setTesting] = useState<string | null>(null);
+
+  /** Actually authenticate, rather than checking that a value is present. */
+  const testSource = async (id: string) => {
+    setTesting(id);
+    setKeyMessage(null);
+    try {
+      await api<{ ok: boolean }>(`api/sources/${id}/test`, { method: 'POST', body: '{}' });
+      setKeyMessage({ kind: 'ok', text: 'Authenticated — this source will contribute to the next scan.' });
+    } catch (error) {
+      setKeyMessage({ kind: 'err', text: String(error).replace(/^Error:\s*/, '').slice(0, 240) });
+    } finally {
+      setTesting(null);
+    }
+  };
   const [health, setHealth] = useState<Health | null>(null);
 
   const [inference, setInference] = useState<Inference | null>(null);
@@ -216,6 +341,8 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
   useEffect(() => {
     api<Credential[]>('api/credentials').then(setCredentials).catch(() => setCredentials(null));
     api<ChannelState[]>('api/channels').then(setChannels).catch(() => setChannels(null));
+    api<SourceState[]>('api/sources').then(setSources).catch(() => setSources(null));
+    api<RoleInfo[]>('api/roles').then(setRoleInfo).catch(() => setRoleInfo([]));
     api<Health>('api/health').then(setHealth).catch(() => setHealth(null));
     api<Inference>('api/inference').then(applyInference).catch(() => setInference(null));
     refreshConnectors();
@@ -252,7 +379,10 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
       if (draft.apiKey.trim()) body.apiKey = draft.apiKey;
       if (draft.contextLength) body.contextLength = Number(draft.contextLength);
       if (draft.maxOutputTokens) body.maxOutputTokens = Number(draft.maxOutputTokens);
-      if (draftRoles.length) body.roles = draftRoles;
+      // Always sent, including empty. Unlike the api key, an empty list is a
+      // real instruction — "this host handles no roles" — and skipping it made
+      // unticking the last one a silent no-op, so the box came back ticked.
+      body.roles = draftRoles;
 
       applyInference(await api<Inference>('api/inference', { method: 'PUT', body: JSON.stringify(body) }));
       setInfMessage({ kind: 'ok', text: makeDefault ? 'Saved, and now the default.' : 'Saved.' });
@@ -325,6 +455,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
       ));
       setCredentials(await api<Credential[]>('api/credentials'));
       setChannels(await api<ChannelState[]>('api/channels').catch(() => null) as ChannelState[] | null);
+      setSources(await api<SourceState[]>('api/sources').catch(() => null) as SourceState[] | null);
       setKeyMessage(saved.warnings.length
         ? { kind: 'err', text: `Saved, but: ${saved.warnings.join('; ')}` }
         : { kind: 'ok', text: `Saved ${Object.keys(filled).length} credential(s) and re-probed.` });
@@ -381,7 +512,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
 
 
   return (
-    <section>
+    <section className="card-stack">
       {onClose && (
         <button className="ghost back-to-scans" onClick={onClose}>← Back to scans</button>
       )}
@@ -399,7 +530,58 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
           <button className="ghost" onClick={recheck} disabled={rechecking}>
             {rechecking ? 'Re-checking…' : 'Re-check all'}
           </button>
+          <button className="ghost" onClick={() => setAddOpen(!addOpen)}>
+            {addOpen ? 'Cancel' : '+ Add a server'}
+          </button>
+          {addMessage && <span className={`set-message ${addMessage.kind}`}>{addMessage.text}</span>}
         </div>
+
+        {addOpen && (
+          <div className="conn-detail">
+            <p className="set-desc" style={{ padding: 0 }}>
+              Any MCP server reachable over streamable HTTP. It is dialled as soon as it is added and
+              its tools listed, so you can bind it to a role straight away. A server that does not
+              answer is still saved — not running yet is a normal state, not a reason to lose the URL.
+            </p>
+            <div className="set-grid">
+              <label>
+                <span>name</span>
+                <input
+                  value={newServer.name}
+                  onChange={(e) => setNewServer({ ...newServer, name: e.target.value })}
+                  placeholder="tavily"
+                  spellCheck={false}
+                />
+              </label>
+              <label>
+                <span>endpoint</span>
+                <input
+                  value={newServer.url}
+                  onChange={(e) => setNewServer({ ...newServer, url: e.target.value })}
+                  placeholder="http://localhost:8096/mcp"
+                  spellCheck={false}
+                />
+              </label>
+              <label className="set-wide">
+                <span>what it is for</span>
+                <input
+                  value={newServer.description}
+                  onChange={(e) => setNewServer({ ...newServer, description: e.target.value })}
+                  placeholder="shown in this list, and in the agent trace when it is called"
+                />
+              </label>
+            </div>
+            <div className="set-actions">
+              <button
+                className="primary"
+                disabled={adding || !newServer.name.trim() || !newServer.url.trim()}
+                onClick={addServer}
+              >
+                {adding ? 'Dialling…' : 'Add and dial it'}
+              </button>
+            </div>
+          </div>
+        )}
         <p className="set-desc">
           Each connector is an MCP endpoint dialled directly over HTTP — nothing brokers these, so a row
           below is the result of an actual <code>tools/list</code> against that service. <b>ok</b> means it
@@ -409,6 +591,19 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
           <code>config/connectors.json</code>; credentials are stored on this machine and never
           shown back to you. Saving re-probes, so you find out immediately whether a key works.
         </p>
+
+        {health?.search?.braveQuotaSpent && (
+          <div className="notice" style={{ margin: '0 16px 12px' }}>
+            <span className="tag warning">Brave quota spent</span>
+            <span>
+              Brave's free plan allows 2,000 queries a month and this month's are gone, so searches
+              are being answered by whichever connector holds the <b>search</b> role instead. Nothing
+              is broken and results are still real — but a scan is only as broad as the connectors
+              below, so an empty panel now means "we ran out of search", not "nobody is talking about
+              this product".
+            </span>
+          </div>
+        )}
 
         {connError && <div className="set-message err" style={{ padding: '12px 16px' }}>{connError}</div>}
         {connectors === null && !connError && <div className="set-loading">Probing connectors…</div>}
@@ -433,7 +628,28 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
                       {c.name}
                       <span className="agent-desc"> — {c.description}</span>
                     </span>
-                    <span className={`tag ${STATUS_TAG[c.status]}`}>{STATUS_LABEL[c.status]}</span>
+                    {/* One cell, not one per tag. The row is a grid with a
+                        fixed column count, so loose tags each claimed a column
+                        and pushed the rest onto new grid rows — bright-data
+                        rendered over five lines and brave over six. */}
+                    <span className="conn-tags">
+                      <span className={`tag ${STATUS_TAG[c.status]}`}>{STATUS_LABEL[c.status]}</span>
+                      {/* A role that is declared but not bound to a tool does
+                          nothing. Shown differently for exactly that reason —
+                          looking configured while doing nothing is the state the
+                          whole connector list used to be in. */}
+                      {(c.roles ?? []).map((role) => (
+                        <span
+                          key={role}
+                          className={`tag ${(c.bound ?? []).includes(role) ? 'good' : 'plain'}`}
+                          title={(c.bound ?? []).includes(role)
+                            ? `Used for ${role}`
+                            : `Declared for ${role} but no tool is bound, so it is not used`}
+                        >
+                          {role}{(c.bound ?? []).includes(role) ? '' : '?'}
+                        </span>
+                      ))}
+                    </span>
                     <span className="conn-meta">
                       {c.status === 'ok' ? `${c.tools} tools${c.ms ? ` · ${c.ms}ms` : ''}` : ''}
                     </span>
@@ -448,6 +664,19 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
 
                   {open && (
                     <div className="conn-detail">
+                      <RoleEditor
+                        connector={c}
+                        roleInfo={roleInfo}
+                        inspection={inspection[c.name]}
+                        onInspect={() => inspect(c.name)}
+                        roles={draftRolesFor[c.name] ?? c.roles ?? []}
+                        bindings={draftBindings[c.name] ?? {}}
+                        setRoles={(next) => setDraftRolesFor((cur) => ({ ...cur, [c.name]: next }))}
+                        setBindings={(next) => setDraftBindings((cur) => ({ ...cur, [c.name]: next }))}
+                        onSave={() => saveRoles(c.name)}
+                        onRemove={() => removeServer(c.name)}
+                      />
+
                       <CredentialFields
                         names={wants}
                         credentials={credentials ?? []}
@@ -500,6 +729,107 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
 
       <div className="panel">
         <div className="set-head">
+          <strong>Direct sources</strong>
+          <span className="tag plain">read</span>
+        </div>
+        <p className="set-desc">
+          Venues this asks <i>directly</i>, rather than asking a search engine about them. Everything
+          else in discovery goes through Brave as a <code>site:</code> query, which is capped by what a
+          general-purpose ranker chose to index — asked directly, Hacker News returns thousands of
+          comments where the search route returns dozens of links. Most of these need no credential at
+          all. A row that says <b>needs credentials</b> is a source contributing nothing to your scans.
+        </p>
+
+        {sources === null && <div className="set-loading">Loading sources…</div>}
+        {sources && (
+          <div className="conn-list">
+            {sources.map((source) => {
+              const open = openRow === `source:${source.id}`;
+              const wants = [...source.requires, ...(source.optional ?? [])];
+              return (
+                <div key={source.id}>
+                  <button
+                    className="conn-row agent-row"
+                    onClick={() => setOpenRow(open ? null : `source:${source.id}`)}
+                  >
+                    <span
+                      className="conn-dot"
+                      data-status={source.readiness === 'ready' ? 'ok' : 'unconfigured'}
+                    />
+                    <span className="conn-name">
+                      {source.label}
+                      <span className="agent-desc"> — {source.notes}</span>
+                    </span>
+                    <span className={`tag ${
+                      source.readiness === 'ready' ? 'good'
+                        : source.readiness === 'exhausted' ? 'critical' : 'warning'}`}
+                    >
+                      {source.readiness === 'ready'
+                        ? (source.requires.length ? 'ready' : 'no key needed')
+                        : source.readiness === 'exhausted' ? 'no credits'
+                          : 'needs credentials'}
+                    </span>
+                    <span className="conn-meta">{wants.length ? (open ? '−' : '+') : ''}</span>
+                  </button>
+
+                  {source.readiness === 'exhausted' && (
+                    <div className="notice" style={{ margin: '0 16px 10px' }}>
+                      <span className="tag critical">no credits</span>
+                      <span>
+                        {source.exhaustedReason} Nothing is misconfigured — the key works, the
+                        allowance is spent. Scans keep running on the other sources, so a thin
+                        result right now means "we ran out of search", not "nobody is talking about
+                        this product".
+                      </span>
+                      {source.links.map((link) => (link.billing ? (
+                        <a key={link.name} className="conn-link" href={link.billing} target="_blank" rel="noreferrer">
+                          top up ↗
+                        </a>
+                      ) : null))}
+                    </div>
+                  )}
+
+                  {open && wants.length > 0 && (
+                    <div className="conn-detail">
+                      {source.requires.length === 0 && (
+                        <p className="set-desc" style={{ padding: 0 }}>
+                          This source runs without a credential. The one below only raises its rate
+                          limit, so a large scan gets further before it is throttled.
+                        </p>
+                      )}
+                      <CredentialFields
+                        names={wants}
+                        credentials={credentials ?? []}
+                        entries={entries}
+                        onChange={(name, value) => setEntries({ ...entries, [name]: value })}
+                        onClear={clearCredential}
+                      />
+                      <div className="set-actions">
+                        <button
+                          className="primary"
+                          disabled={savingKeys || !wants.some((n) => entries[n]?.trim())}
+                          onClick={() => saveCredentials(wants)}
+                        >
+                          {savingKeys ? 'Saving…' : 'Save'}
+                        </button>
+                        {source.requires.length > 0 && (
+                          <button className="ghost" disabled={testing === source.id} onClick={() => testSource(source.id)}>
+                            {testing === source.id ? 'Testing…' : 'Test connection'}
+                          </button>
+                        )}
+                        {keyMessage && <span className={`set-message ${keyMessage.kind}`}>{keyMessage.text}</span>}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="panel">
+        <div className="set-head">
           <strong>Write channels</strong>
           <span className="tag plain">config/channels.json</span>
         </div>
@@ -544,8 +874,15 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
                     <div className="conn-detail">
                       {channel.readiness === 'planned' && (
                         <p className="set-desc" style={{ padding: 0 }}>
-                          This channel is not built yet — filling these in will not make it send anything.
-                          They are here so the credentials are ready when it is.
+                          <b>Not built</b> means nothing here can <i>send</i> yet — filling these in will
+                          not make this channel post anything. They are here so the credentials are ready
+                          when it is.
+                          {channel.id === 'reddit' && (
+                            <> Reddit is the exception worth knowing about: these same credentials
+                            {' '}<i>are</i> used, right now, to <b>read</b> Reddit in discovery. Set them under
+                            Direct sources above and this row goes on saying "not built", correctly —
+                            reading and replying are different problems.</>
+                          )}
                         </p>
                       )}
                       <CredentialFields
@@ -737,5 +1074,133 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
       </div>
 
     </section>
+  );
+}
+
+/** Give a server a job, and say which of its tools does it.
+ *
+ *  Two steps rather than one because they fail differently. Choosing a role is
+ *  a statement of intent and cannot really be wrong. Binding a tool can be, and
+ *  wrongly — a query passed in the wrong argument is answered by most servers
+ *  with something plausible and empty, which looks like "nobody is talking
+ *  about this product" rather than like a misconfiguration. So the tool and the
+ *  argument are both shown, both editable, and both taken from what the server
+ *  actually declared rather than typed from memory.
+ */
+function RoleEditor({
+  connector, roleInfo, inspection, onInspect, roles, bindings, setRoles, setBindings, onSave, onRemove,
+}: {
+  connector: ConnectorStatus;
+  roleInfo: RoleInfo[];
+  inspection?: Inspection;
+  onInspect: () => void;
+  roles: ConnectorRole[];
+  bindings: Partial<Record<ConnectorRole, { tool: string; arg: string }>>;
+  setRoles: (next: ConnectorRole[]) => void;
+  setBindings: (next: Partial<Record<ConnectorRole, { tool: string; arg: string }>>) => void;
+  onSave: () => void;
+  onRemove: () => void;
+}) {
+  const toggle = (role: ConnectorRole) => {
+    const next = roles.includes(role) ? roles.filter((r) => r !== role) : [...roles, role];
+    setRoles(next);
+    // Fetching the tool list is what makes binding possible, and wanting to
+    // bind is exactly what ticking a role means.
+    if (!inspection && !roles.includes(role)) onInspect();
+    if (!roles.includes(role) && inspection?.suggested[role] && !bindings[role]) {
+      setBindings({ ...bindings, [role]: inspection.suggested[role]! });
+    }
+  };
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <span className="cred-field-head"><code>roles</code></span>
+      <p className="cred-what">
+        What this server is for. A role is what the pipeline dispatches on, so ticking one is the
+        whole of putting this server to work — nothing else has to be changed.
+      </p>
+
+      <div className="actions" style={{ flexWrap: 'wrap' }}>
+        {(roleInfo.length ? roleInfo : []).map((info) => (
+          <button
+            key={info.id}
+            className={roles.includes(info.id) ? 'primary' : ''}
+            title={info.uses}
+            onClick={() => toggle(info.id)}
+          >
+            {info.label}{info.wired ? '' : ' (nothing reads this yet)'}
+          </button>
+        ))}
+      </div>
+
+      {roles.length > 0 && (
+        <>
+          {!inspection && (
+            <div className="set-actions">
+              <button className="ghost" onClick={onInspect}>List its tools to bind them</button>
+            </div>
+          )}
+          {inspection && !inspection.reachable && (
+            <p className="conn-err">
+              Could not read its tools: {inspection.error}. The roles can still be saved; bind the
+              tools once it answers.
+            </p>
+          )}
+          {inspection?.reachable && (
+            <div className="set-grid">
+              {roles.map((role) => {
+                const bound = bindings[role] ?? { tool: '', arg: '' };
+                return (
+                  <label key={role} className="set-wide">
+                    <span>{role} — tool and argument</span>
+                    <div className="actions">
+                      <select
+                        className="conn-url"
+                        value={bound.tool}
+                        onChange={(e) => {
+                          const tool = e.target.value;
+                          const args = inspection.tools.find((t) => t.name === tool)?.args ?? [];
+                          setBindings({
+                            ...bindings,
+                            [role]: { tool, arg: bound.arg && args.includes(bound.arg) ? bound.arg : (args[0] ?? '') },
+                          });
+                        }}
+                      >
+                        <option value="">— pick a tool —</option>
+                        {inspection.tools.map((t) => (
+                          <option key={t.name} value={t.name}>{t.name}</option>
+                        ))}
+                      </select>
+                      <select
+                        className="conn-url"
+                        value={bound.arg}
+                        onChange={(e) => setBindings({ ...bindings, [role]: { ...bound, arg: e.target.value } })}
+                      >
+                        <option value="">— argument —</option>
+                        {(inspection.tools.find((t) => t.name === bound.tool)?.args ?? []).map((a) => (
+                          <option key={a} value={a}>{a}</option>
+                        ))}
+                      </select>
+                    </div>
+                    {bound.tool && (
+                      <span className="cred-where">
+                        {inspection.tools.find((t) => t.name === bound.tool)?.description || 'no description given'}
+                      </span>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+
+      <div className="set-actions">
+        <button className="primary" onClick={onSave}>Save roles</button>
+        <button className="ghost" onClick={onRemove} title={`Remove ${connector.name} from the config`}>
+          Remove this server
+        </button>
+      </div>
+    </div>
   );
 }

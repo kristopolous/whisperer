@@ -25,6 +25,7 @@ import { cleanText } from '../shared/html.ts';
 import { usableConnectors } from './config.ts';
 import { callTool } from './mcp.ts';
 import { cached, DAY } from './cache.ts';
+import { bindingFor, connectorsForRole } from './roles.ts';
 
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
 
@@ -32,10 +33,14 @@ const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Geck
 /** Whether the scraping escape hatch is usable at all. Without it, Reddit and
  *  anything behind a bot check keep their search snippet instead of the text
  *  somebody actually wrote. */
-export const brightDataAvailable = () =>
-  usableConnectors().some((c) => c.name === 'bright-data');
+export const brightDataAvailable = () => connectorsForRole('scrape').length > 0;
 
-/** Scrape one page through Bright Data.
+/** Scrape one page through whichever connector declares the `scrape` role.
+ *
+ *  Named by role rather than by vendor, so installing a different scraper is a
+ *  settings change instead of an edit here. They are tried in config order and
+ *  the first that returns a real page wins — a scraper that is down or blocked
+ *  on this domain is a reason to try the next, not to give up on the page.
  *
  *  Delegates to the shared MCP client rather than keeping a second, subtly
  *  different implementation here. The bespoke one this replaces authenticated
@@ -44,20 +49,23 @@ export const brightDataAvailable = () =>
  *  two different ways at once and each masked the other.
  */
 async function brightDataScrape(url: string, timeoutMs = 60_000): Promise<string | null> {
-  const connector = usableConnectors().find((c) => c.name === 'bright-data');
-  if (!connector) return null;
-
-  try {
-    const result = await callTool(connector, 'scrape_as_markdown', { url }, timeoutMs);
-    if (result.isError) return null;
-    const page = unwrapUntrusted(result.text);
-    if (isScraperError(page)) return null;
-    return page.length > 200 ? page : null;
-  } catch {
-    // A scrape that cannot be done is a page we fall back to a snippet for, not
-    // a reason to fail the stage.
-    return null;
+  for (const connector of connectorsForRole('scrape')) {
+    const binding = bindingFor(connector, 'scrape');
+    if (!binding) continue;
+    try {
+      const result = await callTool(
+        connector, binding.tool, { ...(binding.extra ?? {}), [binding.arg]: url }, timeoutMs,
+      );
+      if (result.isError) continue;
+      const page = unwrapUntrusted(result.text);
+      if (isScraperError(page)) continue;
+      if (page.length > 200) return page;
+    } catch {
+      // A scrape that cannot be done is a page we fall back to a snippet for,
+      // not a reason to fail the stage.
+    }
   }
+  return null;
 }
 
 /** Bright Data reporting its own failure, in the body, with a 200.

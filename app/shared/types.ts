@@ -284,7 +284,11 @@ export interface Scan {
   company: string;
   site: string;
   createdAt: string;
-  status: 'running' | 'done' | 'error';
+  /** `cancelled` is deliberately not `error`. A run somebody stopped on purpose
+   *  has not failed, and reporting it as a failure sends people looking for a
+   *  cause that does not exist. It keeps whatever it collected before stopping,
+   *  which is often useful on its own. */
+  status: 'running' | 'done' | 'error' | 'cancelled';
   stage: Stage;
   /** Short, human-readable explanation of why the scan (or a stage) failed. */
   error?: string;
@@ -293,7 +297,7 @@ export interface Scan {
   /** The pipeline stage that failed, when known. */
   failedStage?: Stage;
   /** What class of failure this is, so the UI can offer the right remedy. */
-  errorKind?: 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'other';
+  errorKind?: 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'busy' | 'other';
   profiles: Profile[];
   mentions: Mention[];
   issues: Issue[];
@@ -317,6 +321,23 @@ export interface Scan {
   input?: string;
   /** What the typed input was resolved to, once, at the start. */
   subject?: Subject;
+  /** A seeded demonstration record, not a run.
+   *
+   *  Its retrieval data is real but its scores, issues and verdict are written
+   *  by hand, so it must never be mistaken for a finding — and, more
+   *  importantly, must never stand in for one. The runs rail shows one row per
+   *  company and the newest run wins, so an always-freshly-dated fixture for a
+   *  company somebody has actually scanned hid the real run behind synthesised
+   *  numbers. */
+  fixture?: boolean;
+  /** A checkout in the local workspace to diagnose against, by name.
+   *
+   *  For closed source, where there is no public repository to clone and this
+   *  app must not be given a credential that could reach one. Somebody with
+   *  access clones it into the workspace themselves; this is the name they gave
+   *  it. Always a bare name — it is resolved against the workspace root and
+   *  refused if it escapes. See app/server/workspace.ts. */
+  workspace?: string;
   /** The fork everything is written to. Never the upstream project. */
   fork?: string;
   /** When each stage last finished, as an ISO timestamp.
@@ -373,7 +394,7 @@ export type ScanEvent =
       /** The full raw error text, for the details toggle. */
       detail?: string;
       /** What class of failure this is, so the UI can offer the right remedy. */
-      kind?: 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'other';
+      kind?: 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'busy' | 'other';
     };
 
 /** Which reputation a score measures. They are not interchangeable: a company

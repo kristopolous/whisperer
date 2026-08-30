@@ -15,6 +15,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { loadConfig } from './config.ts';
+import { resolveWorkspace } from './workspace.ts';
 
 const run = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, '../../data/repos');
@@ -59,7 +60,24 @@ export async function ensureCheckout(
    *  is a better answer than anything a config lookup can offer, and requiring
    *  them to also add it to a JSON file to get a diagnosis would be silly. */
   discovered?: string,
+  /** A checkout the user put in the workspace themselves, by name.
+   *
+   *  First, ahead of everything: it is the most explicit statement available of
+   *  which code to read, and it is the only option at all for a private
+   *  repository this app has no credential for — which is the normal case
+   *  inside a company. */
+  workspace?: string,
 ): Promise<{ path: string; config: RepoConfig }> {
+  if (workspace) {
+    // Throws with a plain explanation if the name escapes the workspace, is not
+    // there, or is not a checkout. Never silently falls through to cloning
+    // something else — being pointed at the wrong source is worse than an
+    // error, because the diagnosis that comes back looks perfectly credible.
+    const resolved = resolveWorkspace(workspace);
+    emit('info', `reading the workspace checkout "${workspace}" — nothing is cloned or fetched`);
+    return { path: resolved, config: { company, path: resolved } };
+  }
+
   const config = repoFor(company)
     ?? (discovered ? { company, url: discovered } : undefined);
   if (!config) {
@@ -69,6 +87,10 @@ export async function ensureCheckout(
   }
 
   if (config.path) {
+    // config/repos.json is an operator file on the server's own disk, so an
+    // absolute path here is a deliberate act by someone who already has that
+    // access. Anything arriving from the dashboard goes through the workspace
+    // resolver above instead, and must not be routed here.
     const resolved = path.resolve(config.path);
     if (!existsSync(resolved)) throw new Error(`configured checkout does not exist: ${resolved}`);
     return { path: resolved, config };

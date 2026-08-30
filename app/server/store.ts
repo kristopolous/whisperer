@@ -28,6 +28,12 @@ const SECOND_LEVEL = /\.(co\.uk|com\.au|co\.nz|co\.in|com\.br|co\.jp|com\.mx|org
  *  and "https://www.supabase.com/" all collapse to the same company. Keyed off
  *  the resolved site when we have one, else the raw company string. */
 function companyKey(scan: Scan): string {
+  // A fixture is its own company, whatever it is named after. It carries the
+  // real company's name and site by design — it is built on top of a real
+  // scan — so keying it normally makes it collide with that company, and its
+  // always-current timestamp then wins the collision every time. The real run
+  // disappears from the rail and hand-written numbers are shown in its place.
+  if (scan.fixture) return `fixture:${scan.id}`;
   const source = (scan.site || scan.company || '').replace(/^https?:\/\//i, '').replace(/^www\./i, '').split(/[/?#]/)[0].trim().toLowerCase();
   if (!source) return '';
   let host = source;
@@ -44,23 +50,55 @@ function companyKey(scan: Scan): string {
  *  scan crashes and is retried), so the dashboard should show the single, most
  *  recent useful run rather than a row per attempt. "supabase.com", "supabase"
  *  and a pasted URL all count as the same company. */
-export const list = () => {
-  const newest = [...scans].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  const seen = new Set<string>();
-  const out: ReturnType<typeof summarize>[] = [];
-  for (const scan of newest) {
-    const key = companyKey(scan);
-    if (!key || seen.has(key)) continue;
-    if (scan.status === 'running') {
-      // Don't surface a stuck or in-progress run as the company's entry when a
-      // settled (done/error) scan for the same company already exists.
-      const settled = newest.some((s) => companyKey(s) === key && s.status !== 'running');
-      if (settled) continue;
-    }
-    seen.add(key);
-    out.push(summarize(scan));
+/** How much a run actually produced. The tiebreaker when choosing which of a
+ *  company's attempts to show. */
+const yield_ = (scan: Scan) =>
+  (scan.mentions?.length ?? 0) + (scan.feed?.length ?? 0)
+  + (scan.issues?.length ?? 0) + (scan.abuse?.length ?? 0);
+// Profiles are deliberately not counted. A run that found the company's own
+// accounts and then no discussion at all has produced nothing anyone opened
+// this dashboard for, and letting a footprint rescue it puts an empty run at
+// the top of the rail.
+
+/** Pick the one run that represents a company.
+ *
+ *  Recency alone is the wrong rule and produced a visibly wrong answer: a
+ *  settled run holding nothing at all beat a run with sixty mentions, purely
+ *  for being newer. Somebody looking at their dashboard wants the run that
+ *  found something, and an empty scan is a failed attempt whatever its status
+ *  says.
+ *
+ *  So: a run that produced something always beats one that did not, and only
+ *  then does recency decide. A still-running scan still loses to a finished
+ *  one, because a half-written record is not the thing to show — but it wins
+ *  over a finished empty one, since it may yet produce something and the empty
+ *  one never will. */
+function best(a: Scan, b: Scan): Scan {
+  const empty = (scan: Scan) => yield_(scan) === 0;
+  if (empty(a) !== empty(b)) return empty(a) ? b : a;
+  if (!empty(a) && !empty(b)) {
+    const settled = (scan: Scan) => scan.status !== 'running';
+    if (settled(a) !== settled(b)) return settled(a) ? a : b;
   }
-  return out;
+  return a.createdAt.localeCompare(b.createdAt) >= 0 ? a : b;
+}
+
+export const list = () => {
+  const chosen = new Map<string, Scan>();
+  for (const scan of scans) {
+    const key = companyKey(scan);
+    if (!key) continue;
+    const current = chosen.get(key);
+    chosen.set(key, current ? best(current, scan) : scan);
+  }
+
+  return [...chosen.values()]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    // Fixtures sort to the bottom regardless of date. They are for looking at a
+    // populated dashboard, not for reading, and the top of the list is where a
+    // person looks for their most recent real run.
+    .sort((a, b) => Number(Boolean(a.fixture)) - Number(Boolean(b.fixture)))
+    .map(summarize);
 };
 
 /** The headline numbers for one scan, with the chatty bodies stripped. */
@@ -87,6 +125,45 @@ function summarize({ mentions, issues, abuse, log, ...rest }: Scan) {
 }
 
 export const get = (id: string) => scans.find((s) => s.id === id);
+
+/* --------------------------------------------------------- one writer ---
+ *
+ *  A scan is written by whoever is running it, and a stage takes minutes. Two
+ *  runs on the same scan at once do not interleave — they overwrite. Both
+ *  handlers hold their own `Scan` object (a full run builds a fresh one; a
+ *  stage rerun reads the stored one), each mutates its copy for as long as its
+ *  stage takes, and each writes the whole record back at the end. The one that
+ *  finishes last wins, and everything the other wrote in the meantime is gone.
+ *
+ *  That is not hypothetical: a still-running abuse pass finished after a stage
+ *  rerun had collected a fresh review scorecard, wrote its minutes-old snapshot
+ *  over it, and took the stage marker back to `feed` as well. From the outside
+ *  it looks like the rerun silently did nothing.
+ *
+ *  Merging on write does not fix it — a stale snapshot carries stale values for
+ *  every field, so field-level last-write-wins still reverts them. The only
+ *  correct answer is that one scan has one writer, so the second caller is told
+ *  what is already running instead of racing it.
+ */
+interface Claim { what: string; since: number }
+const claims = new Map<string, Claim>();
+
+/** Take the write lock for a scan, or return who already holds it. */
+export function claim(id: string, what: string): { ok: true } | { ok: false; held: Claim } {
+  const held = claims.get(id);
+  if (held) return { ok: false, held };
+  claims.set(id, { what, since: Date.now() });
+  return { ok: true };
+}
+
+/** Release the write lock. Safe to call when it was never taken — a handler
+ *  that failed to claim still runs its own cleanup. */
+export function release(id: string, what: string) {
+  if (claims.get(id)?.what === what) claims.delete(id);
+}
+
+/** How long the current holder has had it, for the message the loser gets. */
+export const heldFor = (held: Claim) => Math.round((Date.now() - held.since) / 1000);
 
 export function put(scan: Scan) {
   const index = scans.findIndex((s) => s.id === scan.id);

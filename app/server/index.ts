@@ -13,7 +13,7 @@ import { cacheSize, cacheStats, clearCache } from './cache.ts';
 import { askJsonDirect } from './model.ts';
 import { recordLoopStep } from './channels/github.ts';
 import { channelStates, reloadChannels } from './channels/index.ts';
-import { enabledConnectors, inferenceConfig, inferenceHost, inferenceHosts, patchConnector, patchInferenceHost, reloadConfig } from './config.ts';
+import { addConnector, enabledConnectors, missingCredentials, removeConnector, inferenceConfig, inferenceHost, inferenceHosts, patchConnector, patchInferenceHost, reloadConfig } from './config.ts';
 import { diagnoseIssue } from './agents/diagnose-run.ts';
 import { fixIssue } from './agents/fix-run.ts';
 import { ensureFork } from './channels/fork.ts';
@@ -22,14 +22,21 @@ import { discard, outbox } from './outbox.ts';
 import { ensureCheckout, reloadRepos, repoConfig } from './repos.ts';
 import { hintFor, warnAbout } from './credential-hints.ts';
 import { secretSource, setSecrets, storedSecrets } from './secrets.ts';
-import { availableConnectors, checkConnectors } from './mcp.ts';
+import { availableConnectors, checkConnectors, listTools, toolUsage, type McpTool } from './mcp.ts';
+import {
+  guessArg, guessTool, ROLES, ROLE_INFO, type ConnectorRole, type RoleBinding,
+} from './roles.ts';
 import { runStage, explainFailure } from './stages.ts';
 import * as store from './store.ts';
 import { buildPayload } from './trackers.ts';
 import { fileTicket, submitTicket, ticketFiledEvent } from './agents/file-ticket.ts';
 import { respondToUser, deliverReply, replyEvent, type ReplyPhase } from './agents/respond-to-user.ts';
-import * as settings from './settings.ts';
 import { testReddit } from './reddit.ts';
+import { sourceStates } from './sources/index.ts';
+import { listWorkspaces, resolveWorkspace, workspaceRoot, WorkspaceError } from './workspace.ts';
+import { braveExhausted } from './search.ts';
+import * as cancel from './cancel.ts';
+import { wasCancelled } from './run-context.ts';
 
 const app = express();
 app.use(cors());
@@ -41,6 +48,12 @@ app.get('/api/health', (_req, res) => {
     servers: availableConnectors(),
     model: `${host.key}/${host.modelId}`,
     inference: { host: host.key, baseUrl: host.baseUrl, isExample: inferenceConfig().isExample },
+    // Whether the primary search provider has spent its allowance. Surfaced
+    // rather than left to be inferred from slow scans and thin results: a
+    // spent quota looks exactly like "the internet is quiet about this
+    // product", which is the one conclusion this tool must never reach by
+    // accident.
+    search: { braveQuotaSpent: braveExhausted() },
   });
 });
 
@@ -123,20 +136,87 @@ app.get('/api/connectors', async (_req, res) => {
 
 /** Which credentials the configured connectors and channels want, whether each
  *  is set, and where it came from. Never the values themselves. */
+/** The sources a scan reads by asking the venue directly, and whether each one
+ *  has what it needs. Not connectors — see app/server/sources/index.ts. */
+app.get('/api/sources', (_req, res) => res.json(sourceStates()));
+
+/** The git checkouts sitting in the workspace, for the "which code?" picker.
+ *
+ *  A list rather than a text box, deliberately. Offering what is actually there
+ *  is friendlier, and a name chosen from a list cannot be a probe for somewhere
+ *  else on the filesystem — the resolver refuses those anyway, but the best
+ *  input is one that never has to be refused. */
+app.get('/api/workspaces', async (_req, res) => {
+  try {
+    res.json({ root: workspaceRoot(), workspaces: await listWorkspaces() });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Point a scan at a checkout in the workspace, or clear it.
+ *
+ *  Validated here, on the way in, rather than at the point of use: storing a
+ *  name that will be refused later means the dashboard shows the scan as
+ *  configured and it fails minutes afterwards, in a stage that looks unrelated. */
+app.post('/api/scans/:id/workspace', (req, res) => {
+  const scan = store.get(req.params.id);
+  if (!scan) return res.status(404).json({ error: 'no such scan' });
+
+  const name = String(req.body?.workspace ?? '').trim();
+  if (!name) {
+    scan.workspace = undefined;
+    store.put(scan);
+    return res.json({ workspace: null });
+  }
+
+  try {
+    resolveWorkspace(name);
+  } catch (error) {
+    return res.status(400).json({
+      error: error instanceof WorkspaceError ? error.message : 'that workspace cannot be used',
+    });
+  }
+
+  scan.workspace = name;
+  store.put(scan);
+  // The resolved path is deliberately NOT returned. The dashboard has no use
+  // for it, and echoing filesystem layout back to a browser is how a probe
+  // learns whether a guess landed.
+  res.json({ workspace: name });
+});
+
+/** One authenticated round-trip against a source that needs credentials, so
+ *  "are these keys any good" is answerable without running a scan.
+ *
+ *  Worth a button rather than an inference from the readiness dot: readiness
+ *  only says a value is present. Reddit's credentials were present and were
+ *  six-character garbage for this project's entire life, and every scan since
+ *  quietly ran without Reddit while the settings screen showed it configured. */
+app.post('/api/sources/:id/test', async (req, res) => {
+  if (req.params.id !== 'reddit') {
+    return res.status(400).json({ ok: false, error: 'that source has nothing to authenticate' });
+  }
+  const result = await testReddit();
+  res.status(result.ok ? 200 : 400).json(result);
+});
+
 app.get('/api/credentials', (_req, res) => {
   try {
     const fromConnectors = enabledConnectors().flatMap((c) =>
       (c.requires ?? []).map((name) => ({ name, usedBy: c.name, kind: 'connector' as const })));
     const fromChannels = channelStates().flatMap((c) =>
       (c.requires ?? []).map((name) => ({ name, usedBy: c.label, kind: 'channel' as const })));
+    const fromSources = sourceStates().flatMap((s) =>
+      [...s.requires, ...(s.optional ?? [])].map((name) => ({ name, usedBy: s.label, kind: 'source' as const })));
 
     // One row per credential, listing everything that wants it — several
     // connectors can share a key and asking for it twice would be silly.
     const byName = new Map<string, {
       name: string; usedBy: string[]; kind: string; source: string;
-      what: string; where: string; secret: boolean;
+      what: string; where: string; url: string; billingUrl: string; secret: boolean;
     }>();
-    for (const entry of [...fromConnectors, ...fromChannels]) {
+    for (const entry of [...fromConnectors, ...fromChannels, ...fromSources]) {
       const hint = hintFor(entry.name);
       const row = byName.get(entry.name) ?? {
         name: entry.name,
@@ -145,6 +225,10 @@ app.get('/api/credentials', (_req, res) => {
         source: secretSource(entry.name),
         what: hint.what,
         where: hint.where ?? '',
+        // The page that issues it, and the page that shows what is left of it.
+        // "Where do I get this" should be a click, not a search.
+        url: hint.url ?? '',
+        billingUrl: hint.billingUrl ?? '',
         secret: hint.secret,
       };
       row.usedBy.push(entry.usedBy);
@@ -269,9 +353,34 @@ app.post('/api/inference/test', async (_req, res) => {
  *  missing one. */
 app.put('/api/connectors/:name', async (req, res) => {
   try {
-    const changes: { url?: string; enabled?: boolean } = {};
+    const changes: Parameters<typeof patchConnector>[1] = {};
     if (typeof req.body?.url === 'string') changes.url = req.body.url.trim();
     if (typeof req.body?.enabled === 'boolean') changes.enabled = req.body.enabled;
+    if (Array.isArray(req.body?.roles)) {
+      const roles = req.body.roles.filter((r: unknown): r is ConnectorRole =>
+        typeof r === 'string' && (ROLES as readonly string[]).includes(r));
+      if (roles.length !== req.body.roles.length) {
+        return res.status(400).json({ error: `roles must be drawn from: ${ROLES.join(', ')}` });
+      }
+      changes.roles = roles;
+    }
+    if (req.body?.bindings && typeof req.body.bindings === 'object') {
+      const bindings: Partial<Record<ConnectorRole, RoleBinding>> = {};
+      for (const [role, value] of Object.entries(req.body.bindings as Record<string, RoleBinding>)) {
+        if (!(ROLES as readonly string[]).includes(role)) {
+          return res.status(400).json({ error: `"${role}" is not a role` });
+        }
+        // A binding with no tool or no argument is not a binding — it would be
+        // stored, satisfy connectorsForRole, and then call undefined.
+        if (!value?.tool?.trim() || !value?.arg?.trim()) {
+          return res.status(400).json({ error: `the ${role} binding needs both a tool and an argument name` });
+        }
+        bindings[role as ConnectorRole] = {
+          tool: value.tool.trim(), arg: value.arg.trim(), ...(value.extra ? { extra: value.extra } : {}),
+        };
+      }
+      changes.bindings = bindings;
+    }
     patchConnector(req.params.name, changes);
     // Re-probe everything rather than just this row: enabling one connector
     // changes what the list means, and a stale neighbour is confusing.
@@ -279,6 +388,109 @@ app.put('/api/connectors/:name', async (req, res) => {
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }
+});
+
+/** The role catalogue, so the settings screen can explain what picking one
+ *  does rather than showing five bare words. */
+app.get('/api/roles', (_req, res) => res.json(Object.values(ROLE_INFO)));
+
+/** What this process has actually spent on connectors, per tool.
+ *
+ *  Counts requests, not money — the vendor is the authority on the bill. What
+ *  it answers is the question a dashboard cannot: which tool the budget went
+ *  on, how much of it went on calls that errored, and whether a metered
+ *  provider is being used at all. Resets when the server restarts, because it
+ *  is about this run rather than the month. */
+app.get('/api/connectors/usage', (_req, res) => {
+  const rows = toolUsage();
+  res.json({
+    since: process.uptime(),
+    total: rows.reduce((sum, row) => sum + row.calls, 0),
+    errors: rows.reduce((sum, row) => sum + row.errors, 0),
+    tools: rows,
+  });
+});
+
+/** Install an MCP server, then dial it and report what it offers.
+ *
+ *  Adding and probing are separate inside (see addConnector) but one action out
+ *  here, because the question a person actually has when they paste a URL is
+ *  "did that work, and what can it do" — and answering it needs the tool list
+ *  anyway to suggest role bindings. A server that does not answer is still
+ *  saved; the response says so. */
+app.post('/api/connectors', async (req, res) => {
+  try {
+    const body = req.body ?? {};
+    const connector = addConnector({
+      name: String(body.name ?? '').trim(),
+      url: String(body.url ?? '').trim(),
+      description: typeof body.description === 'string' ? body.description : undefined,
+      requires: Array.isArray(body.requires) ? body.requires.map(String) : undefined,
+      roles: Array.isArray(body.roles)
+        ? body.roles.filter((r: unknown): r is ConnectorRole =>
+          typeof r === 'string' && (ROLES as readonly string[]).includes(r))
+        : undefined,
+    });
+    res.json({ connector, ...(await inspectConnector(connector.name)) });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.delete('/api/connectors/:name', async (req, res) => {
+  try {
+    removeConnector(req.params.name);
+    res.json(await checkConnectors());
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** What one server offers, and which of its tools would serve each role.
+ *
+ *  The suggestion is a heuristic over tool names and their declared arguments,
+ *  and it is shown for confirmation rather than applied. A tool bound to the
+ *  wrong role fails loudly; a query passed in the wrong argument does not —
+ *  most servers answer that with something plausible and empty. */
+async function inspectConnector(name: string) {
+  const connector = enabledConnectors().find((c) => c.name === name);
+  if (!connector) return { reachable: false, error: 'not in the config', tools: [], suggested: {} };
+
+  const missing = missingCredentials(connector);
+  if (missing.length) {
+    return { reachable: false, error: `needs ${missing.join(', ')}`, tools: [], suggested: {} };
+  }
+
+  try {
+    const tools = await listTools(connector);
+    const suggested: Partial<Record<ConnectorRole, RoleBinding>> = {};
+    for (const role of ROLES) {
+      const tool = guessTool(role, tools);
+      if (!tool) continue;
+      const schema = tools.find((t: McpTool) => t.name === tool)?.inputSchema;
+      suggested[role] = { tool, arg: guessArg(role, schema) };
+    }
+    return {
+      reachable: true,
+      tools: tools.map((t: McpTool) => ({
+        name: t.name,
+        description: (t.description ?? '').slice(0, 200),
+        args: Object.keys(t.inputSchema?.properties ?? {}),
+      })),
+      suggested,
+    };
+  } catch (error) {
+    return {
+      reachable: false,
+      error: error instanceof Error ? error.message.slice(0, 200) : String(error),
+      tools: [],
+      suggested: {},
+    };
+  }
+}
+
+app.get('/api/connectors/:name/tools', async (req, res) => {
+  res.json(await inspectConnector(req.params.name));
 });
 
 /** Re-read config/connectors.json and re-probe. Connectors are dialled
@@ -295,28 +507,19 @@ app.post('/api/connectors/reconnect', async (_req, res) => {
 
 /** The API keys the user pastes in the Settings tab. Secrets are masked so they
  *  never round-trip to the browser. */
-app.get('/api/settings/reddit', (_req, res) => {
-  res.json(settings.redditPublic());
-});
-
-app.put('/api/settings/reddit', (req, res) => {
-  const body = req.body ?? {};
-  const next = {
-    clientId: String(body.clientId ?? ''),
-    clientSecret: String(body.clientSecret ?? ''),
-    username: String(body.username ?? ''),
-    password: String(body.password ?? ''),
-    userAgent: String(body.userAgent ?? ''),
-  };
-  res.json(settings.setReddit(next));
-});
-
-/** A single authenticated Reddit round-trip; used by the Settings panel's
- *  "Test connection" button to confirm the pasted keys work. */
-app.post('/api/settings/reddit/test', async (_req, res) => {
-  const result = await testReddit();
-  res.status(result.ok ? 200 : 400).json(result);
-});
+/* The Reddit-specific settings routes that used to live here are gone.
+ *
+ * They backed a Reddit-only form in the settings panel, which was replaced when
+ * credentials moved inline into the row that needs them. What made removing
+ * them worth doing rather than merely tidy: the form displayed each secret
+ * masked as `abc…yz`, loaded that display value into its own input, and saved
+ * it back — so pressing Save overwrote the real client id with the six
+ * characters of its own mask. Reddit then failed with a latin-1 encoding error
+ * from deep inside PRAW, which reads like anything but "the UI ate the key".
+ *
+ * Reddit credentials are now ordinary credentials, entered under Direct
+ * sources and read through secret(). See app/server/sources/index.ts.
+ */
 
 app.get('/api/scans/:id', (req, res) => {
   const scan = store.get(req.params.id);
@@ -347,6 +550,23 @@ app.get('/api/scans/:id/stream', async (req, res) => {
   const raw = String(req.query.company ?? '').trim();
   if (!raw) return res.status(400).end();
 
+  // One writer per scan. Racing a stage rerun would not interleave, it would
+  // overwrite — see the note on store.claim.
+  const lock = store.claim(req.params.id, 'full scan');
+  if (!lock.ok) {
+    // Refused over the stream rather than as a 409: the client is an
+    // EventSource, which cannot read a response body and would show this as a
+    // bare connection error with nothing to act on.
+    const send = openStream(res, () => {});
+    send({
+      type: 'error',
+      kind: 'busy',
+      message: `This scan has been running for ${store.heldFor(lock.held)}s already, `
+        + 'so a second run was not started on top of it.',
+    });
+    return res.end();
+  }
+
   // Reuse the record the POST created, so its createdAt — and its position in
   // the rail — does not jump when the stream opens.
   const existing = store.get(req.params.id);
@@ -375,6 +595,8 @@ app.get('/api/scans/:id/stream', async (req, res) => {
   };
   store.put(scan);
 
+  const signal = cancel.begin(req.params.id);
+
   const send = openStream(res, () => {});
   const log: Log = (level, text) => {
     scan.log.push({ at: new Date().toISOString(), level, stage: scan.stage, text });
@@ -389,8 +611,20 @@ app.get('/api/scans/:id/stream', async (req, res) => {
     for (const next of STAGE_KEYS) {
       send({ type: 'stage', stage: next });
       try {
-        await runStage({ scan, log, send }, next);
+        await runStage({ scan, log, send, signal }, next);
       } catch (error) {
+        // Cancelling stops the run where it is and keeps what it collected.
+        // Handled before the generic branch below, which steps over a failed
+        // stage and carries on — exactly what must not happen here.
+        if (wasCancelled(error)) {
+          scan.status = 'cancelled';
+          scan.stage = next;
+          log('warn', `cancelled at ${next} — keeping what was collected`);
+          store.put(scan);
+          send({ type: 'patch', scan: { status: 'cancelled', stage: next } });
+          send({ type: 'done', scan });
+          return;
+        }
         const raw = error instanceof Error ? error.message : String(error);
         const { message, detail, kind } = explainFailure(next, raw);
         log('error', `failed at ${next}: ${raw}`);
@@ -449,6 +683,8 @@ app.get('/api/scans/:id/stream', async (req, res) => {
     store.put({ ...scan, status: 'error', error: message });
     send({ type: 'error', message });
   } finally {
+    cancel.end(req.params.id);
+    store.release(req.params.id, 'full scan');
     res.end();
   }
 });
@@ -465,6 +701,21 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
   if (!scan) return res.status(404).json({ error: 'no such scan' });
   if (!(STAGE_KEYS as string[]).includes(next)) return res.status(400).json({ error: 'no such stage' });
 
+  const what = `${next} rerun`;
+  const lock = store.claim(req.params.id, what);
+  if (!lock.ok) {
+    const send = openStream(res, () => {});
+    send({
+      type: 'error',
+      stage: next,
+      kind: 'busy',
+      message: `The ${lock.held.what.replace(/ rerun$/, ' step')} of this scan has been running for `
+        + `${store.heldFor(lock.held)}s already. Starting another underneath it would overwrite `
+        + 'whatever it writes when it finishes.',
+    });
+    return res.end();
+  }
+
   if (req.query.reset === '1') {
     scan.log = [];
     scan.error = undefined;
@@ -480,18 +731,27 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
     send({ type: 'log', line: scan.log.at(-1)! });
   };
 
+  const signal = cancel.begin(req.params.id);
+
   try {
     const servers = availableConnectors();
     scan.status = 'running';
     scan.stage = next;
     store.put(scan);
-    await runStage({ scan, log, send }, next);
+    await runStage({ scan, log, send, signal }, next);
     scan.status = 'done';
     scan.stage = 'done';
     store.put(scan);
     send({ type: 'patch', scan: { status: 'done', stage: 'done' } });
     send({ type: 'done', scan });
   } catch (error) {
+    if (wasCancelled(error)) {
+      log('warn', `cancelled at ${next} — keeping what was collected`);
+      store.put({ ...scan, status: 'cancelled', stage: next });
+      send({ type: 'patch', scan: { status: 'cancelled', stage: next } });
+      send({ type: 'done', scan });
+      return;
+    }
     const raw = error instanceof Error ? error.message : String(error);
     const { message, detail, kind } = explainFailure(next, raw);
     log('error', `failed at ${next}: ${raw}`);
@@ -506,6 +766,8 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
     });
     send({ type: 'error', message, stage: next, detail, kind });
   } finally {
+    cancel.end(req.params.id);
+    store.release(req.params.id, what);
     res.end();
   }
 });
@@ -543,6 +805,28 @@ app.post('/api/scans', (req, res) => {
  *  what one row in the sidebar stands for. Deliberately explicit about how many
  *  records went: "removed 1" and "removed 4" are different events and the
  *  caller should be able to tell the user which happened. */
+/** Stop a run that is already going.
+ *
+ *  A signal, not a kill. The run stops at its next checkpoint — between stages,
+ *  before each search, or when the in-flight request it is waiting on drops —
+ *  and keeps everything it collected up to that point. Tearing the process down
+ *  mid-stage would leave a half-written scan, which is worse than waiting a few
+ *  seconds for it to stop tidily.
+ *
+ *  Returns whether anything was actually running, so the dashboard can say "it
+ *  had already finished" rather than claiming to have stopped something. */
+app.post('/api/scans/:id/cancel', (req, res) => {
+  const scan = store.get(req.params.id);
+  if (!scan) return res.status(404).json({ error: 'no such scan' });
+  const stopping = cancel.cancel(req.params.id);
+  res.json({
+    stopping,
+    message: stopping
+      ? 'Stopping — it will finish the request it is on and keep what it has collected.'
+      : 'Nothing was running on this scan.',
+  });
+});
+
 app.delete('/api/scans/:id', (req, res) => {
   const removed = store.remove(req.params.id);
   if (removed.length === 0) return res.status(404).json({ error: 'no such scan' });
@@ -624,7 +908,9 @@ app.post('/api/scans/:id/issues/:issueId/ticket', async (req, res) => {
         issue.loop = [...(issue.loop ?? []), ticketFiledEvent(tracker, result.ref ?? 'filed', result.url)];
         store.put(scan);
       }
-      return res.json({ draft, ...result });
+      // The issue rides back with the result so the caller does not have to
+      // refetch to see the ledger entry it just created.
+      return res.json({ draft, ...result, issue });
     }
 
     res.json({ draft, filed: false });
@@ -664,7 +950,7 @@ app.post('/api/scans/:id/issues/:issueId/reply', async (req, res) => {
         store.put(scan);
         // The ledger gets the verbatim message. Annotating it must never fail
         // the send that already happened, so this swallows its own errors.
-        await recordLoopStep(issue, event);
+        await recordLoopStep(scan, issue, event);
       }
       return res.json({ draft, ...result });
     }
@@ -689,7 +975,7 @@ app.post('/api/scans/:id/issues/:issueId/diagnose', async (req, res) => {
   const emit = (level: 'info' | 'warn', text: string) => trail.push(`[${level}] ${text}`);
 
   try {
-    const { path: repo } = await ensureCheckout(scan.company, emit, scan.subject?.repo);
+    const { path: repo } = await ensureCheckout(scan.company, emit, scan.subject?.repo, scan.workspace);
     const result = await diagnoseIssue(scan, issue, repo, emit);
     issue.diagnosis = { ...result, at: new Date().toISOString() };
     store.put(scan);
@@ -717,7 +1003,7 @@ app.post('/api/scans/:id/issues/:issueId/fix', async (req, res) => {
   const emit = (level: 'info' | 'warn', text: string) => trail.push(`[${level}] ${text}`);
 
   try {
-    const { path: repo } = await ensureCheckout(scan.company, emit, scan.subject?.repo);
+    const { path: repo } = await ensureCheckout(scan.company, emit, scan.subject?.repo, scan.workspace);
     const result = await fixIssue(scan, issue, issue.diagnosis, repo, emit);
     issue.fix = { ...result, at: new Date().toISOString() };
     store.put(scan);
@@ -766,6 +1052,7 @@ app.post('/api/scans/:id/issues/:issueId/pr', async (req, res) => {
   const trail: string[] = [];
   try {
     const pr = await openPullRequest(
+      scan,
       issue.fix.files.map((f) => ({ path: f.path, contents: f.contents })),
       issue.title,
       [
@@ -791,7 +1078,10 @@ app.post('/api/scans/:id/issues/:issueId/pr', async (req, res) => {
       ref: { label: `#${pr.number}`, url: pr.url },
     }];
     store.put(scan);
-    res.json({ pr, log: trail });
+    // The issue goes back too, so the dashboard shows the new ledger entry
+    // without a refetch — the pull request is a step in the loop, not a
+    // side-effect to be discovered later.
+    res.json({ pr, issue, log: trail });
   } catch (error) {
     res.status(502).json({ error: error instanceof Error ? error.message : 'pull request failed', log: trail });
   }
@@ -847,7 +1137,7 @@ app.post('/api/scans/:id/issues/:issueId/confirm', async (req, res) => {
 
   // Both closing steps go onto the ledger, so the filed issue ends with the
   // reporter's own words rather than with someone's assertion that it is done.
-  for (const event of issue.loop.slice(-2)) await recordLoopStep(issue, event);
+  for (const event of issue.loop.slice(-2)) await recordLoopStep(scan, issue, event);
 
   res.json(issue);
 });

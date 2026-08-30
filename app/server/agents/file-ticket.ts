@@ -28,7 +28,7 @@ import { runAgent } from './runtime.ts';
 import type { AgentDefinition } from './types.ts';
 import { ticketSchema } from '../schemas.ts';
 import { buildPayload, type FilePayload } from '../trackers.ts';
-import { createIssue, githubConfigured } from '../channels/github.ts';
+import { createIssue, githubConfigured, writeTarget } from '../channels/github.ts';
 
 export const FILE_TICKET_INSTRUCTIONS = `You turn a public bug report into an engineering ticket.
 
@@ -161,12 +161,14 @@ export async function submitTicket(
     };
   }
 
-  if (!githubConfigured()) {
+  if (!githubConfigured(scan)) {
     return {
       filed: false,
       reason:
-        'GitHub filing is built but not configured — set ticketing.github owner/repo in '
-        + 'config/channels.json and a GITHUB_TOKEN with Issues: read and write.',
+        'GitHub filing is built, but there is nowhere to file to. Fork this project first — '
+        + 'everything this pipeline writes goes to a fork under your own account — or set '
+        + 'ticketing.github owner/repo in config/channels.json. Either way it needs a '
+        + 'GITHUB_TOKEN with Issues: read and write.',
       payload,
     };
   }
@@ -179,7 +181,8 @@ export async function submitTicket(
     const filed = await createIssue(scan, issue, payload.title, payload.body, payload.labels);
     return {
       filed: true,
-      reason: `Filed as #${filed.number}. Every later step of the loop will be appended to it as a comment.`,
+      reason: `Filed as ${writeTarget(scan) ?? 'the configured repository'}#${filed.number}. `
+        + 'Every later step of the loop will be appended to it as a comment.',
       payload,
       ref: `#${filed.number}`,
       url: filed.url,

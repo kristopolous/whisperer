@@ -23,28 +23,69 @@ const ACCEPT = 'application/vnd.github+json';
 
 export class GithubNotConfigured extends Error {}
 
-function github() {
+/** Where writes for this scan go.
+ *
+ *  A scan that has been forked writes to its fork, and that beats the
+ *  configured repository rather than merely defaulting to it. The fork exists
+ *  precisely because the subject's own tracker is off limits, so once one has
+ *  been made, a stale `ticketing.github` pointing at somebody else's project
+ *  must not be able to win. (`assertWritable` would refuse such a write anyway
+ *  — but refusing after the fork was made is a bug report, not a design.)
+ *
+ *  With no scan, or a scan that has not been forked, this is the configured
+ *  repository, which is how the settings panel and `githubConfigured` see it. */
+function github(scan?: Scan) {
   const { github: config } = channelsConfig().value.ticketing;
-  if (!config?.owner || !config.repo) {
-    throw new GithubNotConfigured('config/channels.json has no ticketing.github owner/repo');
+  const forked = splitFullName(scan?.fork);
+  const owner = forked?.owner ?? config?.owner;
+  const repo = forked?.repo ?? config?.repo;
+  if (!owner || !repo) {
+    throw new GithubNotConfigured(
+      'nowhere to file this — fork the project first, or set ticketing.github owner/repo in config/channels.json',
+    );
   }
-  if (!config.token) {
+  if (!config?.token) {
     throw new GithubNotConfigured('no GitHub token — set GITHUB_TOKEN (Issues: read and write)');
   }
-  return { ...config, apiBase: (config.apiBase ?? 'https://api.github.com').replace(/\/$/, '') };
+  return { ...config, owner, repo, apiBase: (config.apiBase ?? 'https://api.github.com').replace(/\/$/, '') };
 }
 
-export function githubConfigured(): boolean {
+/** "kristopolous/hangman-test" → its two halves. Anything else is not a target. */
+function splitFullName(fullName?: string): { owner: string; repo: string } | null {
+  const [owner, repo, ...rest] = (fullName ?? '').split('/');
+  return owner && repo && rest.length === 0 ? { owner, repo } : null;
+}
+
+/** True when a ticket could be filed with no further setup — a token plus
+ *  somewhere to put it. A scan makes this specific: a forked scan is filable
+ *  even when nothing is configured. */
+export function githubConfigured(scan?: Scan): boolean {
   try {
-    github();
+    github(scan);
     return true;
   } catch {
     return false;
   }
 }
 
-async function call<T>(path: string, body?: unknown, method?: 'POST' | 'PUT'): Promise<T> {
-  const config = github();
+type Target = ReturnType<typeof github>;
+
+/** Where a write for this scan would go, as `owner/repo`, or null if nowhere.
+ *
+ *  Exported so that anything reporting on a write can name its destination
+ *  rather than a bare issue number. "Filed as #12" is the sentence that lets a
+ *  person assume it went to the project; "filed as kristopolous/hangman-test#12"
+ *  cannot be misread. */
+export function writeTarget(scan?: Scan): string | null {
+  try {
+    const target = github(scan);
+    return `${target.owner}/${target.repo}`;
+  } catch {
+    return null;
+  }
+}
+
+async function call<T>(config: Target, path: string, body?: unknown, method?: 'POST' | 'PUT'): Promise<T> {
   const response = await fetch(`${config.apiBase}/repos/${config.owner}/${config.repo}${path}`, {
     method: method ?? (body ? 'POST' : 'GET'),
     headers: {
@@ -82,10 +123,10 @@ export async function createIssue(
   // Hard stop before anything is written. Filing a bot-written ticket on
   // somebody else's tracker wastes a maintainer's time and cannot be undone by
   // deleting it afterwards — they have already read it.
-  const target = github();
+  const target = github(scan);
   await assertWritable(target.owner, target.repo);
 
-  const created = await call<{ number: number; html_url: string }>('/issues', {
+  const created = await call<{ number: number; html_url: string }>(target, '/issues', {
     title,
     body: `${auditHeader(scan, issue)}\n\n---\n\n${body}`,
     labels,
@@ -93,10 +134,10 @@ export async function createIssue(
   return { number: created.number, url: created.html_url };
 }
 
-export async function commentOnIssue(number: number, body: string): Promise<string> {
-  const target = github();
+export async function commentOnIssue(scan: Scan, number: number, body: string): Promise<string> {
+  const target = github(scan);
   await assertWritable(target.owner, target.repo);
-  const created = await call<{ html_url: string }>(`/issues/${number}/comments`, { body });
+  const created = await call<{ html_url: string }>(target, `/issues/${number}/comments`, { body });
   return created.html_url;
 }
 
@@ -138,12 +179,12 @@ export function loopComment(event: LoopEvent): string {
 /** Append a loop step to the issue this complaint was filed as, if it was filed
  *  to GitHub at all. Never throws into the caller's path: failing to annotate
  *  the ledger must not fail the action that was actually being taken. */
-export async function recordLoopStep(issue: Issue, event: LoopEvent): Promise<string | null> {
+export async function recordLoopStep(scan: Scan, issue: Issue, event: LoopEvent): Promise<string | null> {
   if (issue.filedTo?.tracker !== 'github') return null;
   const number = Number(issue.filedTo.ref.replace(/^#/, ''));
   if (!Number.isFinite(number)) return null;
   try {
-    return await commentOnIssue(number, loopComment(event));
+    return await commentOnIssue(scan, number, loopComment(event));
   } catch {
     return null;
   }
@@ -169,21 +210,22 @@ export interface OpenedPr {
 }
 
 export async function openPullRequest(
+  scan: Scan,
   files: { path: string; contents: string }[],
   title: string,
   body: string,
   emit: (level: 'info' | 'warn', text: string) => void,
 ): Promise<OpenedPr> {
-  const target = github();
+  const target = github(scan);
   await assertWritable(target.owner, target.repo);
   if (files.length === 0) throw new Error('nothing to open a pull request with');
 
-  const repo = await call<{ default_branch: string }>('');
+  const repo = await call<{ default_branch: string }>(target, '');
   const base = repo.default_branch;
   const branch = `whisperer/fix-${Date.now().toString(36)}`;
 
-  const head = await call<{ object: { sha: string } }>(`/git/ref/heads/${base}`);
-  await call(`/git/refs`, { ref: `refs/heads/${branch}`, sha: head.object.sha });
+  const head = await call<{ object: { sha: string } }>(target, `/git/ref/heads/${base}`);
+  await call(target, `/git/refs`, { ref: `refs/heads/${branch}`, sha: head.object.sha });
   emit('info', `branch ${branch} created on ${target.owner}/${target.repo}`);
 
   for (const file of files) {
@@ -191,13 +233,13 @@ export async function openPullRequest(
     // carry a sha at all.
     let sha: string | undefined;
     try {
-      const existing = await call<{ sha: string }>(`/contents/${encodeURI(file.path)}?ref=${branch}`);
+      const existing = await call<{ sha: string }>(target, `/contents/${encodeURI(file.path)}?ref=${branch}`);
       sha = existing.sha;
     } catch {
       sha = undefined;
     }
 
-    await call(`/contents/${encodeURI(file.path)}`, {
+    await call(target, `/contents/${encodeURI(file.path)}`, {
       message: `${sha ? 'Update' : 'Add'} ${file.path}`,
       content: Buffer.from(file.contents, 'utf8').toString('base64'),
       branch,
@@ -206,7 +248,7 @@ export async function openPullRequest(
     emit('info', `committed ${file.path}`);
   }
 
-  const pr = await call<{ number: number; html_url: string }>('/pulls', {
+  const pr = await call<{ number: number; html_url: string }>(target, '/pulls', {
     title,
     body,
     head: branch,
