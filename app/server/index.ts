@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import cors from 'cors';
 import express from 'express';
 import type { Scan, ScanEvent, Stage, Tracker } from '../shared/types.ts';
@@ -296,5 +298,28 @@ app.post('/api/scans/:id/issues/:issueId/status', (req, res) => {
   res.json(issue);
 });
 
+/* Serve the built dashboard from the API process when a build exists.
+ *
+ * In development the Vite dev server owns the UI and proxies /api here, so
+ * this does nothing. In a deployment there is no Vite, and running a second
+ * process just to hand over static files is a worse thing to operate than one
+ * process that serves both. Registered last so it can never shadow /api. */
+const DIST = path.resolve(import.meta.dirname, '../web/dist');
+if (existsSync(DIST)) {
+  app.use(express.static(DIST));
+  // The dashboard routes on the hash, but a deep link or a refresh still has
+  // to land on index.html rather than a 404.
+  app.get(/^(?!\/api\/).*/, (_req, res) => res.sendFile(path.join(DIST, 'index.html')));
+  console.log(`serving dashboard from ${DIST}`);
+}
+
 const port = Number(process.env.PORT ?? 8791);
-app.listen(port, '127.0.0.1', () => console.log(`whisperer API on http://127.0.0.1:${port}`));
+
+/* Bind to loopback unless told otherwise.
+ *
+ * A scan report names real people and quotes them, so the default should never
+ * be "reachable from the internet because it happened to start on a server".
+ * Deployments that want a wider bind set HOST explicitly and put their own
+ * access control in front of it. */
+const host = process.env.HOST ?? '127.0.0.1';
+app.listen(port, host, () => console.log(`whisperer on http://${host}:${port}`));
