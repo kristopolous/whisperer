@@ -4,8 +4,11 @@ import {
   FEED_INSTRUCTIONS, FEED_SERVERS, FOOTPRINT_INSTRUCTIONS, HEALTH_INSTRUCTIONS, PRESENCE_SERVERS,
 } from '../app/server/pipeline.ts';
 import {
-  abuseSchema, buzzSchema, feedSchema, healthSchema, mentionsSchema, profilesSchema, siteSchema, strictify,
+  abuseSchema, buzzSchema, feedSchema, healthSchema, mentionsSchema, profilesSchema, replySchema,
+  siteSchema, strictify, ticketSchema,
 } from '../app/server/schemas.ts';
+import { FILE_TICKET_INSTRUCTIONS } from '../app/server/agents/file-ticket.ts';
+import { RESPOND_INSTRUCTIONS } from '../app/server/agents/respond-to-user.ts';
 
 /**
  * Every Whisperer pipeline stage, also saved as a named TrueForge agent — so
@@ -125,6 +128,36 @@ export const agents: TrueForgeApi.CreateAgentRequest[] = [
   {
     name: 'whisperer-health',
     manifest: reasoningAgent(HEALTH_INSTRUCTIONS + CALLED_WITH_A_CORPUS, healthSchema, 'medium'),
+  },
+  // The two loop agents. Both are reasoning agents — they work over material
+  // already gathered, and neither should be able to reach for a tool: a ticket
+  // invented from a web search rather than from what the reporters wrote is
+  // exactly the failure these are meant to avoid.
+  //
+  // They are registered here as well as being callable directly so that they
+  // are visible and fireable from the TrueForge UI like every other stage. The
+  // instructions come from the modules that implement them rather than being
+  // copied, so the saved agent and the running code cannot drift.
+  {
+    name: 'whisperer-file-ticket',
+    manifest: reasoningAgent(
+      FILE_TICKET_INSTRUCTIONS
+      + '\n\nHow you are invoked: the first message names the product, gives the triaged issue as JSON, and '
+      + 'then gives what the reporters actually wrote. Write the ticket from those words.',
+      ticketSchema,
+      'medium',
+    ),
+  },
+  {
+    name: 'whisperer-respond',
+    manifest: reasoningAgent(
+      RESPOND_INSTRUCTIONS
+      + '\n\nHow you are invoked: the first message names the product and venue, gives the triaged issue, quotes '
+      + 'what the reporter wrote, and says which reply to write — the acknowledgement (nothing is fixed yet) or '
+      + 'the follow-up (the fix shipped, ask them to check).',
+      replySchema,
+      'medium',
+    ),
   },
   {
     name: 'whisperer-abuse',

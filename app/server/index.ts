@@ -11,6 +11,8 @@ import { checkConnectors, reconnectConnectors } from './connectors.ts';
 import { runStage, explainFailure } from './stages.ts';
 import * as store from './store.ts';
 import { buildPayload } from './trackers.ts';
+import { fileTicket, submitTicket, ticketFiledEvent } from './agents/file-ticket.ts';
+import { respondToUser, deliverReply, replyEvent, type ReplyPhase } from './agents/respond-to-user.ts';
 import * as settings from './settings.ts';
 import { testReddit } from './reddit.ts';
 
@@ -304,6 +306,121 @@ app.post('/api/scans/:id/issues/:issueId/status', (req, res) => {
  * this does nothing. In a deployment there is no Vite, and running a second
  * process just to hand over static files is a worse thing to operate than one
  * process that serves both. Registered last so it can never shadow /api. */
+/* ------------------------------------------------------- loop agents ---- */
+
+/** Draft a real engineering ticket for an issue.
+ *
+ *  Distinct from /payload, which renders the existing issue into a tracker's
+ *  envelope from a template. This reads what the reporters actually wrote and
+ *  reconstructs repro steps, expected/actual and acceptance criteria — the part
+ *  that otherwise costs a person twenty minutes per ticket. */
+app.post('/api/scans/:id/issues/:issueId/ticket', async (req, res) => {
+  const scan = store.get(req.params.id);
+  const issue = scan?.issues.find((i) => i.id === req.params.issueId);
+  if (!scan || !issue) return res.status(404).json({ error: 'no such issue' });
+
+  try {
+    const tracker = (req.body?.tracker ?? 'clipboard') as Tracker;
+    const draft = await fileTicket(scan, issue, tracker);
+
+    // `submit=true` is the caller saying "actually file it". It still will not,
+    // until a tracker credential is configured — but the distinction between
+    // drafting and filing lives here rather than being blurred.
+    if (req.body?.submit) {
+      const result = await submitTicket(draft);
+      if (result.filed) {
+        issue.status = 'filed';
+        issue.filedTo = { tracker, ref: 'filed', at: new Date().toISOString() };
+        issue.loop = [...(issue.loop ?? []), ticketFiledEvent(tracker, 'filed')];
+        store.put(scan);
+      }
+      return res.json({ draft, ...result });
+    }
+
+    res.json({ draft, filed: false });
+  } catch (error) {
+    res.status(502).json({ error: error instanceof Error ? error.message : 'ticket drafting failed' });
+  }
+});
+
+/** Draft the reply that goes back to the person who reported it.
+ *
+ *  `phase` picks the message: `acknowledge` before anything is fixed,
+ *  `fix-notify` after, which asks them to confirm rather than telling them it
+ *  works. Only their confirmation may close the issue, so the follow-up is a
+ *  question and the endpoint cannot itself mark anything resolved. */
+app.post('/api/scans/:id/issues/:issueId/reply', async (req, res) => {
+  const scan = store.get(req.params.id);
+  const issue = scan?.issues.find((i) => i.id === req.params.issueId);
+  if (!scan || !issue) return res.status(404).json({ error: 'no such issue' });
+
+  const phase = (req.body?.phase ?? 'acknowledge') as ReplyPhase;
+  if (phase !== 'acknowledge' && phase !== 'fix-notify') {
+    return res.status(400).json({ error: 'phase must be "acknowledge" or "fix-notify"' });
+  }
+
+  try {
+    const draft = await respondToUser(scan, issue, phase, {
+      ticketRef: issue.filedTo?.ref,
+      whatChanged: req.body?.whatChanged,
+    });
+
+    if (req.body?.send) {
+      const result = await deliverReply(draft);
+      if (result.sent) {
+        issue.loop = [...(issue.loop ?? []), replyEvent(draft, issue.reporter)];
+        if (phase === 'acknowledge') issue.status = 'responded';
+        store.put(scan);
+      }
+      return res.json({ draft, ...result });
+    }
+
+    res.json({ draft, sent: false });
+  } catch (error) {
+    res.status(502).json({ error: error instanceof Error ? error.message : 'reply drafting failed' });
+  }
+});
+
+/** The reporter came back and said it works.
+ *
+ *  Deliberately the only route that can close an issue, and it takes their
+ *  words rather than a boolean — the audit trail is worth nothing if "the
+ *  reporter confirmed" can be recorded without what they said. */
+app.post('/api/scans/:id/issues/:issueId/confirm', (req, res) => {
+  const scan = store.get(req.params.id);
+  const issue = scan?.issues.find((i) => i.id === req.params.issueId);
+  if (!scan || !issue) return res.status(404).json({ error: 'no such issue' });
+
+  const said = String(req.body?.message ?? '').trim();
+  if (!said) return res.status(400).json({ error: 'the reporter\'s own words are required to close an issue' });
+
+  const at = new Date().toISOString();
+  issue.loop = [
+    ...(issue.loop ?? []),
+    {
+      id: randomUUID().slice(0, 8),
+      step: 'confirmed',
+      actor: 'reporter',
+      at,
+      human: true,
+      summary: 'Reporter confirmed the fix works.',
+      message: said,
+      ref: issue.reporter ? { label: 'confirmation in thread', url: issue.reporter.sourceUrl } : undefined,
+    },
+    {
+      id: randomUUID().slice(0, 8),
+      step: 'closed',
+      actor: 'system',
+      at,
+      human: false,
+      summary: 'Closed on the reporter\'s confirmation.',
+    },
+  ];
+  issue.status = 'closed';
+  store.put(scan);
+  res.json(issue);
+});
+
 const DIST = path.resolve(import.meta.dirname, '../web/dist');
 if (existsSync(DIST)) {
   app.use(express.static(DIST));

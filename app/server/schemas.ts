@@ -263,3 +263,71 @@ export const abuseSchema = {
     },
   },
 };
+
+/* ------------------------------------------------------- loop agents ---- */
+
+/** A real engineering ticket, written from a public complaint.
+ *
+ *  Deliberately more than a restatement of the issue: a ticket someone can
+ *  pick up needs steps, an expected/actual pair, and a way to know when it is
+ *  done. Those are the fields an engineer would otherwise have to reconstruct
+ *  from the thread themselves. */
+export const ticketSchema = {
+  name: 'ticket',
+  schema: {
+    type: 'object',
+    required: ['title', 'body', 'labels', 'reproSteps', 'expected', 'actual', 'acceptance'],
+    properties: {
+      title: {
+        type: 'string',
+        description: 'Imperative and specific, as an engineer would write it. No marketing tone, no severity prefix.',
+      },
+      body: {
+        type: 'string',
+        description: 'Markdown. What is wrong, who hit it, and why it matters. Do not repeat the fields below.',
+      },
+      labels: { type: 'array', items: { type: 'string' } },
+      reproSteps: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Ordered steps taken from what the reporters actually described. Never invent a step they did not mention.',
+      },
+      expected: { type: 'string' },
+      actual: { type: 'string' },
+      acceptance: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Checkable conditions that mean this is fixed, including the regression test that should exist.',
+      },
+    },
+  },
+};
+
+/** A reply addressed to the person who reported something.
+ *
+ *  Split into the message and the reasoning behind it so a human reviewing the
+ *  queue can judge the tone before it goes out, rather than after. */
+export const replySchema = {
+  name: 'reply',
+  schema: {
+    type: 'object',
+    required: ['message', 'tone', 'addresses'],
+    properties: {
+      message: {
+        type: 'string',
+        description:
+          'The reply itself, in the register of the venue it is going to. Plain, specific, no corporate filler, '
+          + 'no promises about dates. Acknowledge the particular thing they hit, in their terms.',
+      },
+      tone: {
+        type: 'string',
+        description: 'One line on the register chosen and why it fits this venue and this person.',
+      },
+      addresses: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'The specific points from their message this reply answers.',
+      },
+    },
+  },
+};
