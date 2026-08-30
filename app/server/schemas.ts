@@ -162,6 +162,21 @@ export const buzzSchema = {
   },
 };
 
+/** Just the verdict, for the pass that writes it over the finished corpus. */
+export const verdictSchema = {
+  name: 'verdict',
+  schema: {
+    type: 'object',
+    required: ['verdict'],
+    properties: {
+      verdict: {
+        type: 'string',
+        description: 'One paragraph: which way perception is moving across the whole window, and what is driving it.',
+      },
+    },
+  },
+};
+
 export const healthSchema = {
   name: 'health',
   schema: {

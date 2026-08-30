@@ -8,7 +8,7 @@ import type {
 } from '../shared/types.ts';
 import { fetchAll } from './content.ts';
 import { askJsonDirect } from './model.ts';
-import { abuseSchema, buzzSchema, healthSchema } from './schemas.ts';
+import { abuseSchema, buzzSchema, healthSchema, verdictSchema } from './schemas.ts';
 import {
   braveSearch, braveSearchAll, isLexicalNoise, isOpinionBearing, platformOf, profileHandle, venueOf,
   type SearchHit,
@@ -718,19 +718,62 @@ export async function scoreBuzz(
 
   emit('info', `${scores.size}/${mentions.length} mentions scored`);
 
-  return {
-    mentions: mentions.map((m) => {
-      const hit = scores.get(m.url);
-      if (!hit) return m;
-      return {
-        ...m,
-        sentiment: hit.sentiment ?? 'neutral',
-        score: clamp(hit.score ?? 0),
-        themes: hit.themes ?? [],
-      };
-    }),
-    verdict: verdicts.join(' '),
-  };
+  const scored = mentions.map((m) => {
+    const hit = scores.get(m.url);
+    if (!hit) return m;
+    return {
+      ...m,
+      sentiment: hit.sentiment ?? 'neutral',
+      score: clamp(hit.score ?? 0),
+      themes: hit.themes ?? [],
+    };
+  });
+
+  // One verdict written over the whole corpus, not fifteen batch verdicts glued
+  // end to end.
+  //
+  // Concatenating them produced a paragraph that argued with itself — "drifting
+  // negative, and the pull is growing steeper" immediately followed by
+  // "flat-to-slightly-positive" — because each batch only ever saw four items
+  // and generalised from them. A verdict is a claim about the whole window, so
+  // it has to be written somewhere that can see the whole window. This call is
+  // cheap: it reasons over the tallies and a sample, not the full corpus.
+  const verdict = await summariseVerdict(company, scored, emit)
+    // Falling back to the first batch verdict is worse than the real thing but
+    // better than nothing, and much better than the contradictory join.
+    .catch(() => verdicts[0] ?? '');
+
+  return { mentions: scored, verdict };
+}
+
+/** Write the one-paragraph verdict over the finished corpus. */
+async function summariseVerdict(company: string, mentions: Mention[], emit: Emit): Promise<string> {
+  const tally = { positive: 0, negative: 0, neutral: 0, mixed: 0 } as Record<string, number>;
+  const themes = new Map<string, number>();
+  for (const m of mentions) {
+    tally[m.sentiment] = (tally[m.sentiment] ?? 0) + 1;
+    for (const theme of m.themes ?? []) themes.set(theme, (themes.get(theme) ?? 0) + 1);
+  }
+
+  // The extremes carry the argument; the middle rarely says anything sharp.
+  const ranked = [...mentions].sort((a, b) => a.score - b.score);
+  const sample = [...ranked.slice(0, 8), ...ranked.slice(-8)].map((m) => ({
+    date: m.date, score: m.score, title: m.title, excerpt: m.excerpt.slice(0, 200),
+  }));
+
+  const top = [...themes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+
+  emit('info', 'writing the verdict over the whole window');
+  const { verdict } = await askJsonDirect<{ verdict: string }>({
+    instructions: BUZZ_INSTRUCTIONS,
+    prompt: `Product: "${company}". Write ONLY the one-paragraph verdict for the whole window — `
+      + `which way perception is moving and what is driving it. Do not score anything.\n\n`
+      + `Totals across ${mentions.length} mentions: ${JSON.stringify(tally)}\n`
+      + `Most common themes: ${JSON.stringify(top)}\n\n`
+      + `The most negative and most positive items:\n${JSON.stringify(sample)}`,
+    schema: verdictSchema,
+  });
+  return verdict ?? '';
 }
 
 const clamp = (n: number) => Math.max(-1, Math.min(1, Number(n) || 0));
@@ -890,25 +933,34 @@ export async function findAbuse(
   }
   emit('info', `judging ${candidates.length} candidate pages`);
 
-  const context = mentions.slice(0, 15).map((m) => ({ url: m.url, title: m.title, excerpt: m.excerpt.slice(0, 200) }));
+  // Batched, like buzz and health. Judging thirty candidate pages in one turn
+  // is the shape that kept timing out and losing the whole stage; ten at a time
+  // completes, and a batch that fails costs only its own ten.
+  const BATCH = 10;
+  const batches: typeof candidates[] = [];
+  for (let i = 0; i < candidates.length; i += BATCH) batches.push(candidates.slice(i, i + BATCH));
 
-  const { findings } = await withRetry('abuse', emit, () =>
-    askJsonDirect<{ findings: Omit<AbuseFinding, 'id' | 'status' | 'firstSeen'>[] }>({
-      instructions: ABUSE_INSTRUCTIONS,
-      prompt: `Company: "${company}" (${site}).
+  const findings: Omit<AbuseFinding, 'id' | 'status' | 'firstSeen'>[] = [];
+  for (const [index, batch] of batches.entries()) {
+    try {
+      const result = await askJsonDirect<{ findings: Omit<AbuseFinding, 'id' | 'status' | 'firstSeen'>[] }>({
+        instructions: ABUSE_INSTRUCTIONS,
+        prompt: `Company: "${company}" (${site}).
 
 These pages came back from searches for misuse of this brand — impersonating accounts and Discord/Telegram servers, lookalike domains, phishing pages, giveaway and airdrop scams, fake support, counterfeit or cracked distributions, and packages published under the name.
 
 Most of them will be ordinary coverage, reviews or discussion that merely uses the words — report only the ones the evidence actually supports as abuse, and return an empty list if none do.
 
 Candidates:
-${JSON.stringify(candidates)}
-
-Discussion already collected, for context:
-${JSON.stringify(context)}`,
-      schema: abuseSchema,
-    }),
-  );
+${JSON.stringify(batch)}`,
+        schema: abuseSchema,
+      });
+      findings.push(...(result.findings ?? []));
+      emit('info', `batch ${index + 1}/${batches.length}: ${(result.findings ?? []).length} finding(s)`);
+    } catch (error) {
+      emit('warn', `batch ${index + 1}/${batches.length} failed — ${error instanceof Error ? error.message.slice(0, 120) : 'error'}`);
+    }
+  }
 
   const byUrl = new Map(mentions.map((m) => [m.url, m]));
   return (findings ?? []).map((finding) => {
