@@ -44,7 +44,7 @@ export function strictify<T>(schema: T): T {
 
 const venue = {
   type: 'string',
-  enum: ['reddit', 'hackernews', 'x', 'github', 'youtube', 'telegram', 'signal', 'whatsapp', 'blog', 'forum', 'review', 'other'],
+  enum: ['reddit', 'hackernews', 'x', 'github', 'youtube', 'discord', 'linkedin', 'telegram', 'signal', 'whatsapp', 'blog', 'forum', 'review', 'other'],
 } as const;
 
 export const mentionsSchema = {

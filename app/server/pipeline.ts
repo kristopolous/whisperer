@@ -640,11 +640,18 @@ export async function scoreBuzz(
   // 3,900 the whole stage is lost. Batches keep each turn inside the model's
   // context and output limits, let a bad batch fail on its own without taking
   // the other five with it, and report progress as they land.
-  // 8, not 12. A 12-item batch measured ~2,900 completion tokens against this
-  // model's 4,096 output cap, and the batches whose items had longer excerpts
-  // duly failed with "max_tokens breached". 8 leaves real headroom; the cost is
-  // one extra round trip per 24 mentions.
-  const BATCH = 8;
+  // 4, and note this shrank twice for the same reason.
+  //
+  // 12 breached the model's 4,096-token output cap. 8 held while the corpus was
+  // search snippets, then started timing out and truncating mid-JSON once real
+  // page text was fetched: more input to read means more reasoning emitted
+  // before the answer starts, and the answer has to fit in what is left. 4
+  // items of real discussion is what actually completes here.
+  const BATCH = 4;
+
+  /** Characters of page text per item. Real thread text is far longer than a
+   *  search snippet and has to be trimmed to leave output budget. */
+  const TEXT_BUDGET = 900;
   const batches: Mention[][] = [];
   for (let i = 0; i < mentions.length; i += BATCH) batches.push(mentions.slice(i, i + BATCH));
 
@@ -672,7 +679,7 @@ export async function scoreBuzz(
         // Real thread text where it could be fetched, the snippet otherwise —
         // flagged, so the model knows when it is judging a summary rather than
         // someone's actual words.
-        text: (got?.text ?? m.excerpt).slice(0, 1_500),
+        text: (got?.text ?? m.excerpt).slice(0, TEXT_BUDGET),
         isFullText: got?.full ?? false,
       };
     });
@@ -769,7 +776,7 @@ export async function findIssues(
       date: m.date,
       venue: m.venue,
       title: m.title,
-      text: (got?.text ?? m.excerpt).slice(0, 1_500),
+      text: (got?.text ?? m.excerpt).slice(0, 900),
       isFullText: got?.full ?? false,
     };
   });
@@ -782,7 +789,7 @@ export async function findIssues(
   // The cost is real and worth stating: merging duplicates ("one issue per
   // underlying cause") can only happen inside a batch, so the same complaint
   // raised in two different batches can surface twice.
-  const BATCH = 6;
+  const BATCH = 3;
   const batches: typeof corpus[] = [];
   for (let i = 0; i < corpus.length; i += BATCH) batches.push(corpus.slice(i, i + BATCH));
 

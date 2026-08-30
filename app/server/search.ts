@@ -140,6 +140,8 @@ export function venueOf(url: string): Venue {
   if (onDomain(h, 'x.com') || onDomain(h, 'twitter.com')) return 'x';
   if (onDomain(h, 'github.com')) return 'github';
   if (onDomain(h, 'youtube.com') || onDomain(h, 'youtu.be')) return 'youtube';
+  if (onDomain(h, 'discord.com') || onDomain(h, 'discord.gg')) return 'discord';
+  if (onDomain(h, 'linkedin.com')) return 'linkedin';
   if (onDomain(h, 't.me')) return 'telegram';
   if (/review|trustpilot|g2\.com|capterra|producthunt/.test(h)) return 'review';
   if (/forum|community|discourse|stackoverflow|stackexchange/.test(h)) return 'forum';

@@ -3,6 +3,7 @@
 
 export type Venue =
   | 'reddit' | 'hackernews' | 'x' | 'github' | 'youtube'
+  | 'discord' | 'linkedin'
   | 'telegram' | 'signal' | 'whatsapp'
   | 'blog' | 'forum' | 'review' | 'other';
 
@@ -55,9 +56,81 @@ export interface Issue {
   draftReply: string;
   status: IssueStatus;
   filedTo?: { tracker: Tracker; ref: string; at: string };
+  /** Who raised it and how to reach them, when a single reporter is identifiable. */
+  reporter?: Reporter;
+  /** The full audit trail, oldest first. Empty until the loop starts. */
+  loop?: LoopEvent[];
 }
 
 export type Tracker = 'linear' | 'jira' | 'github' | 'clipboard';
+
+/* ------------------------------------------------- the resolution loop ---- */
+
+/** One rung of the ladder from "a stranger complained in public" to "that same
+ *  stranger agreed it is fixed".
+ *
+ *  The ordering is the contract: a fix is never announced before it exists, and
+ *  an issue is never closed on the agent's own say-so — only the person who
+ *  reported it can move it to `confirmed`. */
+export type LoopStep =
+  | 'discovered'     // the complaint was found in public discussion
+  | 'reproduced'     // the defect was confirmed against a real build
+  | 'filed'          // opened in the tracker, with the report attached
+  | 'contact-found'  // a way to reach the reporter was established
+  | 'outreach'       // reporter was told it is real, and apologised to
+  | 'fixed'          // the change that resolves it landed
+  | 'test-added'     // a regression test now guards it
+  | 'fix-notified'   // reporter was told it is believed fixed, and asked to check
+  | 'confirmed'      // the reporter said it works
+  | 'closed';        // loop complete
+
+/** Who took the action.
+ *
+ *  `reporter` is the only human. That is the whole design: no internal triage
+ *  meeting, no support rep in the middle — the one person whose time is spent
+ *  is the one who already cared enough to complain. */
+export type LoopActor = 'agent' | 'reporter' | 'system';
+
+export interface LoopEvent {
+  id: string;
+  step: LoopStep;
+  actor: LoopActor;
+  at: string;
+  /** One line describing what happened, for the timeline. */
+  summary: string;
+  /** Verbatim text when this step was a message to or from a person. Kept in
+   *  full: a public apology sent in the company's name is exactly the thing an
+   *  audit needs to be able to reread. */
+  message?: string;
+  /** What the step produced or where it happened — a thread, a tracker ticket,
+   *  a commit, a test file. */
+  ref?: { label: string; url?: string };
+  /** Whether a person had to do something for this step to happen. Only the
+   *  reporter's steps should be true; if anything else is, the loop is not
+   *  actually closed without staff. */
+  human: boolean;
+}
+
+/** How to reach the person who reported an issue, and how sure we are that it
+ *  is them.
+ *
+ *  `confidence` matters more than it looks: contacting the wrong person in the
+ *  company's name is worse than not contacting anyone. */
+export interface Reporter {
+  /** Their handle at the venue they complained on. */
+  handle: string;
+  venue: Venue;
+  /** The thread where they said it. */
+  sourceUrl: string;
+  /** How the agent would reach them, in the venue's own terms. */
+  channel: 'venue-reply' | 'email' | 'github-issue' | 'none';
+  /** Where that channel points, when it is not just "reply in the thread". */
+  address?: string;
+  /** How the contact route was established — a public profile, a linked site,
+   *  a signature. Recorded so the audit trail can show it was not guessed. */
+  basis: string;
+  confidence: 'high' | 'low';
+}
 
 export type AbuseKind =
   | 'impersonation' | 'phishing' | 'scam' | 'counterfeit'
@@ -79,6 +152,19 @@ export interface AbuseFinding {
   /** What to actually do: report to the platform, register the domain, warn users. */
   recommendation: string;
   status: 'open' | 'reported' | 'dismissed';
+}
+
+/** How much was said about one product topic in one time bucket.
+ *
+ *  Sentiment answers "how do they feel"; this answers "about what". Stacked
+ *  over time it shows attention moving — a feature that dominated discussion in
+ *  spring fading out as a newer one takes over — which is a different and often
+ *  more actionable signal than the polarity alone. */
+export interface TopicPoint {
+  /** Bucket start, same convention as BuzzPoint. */
+  bucket: string;
+  /** Mentions per topic in this bucket. Absent topic means zero. */
+  byTopic: Record<string, number>;
 }
 
 export interface BuzzPoint {
@@ -129,6 +215,8 @@ export interface Scan {
   issues: Issue[];
   abuse: AbuseFinding[];
   buzz: BuzzPoint[];
+  /** Discussion volume per topic over time, for the stacked view. */
+  topics: TopicPoint[];
   /** Newest-first stream of the latest comments, videos and posts. */
   feed: FeedItem[];
   /** Everything the run printed, kept with the scan so a finished run can still

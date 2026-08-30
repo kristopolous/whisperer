@@ -10,6 +10,7 @@ import { Overview } from './components/Overview.tsx';
 import { PresenceView } from './components/Presence.tsx';
 import { RunDashboard, type RunSummary } from './components/RunDashboard.tsx';
 import { SettingsPanel } from './components/SettingsPanel.tsx';
+import { StatCards, type OverviewTab } from './components/StatCards.tsx';
 import { api, cleanName, normalize, siteOf } from './lib.ts';
 
 type Tab = 'overview' | 'presence' | 'discovery' | 'feed' | 'health' | 'integrity';
@@ -41,7 +42,7 @@ function hashFor(id: string, tab: Tab): string {
 
 const BLANK: Scan = {
   id: '', company: '', site: '', createdAt: '', status: 'done', stage: 'queued',
-  profiles: [], mentions: [], issues: [], abuse: [], buzz: [], feed: [], log: [], timings: {},
+  profiles: [], mentions: [], issues: [], abuse: [], buzz: [], topics: [], feed: [], log: [], timings: {},
   verdict: '', net: { now: 0, delta: 0 },
 };
 
@@ -117,10 +118,12 @@ useEffect(() => {
     return () => clearInterval(t);
   }, [running]);
   const applyHash = useCallback(async (id: string, tab: Tab) => {
-    if (scanIdRef.current === id) { setTab(tab); return; }
     source.current?.close();
-    const previous = await api<Scan>(`/api/scans/${id}`);
+    // Update the selection synchronously (before the async fetch yields) so any
+    // rerun / tab action taken in the load window targets THIS scan, not the
+    // one that was on screen a moment ago.
     scanIdRef.current = id;
+    const previous = await api<Scan>(`/api/scans/${id}`);
     setScan(normalize({ ...previous, id }));
     setStage(previous.stage);
     setLog(previous.log ?? []);
@@ -235,9 +238,14 @@ useEffect(() => {
   }, [attachStream, refresh]);
 
   /** Re-run one or more stages on the currently loaded scan, in sequence,
-   *  streamed over SSE so the tabs page in the results as they land. */
+   *  streamed over SSE so the tabs page in the results as they land.
+   *
+   *  The target scan id is read from the selection ref rather than the state
+   *  closure: the ref is set synchronously the instant a site is picked in the
+   *  rail, so a rerun can never hit a different site than the one highlighted. */
   const rerun = useCallback(async (stages: Stage[]) => {
-    if (!scan.id || stages.length === 0) return;
+    const target = scanIdRef.current;
+    if (!target || stages.length === 0) return;
     source.current?.close();
     setRerunningStage(stages[0]);
     setRunning(true);
@@ -248,6 +256,7 @@ useEffect(() => {
     setLog([]);
     setScan((s) => ({
       ...s,
+      id: target,
       status: 'running',
       error: undefined, errorDetail: undefined, failedStage: undefined, errorKind: undefined,
     }));
@@ -255,7 +264,7 @@ useEffect(() => {
     const runOne = (stage: Stage, reset: boolean) =>
       new Promise<void>((resolve, reject) => {
         let settled = false;
-        const stream = new EventSource(`/api/scans/${scan.id}/stages/${stage}/stream${reset ? '?reset=1' : ''}`);
+        const stream = new EventSource(`/api/scans/${target}/stages/${stage}/stream${reset ? '?reset=1' : ''}`);
         source.current = stream;
         stream.onopen = () => {
           setLog((l) => [
@@ -309,7 +318,7 @@ useEffect(() => {
             failedStage: stage,
             error: 'Rerun dropped before it could report back',
             errorKind: 'connector',
-            errorDetail: `The stage stream on /api/scans/${scan.id}/stages/${stage}/stream closed without a result (missing stage data, or the server ended the stream early).`,
+            errorDetail: `The stage stream on /api/scans/${target}/stages/${stage}/stream closed without a result (missing stage data, or the server ended the stream early).`,
           }));
           reject(new Error('stream dropped'));
         };
@@ -329,7 +338,7 @@ useEffect(() => {
       setRerunningStage(null);
       setRunning(false);
     }
-  }, [scan.id, refresh]);
+  }, [refresh]);
 
   const rerunStageFor = (tabKey: Tab): Stage[] | null => {
     switch (tabKey) {
@@ -495,6 +504,10 @@ useEffect(() => {
 
           {(hasScan || running) && (
             <>
+              <StatCards
+                scan={scan}
+                onDrill={(targetTab) => { setTab(targetTab); if (scanIdRef.current) window.location.hash = hashFor(scanIdRef.current, targetTab); }}
+              />
               <nav className="tabs" role="tablist" aria-label="Scan sections">
                 {TABS.map((t) => (
                   <button
@@ -515,7 +528,6 @@ useEffect(() => {
                     scan={scan}
                     cursor={cursor}
                     onScrub={setCursor}
-                    onDrill={(tab) => { setTab(tab); if (scanIdRef.current) window.location.hash = hashFor(scanIdRef.current, tab); }}
                   />
                 )}
 

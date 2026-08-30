@@ -28,7 +28,7 @@
   --s-1: #2a78d6;  --s-2: #eb6834;  --s-3: #1baf7a;
   --s-4: #eda100;  --s-5: #e87ba4;  --s-6: #008300;
   --s-7: #2a86d6;  --s-8: #5b7cfa;  --s-9: #1faf62;
-  --s-10: #c4302b;
+  --s-10: #c4302b; --s-11: #8257e5; --s-12: #0f7b8a;
 
   --good: #0ca30c;  --warning: #fab219;  --serious: #ec835a;  --critical: #d03b3b;
 
@@ -50,7 +50,7 @@
     --s-1: #3987e5;  --s-2: #d95926;  --s-3: #199e70;
     --s-4: #c98500;  --s-5: #d55181;  --s-6: #008300;
     --s-7: #2a86d6;  --s-8: #6b8aff;  --s-9: #1faf62;
-    --s-10: #b5453d;
+    --s-10: #b5453d; --s-11: #9a75f0; --s-12: #17909f; --s-11: #9a75f0; --s-12: #17909f;
     --pos: #3987e5;  --neg: #e66767;  --mid: #3a3f36;
   }
 }
@@ -1086,3 +1086,68 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
 }
+
+/* ---- topic volume, stacked ------------------------------------------------
+   Volume is a magnitude, so this uses the categorical palette rather than the
+   diverging one the sentiment tape needs for its signed values. */
+.topic-stack { display: grid; gap: 10px; }
+.topic-chart { width: 100%; height: auto; display: block; touch-action: none; }
+
+.topic-key {
+  display: flex; flex-wrap: wrap; gap: 4px 14px;
+  padding-top: 8px; border-top: 1px solid var(--hair);
+}
+.topic-key-item {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: none; border: 0; padding: 2px 0; cursor: pointer;
+  font: 400 11px var(--mono); color: var(--ink-2);
+}
+.topic-key-item:hover { color: var(--ink); }
+.topic-key-item[aria-pressed='true'] { color: var(--ink); font-weight: 600; }
+.topic-swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+.topic-total { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+.tip-topics { margin-top: 6px; display: grid; gap: 3px; }
+.tip-topic {
+  display: grid; grid-template-columns: 9px 1fr auto; gap: 7px;
+  align-items: center; font: 400 11px var(--mono);
+}
+
+/* ---- the resolution loop --------------------------------------------------
+   An audit trail is only useful if a reader can check it, so outgoing messages
+   are quoted in full and the human count is stated rather than implied. */
+.loop-status { border: 1px solid var(--hair); border-radius: 6px; padding: 9px 11px; margin: 4px 0 10px; }
+.loop-status.closed { border-color: color-mix(in srgb, var(--good) 45%, var(--hair)); }
+.loop-status.open   { border-color: color-mix(in srgb, var(--warning) 50%, var(--hair)); }
+.loop-status-h { font-weight: 600; font-size: 12.5px; }
+.loop-status-b { font: 400 11px var(--mono); color: var(--ink-3); margin-top: 3px; }
+
+.loop-reporter { margin-bottom: 12px; }
+.loop-reporter-h { display: flex; align-items: center; gap: 8px; font: 400 12px var(--mono); }
+
+.loop { list-style: none; margin: 0; padding: 0 0 0 18px; position: relative; }
+.loop::before {
+  content: ''; position: absolute; left: 3px; top: 6px; bottom: 6px;
+  width: 1px; background: var(--hair);
+}
+.loop-step { position: relative; padding: 0 0 16px; }
+.loop-mark {
+  position: absolute; left: -18px; top: 4px; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--ink-3); box-shadow: 0 0 0 3px var(--paper);
+}
+/* The reporter is the only human in the loop, so their steps are the ones
+   marked — the eye should land on exactly the moments a person was involved. */
+.loop-step.actor-reporter .loop-mark { background: var(--good); }
+.loop-step.actor-system .loop-mark { background: var(--signal); }
+
+.loop-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.loop-label { font-weight: 600; font-size: 12.5px; }
+.loop-at { font: 400 10.5px var(--mono); color: var(--ink-3); margin-left: auto; }
+.loop-summary { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; }
+.loop-message {
+  margin: 7px 0 0; padding: 7px 10px;
+  border-left: 2px solid var(--hair); background: var(--raised);
+  font-size: 12.5px; color: var(--ink); white-space: pre-wrap;
+}
+.loop-step.actor-reporter .loop-message { border-left-color: var(--good); }
+.loop-ref { margin-top: 5px; font: 400 10.5px var(--mono); color: var(--ink-3); }

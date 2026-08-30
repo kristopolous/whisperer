@@ -8,6 +8,7 @@
     "setup": "tsx --env-file=.env src/setup.ts",
     "hello": "tsx --env-file=.env src/hello.ts",
     "typecheck": "tsc",
+    "demo": "tsx --env-file=.env src/demo.ts",
     "agent": "tsx --env-file=.env src/run-agent.ts",
     "api": "tsx --env-file=.env --watch app/server/index.ts",
     "web": "vite --config app/web/vite.config.ts",

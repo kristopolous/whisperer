@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { Issue, Scan, Tracker } from '../../../shared/types.ts';
 import { api, fmtDate, venueOf } from '../lib.ts';
+import { ResolutionLoop } from './ResolutionLoop.tsx';
 
 const TRACKERS: { key: Tracker; label: string }[] = [
   { key: 'linear', label: 'Linear' },
@@ -57,6 +58,10 @@ export function Health({ scan, onChange }: { scan: Scan; onChange: (issue: Issue
                 <span style={{ font: '400 10.5px var(--mono)', color: 'var(--ink-3)' }}>
                   {i.evidence.length} {i.evidence.length === 1 ? 'report' : 'reports'}
                 </span>
+                {i.loop?.some((e) => e.step === 'closed') && <span className="tag good">closed by reporter</span>}
+                {i.loop?.length && !i.loop.some((e) => e.step === 'closed')
+                  ? <span className="tag warning">awaiting reporter</span>
+                  : null}
               </div>
             </button>
           ))}
@@ -131,6 +136,8 @@ function Report({ scan, issue, onChange }: { scan: Scan; issue: Issue; onChange:
         ))}
         {evidence.length === 0 && <li className="q">The supporting threads are no longer in this scan.</li>}
       </ul>
+
+      <ResolutionLoop issue={issue} />
 
       <h5>Reply to the people who raised it</h5>
       <p className="reply">{issue.draftReply}</p>
