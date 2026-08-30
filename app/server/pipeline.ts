@@ -2,15 +2,21 @@ import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { TrueForge } from '@truefoundry/trueforge-sdk';
 import type {
-  AbuseFinding, BuzzPoint, FeedItem, Issue, LogLevel, Mention, Profile, Scan, ScanEvent, Stage, Venue,
+  AbuseFinding, BuzzPoint, FeedItem, Issue, LogLevel, Mention, Profile, Scan, ScanEvent, Stage,
+  TopicPoint, Venue,
 } from '../shared/types.ts';
+import { brandToken } from '../shared/name.ts';
 import { fetchAll } from './content.ts';
-import { askJsonDirect } from './model.ts';
-import { abuseSchema, buzzSchema, healthSchema, verdictSchema } from './schemas.ts';
+import { runAgent } from './agents/runtime.ts';
+import { abuseAgent } from './agents/abuse.ts';
+import { buzzAgent } from './agents/buzz.ts';
+import { healthAgent } from './agents/health.ts';
+import { topicsAgent } from './agents/topics.ts';
+import { verdictAgent } from './agents/verdict.ts';
 import {
-  braveSearch, braveSearchAll, isLexicalNoise, isOpinionBearing, platformOf, profileHandle, venueOf,
+  braveSearch, braveSearchAll, isHomepage, isLexicalNoise, isOpinionBearing, namesCompany,
+  looksLikeComplaint, platformOf, profileHandle, searchWidening, venueOf, windowLabel,
   type SearchHit,
 } from './search.ts';
 
@@ -18,167 +24,10 @@ const run = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const SKILL = path.join(ROOT, 'skills/extract-social-media/scripts');
 
-export const client = new TrueForge({
-  baseUrl: process.env.TRUEFORGE_BASE_URL ?? 'http://localhost:8790',
-  timeoutInSeconds: 900,
-  token: process.env.TRUEFORGE_TOKEN,
-});
-
 export type Log = (level: LogLevel, text: string) => void;
 type Emit = Log;
 
-/** Search backends in the order we want them used.
- *
- *  YouTube first: it's the primary feed source (videos + comments) and the fastest
- *  to report back. Then Bright Data, the paid unmetered path that does not
- *  rate-limit the way the shared Exa endpoint does, which was returning 429
- *  through most of a run. Exa stays as a fallback rather than being removed —
- *  when Bright Data is not configured, some search is better than none.
- */
-const SEARCH_PREFERENCE = ['youtube', 'bright-data', 'exa', 'tiktok', 'brave'];
-
-/** Connectors each stage asks for, in the order it wants them tried. Exported
- *  so src/agents.ts can attach the identical set to the saved-agent version of
- *  each stage — one list, not two copies that can drift.
- *
- *  exa is deliberately absent: the shared Exa endpoint has been returning empty
- *  results and 429s for a whole day, and plumbing a broken connector into every
- *  stage just makes turns fail and pages come back blank. The other search
- *  connectors cover the same ground. */
-export const PRESENCE_SERVERS = ['x', 'exa', 'youtube', 'tiktok', 'bright-data', 'brave'];
-export const DISCOVERY_SERVERS = ['x', 'exa', 'youtube', 'tiktok', 'bright-data', 'brave'];
-export const FEED_SERVERS = ['youtube', 'bright-data', 'x', 'exa', 'tiktok', 'brave'];
-export const ABUSE_SERVERS = ['bright-data', 'brave', 'exa', 'youtube', 'tiktok'];
-
-const orderServers = (available: string[], wanted: string[]) =>
-  SEARCH_PREFERENCE.filter((name) => wanted.includes(name) && available.includes(name));
-
-/** Which connectors this instance actually has, so a missing one degrades to a
- *  narrower search instead of a failed turn. */
-export async function availableServers(): Promise<string[]> {
-  try {
-    const { data } = await client.mcpServers.list();
-    return data.map((s) => s.name);
-  } catch {
-    return [];
-  }
-}
-
-/** One agent turn against a saved TrueForge agent, held to the agent's own JSON
- *  schema, returned parsed.
- *
- *  Each pipeline stage is a named agent registered by `npm run setup` (see
- *  src/agents.ts) — instructions, connectors, model and responseFormat are baked
- *  into the save, and the only per-run input is the prompt. These are the same
- *  agents you can fire from the TrueForge chat UI or from another agent, so
- *  Whisperer's stages aren't some private inline spec nobody else can see or
- *  reuse. A connector that was up at setup time but is now dead surfaces as an
- *  ordinary isError tool result the model routes around (`preload: false` is part
- *  of every saved agent), instead of an eager failure at session start.
- */
-async function askJson<T>(opts: { agent: string; prompt: string; emit: Emit }): Promise<T> {
-  const { data: session } = await client.sessions.create({ agent: { name: opts.agent } });
-
-  const stream = await client.sessions.createTurnStream(session.id, {
-    input: [{ type: 'user.message', content: opts.prompt }],
-  });
-
-  let text = '';
-
-  // Tool calls arrive on model.message.delta as chunked deltas, not on a final
-  // model.message: the id + meta fn (e.g. call_tool) land on the first fragment,
-  // and the JSON arguments (which carry the real mcp_server + tool_name for the
-  // deferred tool-loading meta-tools) trickle in as a long chain of tiny
-  // fragments. Accumulate each call's id + arguments as they stream, resolve
-  // the label once the JSON is whole, and hang every subsequent tool.response
-  // off its id. Otherwise every line reads the same anonymous " returned N B"
-  // and the 429s tell you nothing.
-  const pending: { id: string; fn: string; args: string; label?: string; announced?: boolean }[] = [];
-  const byIndex = new Map<number, { id: string; fn: string; args: string; label?: string; announced?: boolean }>();
-
-  const announce = (call: { id: string; fn: string; args: string; label?: string; announced?: boolean }) => {
-    if (call.announced) return;
-    call.announced = true;
-    const label = describeToolCall(call.fn, call.args);
-    call.label = label;
-    opts.emit('tool', `calling ${label}`);
-  };
-
-  for await (const { data: event } of stream.withMetadata()) {
-    if (event.type === 'model.message.delta' && event.content) text += event.content;
-
-    if (event.type === 'model.message.delta' && event.toolCalls?.length) {
-      // Continuation fragments repeat the index but drop the id; the id-bearing
-      // fragment starts (or reopens) the call for that index.
-      for (const frag of event.toolCalls) {
-        let call = byIndex.get(frag.index);
-        if (!call || frag.id) {
-          call = { id: frag.id ?? '', fn: frag.function?.name ?? '', args: frag.function?.arguments ?? '' };
-          byIndex.set(frag.index, call);
-          pending.push(call);
-        } else {
-          call.args += frag.function?.arguments ?? '';
-        }
-        if (frag.function?.name) call.fn = frag.function.name;
-        if (call.args) {
-          try {
-            const parsed = JSON.parse(call.args);
-            if (parsed && typeof parsed === 'object' && (parsed.mcp_server || parsed.tool_name)) announce(call);
-          } catch {
-            // arguments still partial — wait for the next fragment
-          }
-        }
-      }
-    }
-
-    if (event.type === 'tool.response') {
-      // Prefer the exact id; fall back to the most recently described tool in
-      // the case where the meta-tool's response id doesn't line up.
-      const call = pending.find((p) => p.id === event.toolCallId);
-      if (call) announce(call);
-      const name = call?.label ?? pending.filter((p) => p.label).at(-1)?.label ?? 'tool';
-      const failed = /"error"|failed|Max retries|\b(4\d\d|5\d\d)\b/.test(event.content.slice(0, 200));
-      opts.emit(
-        failed ? 'warn' : 'tool',
-        failed
-          ? `${name} failed — ${summarizeFailure(event.content)}`
-          : `${name} returned ${formatBytes(event.content.length)}`,
-      );
-    }
-
-    if (event.type === 'mcp.auth_required') {
-      for (const server of event.mcpServers) opts.emit('warn', `${server.name} needs authorization`);
-    }
-
-    if (event.type === 'turn.done') {
-      if (event.state.status === 'error') throw new Error(event.state.message);
-      const output = event.state.status === 'done' ? event.state.output : null;
-      if (output && typeof output.content === 'string' && output.content.length > text.length) {
-        text = output.content;
-      }
-    }
-  }
-  return parseJson<T>(text);
-}
-
 const formatBytes = (n: number) => (n < 1024 ? `${n} B` : `${Math.round(n / 1024)} kB`);
-
-/** Deferred tool loading routes every real call through meta tools
- *  (list_tools / get_tool_info / call_tool) whose own name says nothing — the
- *  actual target lives in their arguments. Unwrap it so logs read
- *  "reddit.search_reddit" instead of "call_tool". */
-function describeToolCall(metaName: string, argsJson: string): string {
-  if (!['call_tool', 'list_tools', 'get_tool_info', 'get_tool_output_schema'].includes(metaName)) return metaName;
-  try {
-    const args = JSON.parse(argsJson) as { mcp_server?: string; tool_name?: string };
-    if (!args.mcp_server) return metaName;
-    if (metaName === 'call_tool' && args.tool_name) return `${args.mcp_server}.${args.tool_name}`;
-    if (metaName === 'list_tools') return `${args.mcp_server} (discovering tools)`;
-    return args.tool_name ? `${args.mcp_server}.${args.tool_name} (schema)` : metaName;
-  } catch {
-    return metaName;
-  }
-}
 
 /** Turn an MCP error blob into one readable clause. Kept defensive: the blob can
  *  be a clean error JSON, a nested {"error":{...}} envelope, or an unparsable
@@ -243,18 +92,6 @@ function pipeThrough(command: string, args: string[], input: string): Promise<st
 }
 
 /* ---------------------------------------------------------------- presence */
-
-export const FOOTPRINT_INSTRUCTIONS = `You map a company's entire public footprint — not just the accounts on their own site. Run the search connectors attached to you and hunt venue by venue for any channel where this company has a presence, official OR unofficial:
-
-- Subreddits (r/<name>), Hacker News profile, Discord servers
-- Messaging groups: Telegram (t.me/<name>), Signal group links, WhatsApp group/channel links
-- Review platforms: Trustpilot, Google reviews, Yelp — even when the company does not run them
-- Socials: Facebook, Instagram, TikTok, Snapchat, X, YouTube, LinkedIn, GitHub — official account plus any fan/community/impostor one
-- Community forums and blogs
-
-For each channel report platform, a short handle/title, the url, and whether it is OFFICIAL (run by the company itself) or UNOFFICIAL (fan, community, review, impersonation, third-party). The profile URL is a real, openable link. Do not invent a url — if you could not find one, skip it. Collect every real channel you find, even an unflattering or unofficial one; a company with no unofficial footprint is a finding too. Include at least the clearly-offical accounts the site links to if your search turned them up. When tools are not attached or one venue fails, note it and search the rest.
-
-One row per real account: use x.com not twitter.com, the canonical YouTube URL (youtube.com/@handle) not a /c/ or /channel/ variant, and the handle exactly as the platform shows it with no extra @ prefix. If a search turns up the same account under two URLs, report it once.`;
 
 /** Map a company's footprint. The site scrape yields the accounts the company
  *  itself links to (tagged official); a search sweep then adds the unofficial
@@ -330,17 +167,18 @@ export async function findPresence(
   }
 
   const fromSite = merged.size;
+  const brand = brandToken(company, site);
 
   // The company's own name plus each platform. Cheap, and it is exactly the
   // query a person types.
   const queries = [
-    `${company} official x.com twitter`,
-    `${company} linkedin company page`,
-    `${company} github`,
-    `${company} youtube channel`,
-    `${company} discord community invite`,
-    `${company} subreddit reddit`,
-    `${company} instagram tiktok`,
+    `${brand} official x.com twitter`,
+    `${brand} linkedin company page`,
+    `${brand} github`,
+    `${brand} youtube channel`,
+    `${brand} discord community invite`,
+    `${brand} subreddit reddit`,
+    `${brand} instagram tiktok`,
   ];
 
   const hits = await braveSearchAll(queries, 10, (query, message) =>
@@ -418,28 +256,72 @@ export async function resolveSite(company: string, emit: Emit): Promise<string> 
 
 /* --------------------------------------------------------------- discovery */
 
-export const DISCOVERY_INSTRUCTIONS = `You find where people discuss software by actually running the search connectors attached to you. Do the searching yourself with the real tools — do not answer from memory, and do not return "nothing" without first running every connector that is attached.
+/** How far back still counts as current for a brand watch. A year is the outer
+ *  edge of useful: a complaint from thirteen months ago has either been fixed
+ *  or has stopped being news. */
+const RECENT_MONTHS = 12;
 
-Check which tools are attached, then search venue by venue:
+/** Volume controls, env-overridable because the right numbers depend on both
+ *  the subject and the Brave plan.
+ *
+ *  Why the corpus was tiny: without pagination a query could return at most 20
+ *  results however much the internet had to say, and the result was then cut to
+ *  60. Twenty queries against a thirty-year-old program with a huge, vocal user
+ *  base produced 121 raw hits. That is not what the internet holds; it is what
+ *  20 × 20, minus heavy overlap between queries, minus rate-limited failures,
+ *  arithmetically comes to.
+ *
+ *  Paging costs real time: Brave's free tier is one request per second, so each
+ *  extra page across twenty queries is another twenty seconds of wall clock.
+ *  Three pages is the default because it roughly triples the corpus for about a
+ *  minute more, and going wider is a plan question, not a code one. */
+const SEARCH_PAGES = Number(process.env.SEARCH_PAGES ?? 3);
 
-1. Reddit and Hacker News: you have no dedicated tool for either — search them through Bright Data's search_engine and scrape_as_markdown with site-scoped queries ("site:reddit.com <alias>", "site:news.ycombinator.com <alias>"), then scrape_as_markdown the threads that come up to read the actual comments. A thread with real comments is the goal, but a search hit with a real post you can see is still reportable.
-2. X: if an X search/fetch tool is attached, run it for the alias and pull the actual post text. If not attached, say so and search "site:x.com" via web search instead.
-3. Wider web: run search_engine (Bright Data) or Brave for several narrow queries — plain mention, "X vs", "X review", "X problems", "we use X", "switched from X" — and scrape_as_markdown the promising results to read what was actually said.
-4. Messaging groups (Telegram, Signal, WhatsApp) are real venues — hunt for the company's channels/groups/invite links (t.me, signal.me/signal.group, chat.whatsapp.com/wa.me/whatsapp.com/channel) via web search and the company's own pages. Report official and unofficial communities both, tagged by venue. If you cannot open a group, a short factual note that it exists (name, size if shown) is a valid finding.
+/** How many results discovery wants before it stops widening its window. */
+const DISCOVERY_TARGET = Number(process.env.DISCOVERY_TARGET ?? 150);
 
-Report what the connectors actually gave you. The empty scan is the worst outcome — an honest "no Reddit presence, 2 HN mentions" is a real result; silently returning an empty list when you found search hits is a failure. Collect every real URL you found, even if you could not open the page or read the comments.
+/** How many complaint-shaped results to gather before the complaint pass stops
+ *  widening. Separate from the general target because this is the half of the
+ *  corpus the product actually exists to act on. */
+const COMPLAINT_TARGET = Number(process.env.COMPLAINT_TARGET ?? 120);
 
-The excerpt is a verbatim quote of what a real person wrote when you could read it; when you could not open the source, put a short factual description of what the link is instead. Never invent a quote, a URL, a date, or an engagement count.
+/** How many mentions the corpus keeps.
+ *
+ *  Deliberately much larger than the number the model stages will read. Rows
+ *  are nearly free — they are a title, a URL and a snippet — while scoring is
+ *  minutes per few dozen. Conflating the two is what made "how much did we
+ *  find" and "how much can we afford to think about" the same number, and the
+ *  smaller of the two won. */
+const MENTION_CAP = Number(process.env.MENTION_CAP ?? 300);
 
-Rules:
-- Run the searches. Tool failures and rate limits are not the end — note them, move to the next venue, and report what the others gave you.
-- Never invent a URL, a date, an engagement count, or a quote.
-- Skip press releases, listicles, job postings and the company's own docs and blog (a vendor post syndicated to five sites is one voice).
-- Prefer dated, reachable discussion, but include relevant recent findings even without a date you could verify.
-- Return up to 40 mentions, newest first. Venue coverage beats a lopsided pile: try to include each venue where you found something.`;
+/** The few questions whose best answers are old by nature. Everything else goes
+ *  through the widening recent sweep. */
+const HISTORICAL_QUERIES = (company: string) => [
+  `"switched from ${company}"`,
+  `"${company}" vs`,
+  `"we use ${company}"`,
+];
+
+const isRecent = (date: string) =>
+  Date.now() - Date.parse(date) < RECENT_MONTHS * 30.44 * 86_400_000;
+
+/** Sort order for the corpus: real discussion first, then recency, newest
+ *  first. This decides what survives the cut to sixty, so it is doing more work
+ *  than an ordinary display sort. */
+function rankByDiscussionThenRecency(a: SearchHit, b: SearchHit): number {
+  const tier = (hit: SearchHit) => {
+    const opinion = isOpinionBearing(hit) ? 0 : 3;
+    if (hit.date && isRecent(hit.date)) return opinion;
+    if (!hit.date) return opinion + 1;
+    return opinion + 2;
+  };
+  const byTier = tier(a) - tier(b);
+  if (byTier !== 0) return byTier;
+  return (b.date ?? '').localeCompare(a.date ?? '');
+}
 
 export async function findMentions(
-  company: string, site: string, profiles: Profile[], servers: string[], emit: Emit,
+  company: string, site: string, profiles: Profile[], emit: Emit,
 ): Promise<Mention[]> {
   // Venue by venue, as site-scoped queries. No agent decides which of these to
   // run or in what order — they all run, every time, and a failure in one is a
@@ -452,41 +334,188 @@ export async function findMentions(
   // fills with reviews and "best alternatives" roundups, nobody in it is
   // complaining, and the health stage has nothing to triage while sentiment is
   // scored over SEO copy rather than over anyone's experience.
-  const queries = [
-    `site:reddit.com ${company}`,
-    `site:news.ycombinator.com ${company}`,
-    `site:x.com ${company}`,
-    `site:github.com ${company} issue`,
-    `"${company}" review`,
-    `"${company}" vs`,
-    `"we use ${company}"`,
-    `"switched from ${company}"`,
+  // What to search for is not always what was typed — see brandToken. Every
+  // query below quotes this as an exact phrase, so a descriptive subject like
+  // "gimp image editor" would otherwise search for a phrase nobody writes.
+  const brand = brandToken(company, site);
+  if (brand.toLowerCase() !== company.toLowerCase()) {
+    emit('info', `searching for "${brand}" (from ${site}) rather than the phrase "${company}"`);
+  }
 
-    // Complaint language.
-    `"${company}" broken`,
-    `"${company}" "not working"`,
-    `"${company}" slow OR laggy OR timeout`,
-    `"${company}" bug OR crash OR error`,
-    `"${company}" "doesn't work"`,
-    `"${company}" frustrating OR unusable`,
-    `"${company}" billing OR charged OR refund problem`,
-    `site:reddit.com "${company}" problem OR broken OR bug`,
-    `site:news.ycombinator.com "${company}" broken OR bug OR slow`,
+  // Two query sets, run as two passes and merged with a guaranteed share each.
+  //
+  // They used to be one list. Every result went into one pool that was then
+  // ranked by recency and cut to the scoring budget — and since announcements
+  // and news are always fresher than an accumulated complaint thread, the
+  // complaint results were collected and then buried before the model ever read
+  // them. Measured on a real corpus, complaint-bearing mentions fell from 15 of
+  // 60 to 3 of 48 as the recency ranking was tightened. The product is about
+  // turning gripes into fixes, so that is the corpus quietly losing its point.
+  const generalQueries = [
+    `site:reddit.com ${brand}`,
+    `site:news.ycombinator.com ${brand}`,
+    `site:x.com ${brand}`,
+    `"${brand}" review`,
+    `"${brand}" vs`,
+    `"we use ${brand}"`,
   ];
+
+  // How people actually complain, in two registers, every line measured against
+  // real results before being kept.
+  //
+  // The previous set was helpdesk language — "not working", "bug OR crash OR
+  // error", "billing OR charged". Measured on GIMP, a product with a famously
+  // hostile user opinion, `"gimp" "not working"` returned ten results of which
+  // ZERO were anybody complaining, and `"gimp" bug OR crash OR error` returned
+  // one. That phrasing is how a support ticket is written, not how a person
+  // talks, so the complaint half of the corpus was full of documentation.
+  //
+  // What people actually write is a verdict or a rhetorical question — "gimp
+  // sucks", "why is gimp so", "i hate gimp" — and in more measured venues, a
+  // negation or a wish: "disappointed", "wish it would", "needs better". Both
+  // registers are here because they occur in different places: forums and
+  // Reddit are blunt, blogs and LinkedIn are polite about the same complaint.
+  //
+  // Hit rates measured for "gimp" (results that actually contain a gripe):
+  //   "gimp sucks"                       10/10      "gimp" "not working"     0/10
+  //   "hate gimp"                        10/10      "gimp" bug OR crash      1/10
+  //   "why does gimp" annoying|stupid    10/10
+  //   "disappointed" gimp                10/10
+  //   "wish gimp" would|could|had         7/10
+  //   "gimp needs" better|fixing          7/10
+  //
+  // Phrasings that returned nothing at all were dropped rather than kept for
+  // completeness: "wouldn't recommend X", "not a fan of X", "what happened to
+  // X", "X isn't for everyone" are things people say but not things they write
+  // often enough to index.
+  const complaintQueries = [
+    // Blunt verdict.
+    `"${brand} sucks"`,
+    `"${brand} is trash" OR "${brand} is garbage"`,
+    `"${brand} is awful" OR "${brand} is terrible"`,
+    `"hate ${brand}"`,
+    `"${brand} is the worst"`,
+
+    // Rhetorical question — the most common shape a real complaint takes.
+    `"why is ${brand} so"`,
+    `"why does ${brand}" annoying OR stupid OR terrible`,
+
+    // Polite register: negation, shortfall, and the wish that implies a defect.
+    `"disappointed" ${brand}`,
+    `"wish ${brand}" would OR could OR had`,
+    `"${brand} needs" better OR fixing OR improvement`,
+    `"${brand} isn't" OR "${brand} is not" recommend OR ideal OR great`,
+    `"${brand} falls short" OR "${brand} lacks"`,
+    `"struggled with ${brand}" OR "struggling with ${brand}"`,
+
+    // The failure as an event, in the past tense. The highest-value shape here:
+    // 10/10 for GIMP, and unlike a pure verdict it names a defect, which is
+    // what triage can actually turn into a ticket.
+    `"${brand} froze" OR "${brand} crashed"`,
+    `"${brand} keeps freezing" OR "${brand} keeps crashing"`,
+
+    // Euphemism and profanity, in two groups that are NOT the same complaint.
+    //
+    //  - "garbage", "trash", "waste of time", "dumpster fire" is a verdict on
+    //    whether the thing is worth the effort. The product may work exactly as
+    //    designed; the person has decided the payoff does not justify the cost.
+    //    That is a usability or feature-gap finding, and no bug fix addresses it.
+    //
+    //  - "bullshit", "bs", "crap" is a verdict on whether it can be trusted to
+    //    do what it says. Something behaved unpredictably, or the behaviour
+    //    contradicted what was promised. That is a reliability finding, and it
+    //    usually does have a defect underneath it.
+    //
+    // Conflating them produces tickets that cannot be actioned: "users say it
+    // is garbage" is not a bug report, and "users say it is bullshit" filed as
+    // a UX complaint loses the defect. Both are searched; triage is told to
+    // keep them apart.
+    `"${brand}" "hot garbage" OR "dumpster fire"`,
+    `"${brand}" "waste of time" OR "not worth it"`,
+    `"${brand}" bullshit OR bs`,
+    `"${brand} is crap" OR "${brand} is crappy"`,
+
+    // Something changed and made it worse — where regressions surface.
+    `"the new ${brand}" bad OR worse OR ruined`,
+    `"${brand}" "gave up" OR "giving up on"`,
+
+    // Venue-scoped sweeps, and the one place defects are filed as defects.
+    `site:reddit.com "${brand}" sucks OR terrible OR frustrating OR annoying`,
+    `site:news.ycombinator.com "${brand}" bad OR broken OR frustrating`,
+    `site:github.com "${brand}" issue bug`,
+  ];
+
+  const queries = [...generalQueries, ...complaintQueries];
 
   // A subreddit or GitHub org we already found is a sharper query than a blind
   // name search, so fold the real ones in.
   for (const profile of profiles.filter((candidate) => candidate.official)) {
     if (profile.platform === 'reddit' && profile.handle.startsWith('r/')) {
-      queries.push(`site:reddit.com/${profile.handle} ${company}`);
+      queries.push(`site:reddit.com/${profile.handle} ${brand}`);
     }
     if (profile.platform === 'github') queries.push(`site:github.com/${profile.handle} issues`);
   }
 
-  emit('info', `running ${queries.length} searches`);
-  const hits = await braveSearchAll(queries, 10, (query, message) =>
-    emit('warn', `search "${query}" failed — ${message}`));
-  emit('info', `${hits.length} distinct results`);
+  // A widening recent sweep, then a small unrestricted pass for the handful of
+  // genuinely historical questions.
+  //
+  // An unrestricted sweep alone is what made this stage useless on a big
+  // company. Search ranks by relevance, and for a product with years of
+  // coverage the most "relevant" pages are old, heavily-linked ones — so it
+  // came back led by an eighteen-month-old thread, and because the corpus is
+  // then cut to sixty, the last week of discussion could fail to make it in at
+  // all.
+  const onError = (query: string, message: string) => emit('warn', `search "${query}" failed — ${message}`);
+
+  emit('info', `${generalQueries.length} general + ${complaintQueries.length} complaint searches`);
+
+  // The general pass chases recency: what is being said right now.
+  const general = await searchWidening(
+    generalQueries,
+    { count: 20, target: DISCOVERY_TARGET, pages: SEARCH_PAGES },
+    onError,
+    (rung, total) => emit('info', `general: ${windowLabel(rung)} → ${total} results`),
+  );
+
+  // The complaint pass is NOT windowed, and that is the whole point of running
+  // it separately.
+  //
+  // Complaints accumulate; they do not trend. The definitive thread on why a
+  // mature product is frustrating was written years ago and is still true, and
+  // still what people link. Running these through the recency ladder meant the
+  // ladder hit its target inside the last month and stopped — so the highest
+  // precision queries in the whole system, the ones measured at 10/10 for
+  // returning real gripes, never had their actual results fetched.
+  //
+  // Recency is applied afterwards, as ranking, where it belongs. The general
+  // pass above is what answers "what is being said right now".
+  const complaintHits = await braveSearchAll(complaintQueries, 20, onError, undefined, SEARCH_PAGES);
+  const complaint = { hits: complaintHits, window: undefined, steps: [] };
+
+  emit(
+    'info',
+    `general settled on ${windowLabel(general.window)} (${general.hits.length} results), `
+    + `complaint sweep unwindowed (${complaint.hits.length} results)`,
+  );
+
+  // One unrestricted pass for the questions that are genuinely historical —
+  // "switched from X", "X vs Y" — whose best answers accumulated over years and
+  // would be thrown away by any window.
+  const all = await braveSearchAll(HISTORICAL_QUERIES(brand), 20, onError, undefined, SEARCH_PAGES);
+
+  // What the text says, not which query found it. The complaint pass casts a
+  // wide net — Brave's OR is a preference, not a filter — so "came back from a
+  // complaint query" marked almost the whole corpus and ranked nothing.
+  const fromComplaints = new Set(
+    [...complaint.hits, ...general.hits, ...all].filter(looksLikeComplaint).map((hit) => hit.url),
+  );
+
+  const merged = new Map<string, SearchHit>();
+  for (const hit of [...complaint.hits, ...general.hits, ...all]) {
+    if (!merged.has(hit.url)) merged.set(hit.url, hit);
+  }
+  const hits = [...merged.values()];
+  emit('info', `${hits.length} distinct results, ${fromComplaints.size} whose text reads as a complaint`);
 
   const ownHost = (() => {
     try {
@@ -496,23 +525,72 @@ export async function findMentions(
     }
   })();
 
-  const usable = hits
+  // Counted per reason rather than in total. A single "dropped 79 results"
+  // line — worse, one that called all of them dictionary noise — hides which
+  // filter is eating the corpus, and with a subject like "gimp", which is an
+  // ordinary English word, that is exactly the thing you need to see.
+  const reasons = { ownSite: 0, lexical: 0, unrelated: 0, homepage: 0 };
+  const usable = hits.filter((hit) => {
     // A vendor's own blog, docs and status page are not third-party discussion.
-    .filter((hit) => !ownHost || !hit.url.includes(ownHost))
+    if (ownHost && hit.url.includes(ownHost)) { reasons.ownSite += 1; return false; }
     // A brand that is also an ordinary word drags in dictionary and spelling
     // pages, which carry no opinion to score and no complaint to triage.
-    .filter((hit) => !isLexicalNoise(hit));
+    if (isLexicalNoise(hit)) { reasons.lexical += 1; return false; }
+    // Must actually be about the company, and not a site's front page — both of
+    // which a narrow freshness window otherwise lets straight through.
+    // Kept strict on purpose. Exempting complaint-shaped posts from discussion
+    // venues was tried and let in gripes about MMA, Slipknot and golf games —
+    // complaint language is common enough that without the brand test it
+    // matches the whole of Reddit.
+    if (!namesCompany(hit, brand)) { reasons.unrelated += 1; return false; }
+    if (isHomepage(hit.url)) { reasons.homepage += 1; return false; }
+    return true;
+  });
 
   const dropped = hits.length - usable.length;
-  if (dropped) emit('info', `dropped ${dropped} dictionary/spelling result(s)`);
+  if (dropped) {
+    emit(
+      'info',
+      `kept ${usable.length} of ${hits.length}: dropped ${reasons.ownSite} on ${ownHost || 'own site'}, `
+      + `${reasons.lexical} dictionary/spelling, ${reasons.unrelated} that never name "${brand}", `
+      + `${reasons.homepage} homepages`,
+    );
+  }
 
-  // Real discussion ahead of SEO roundups, so the 60 we keep are the 60 worth
-  // reading rather than whatever the merge order happened to be.
-  const ordered = [
-    ...usable.filter((hit) => isOpinionBearing(hit)),
-    ...usable.filter((hit) => !isOpinionBearing(hit)),
-  ];
-  emit('info', `${ordered.filter(isOpinionBearing).length} of ${ordered.length} look like real discussion`);
+  // Real discussion ahead of SEO roundups, and recent ahead of old, so the 60
+  // we keep are the 60 worth reading rather than whatever search ranked highest.
+  //
+  // Undated hits sit between recent and old rather than at the bottom. A page
+  // search could not date is more often a forum thread or a comment than a
+  // dead article, and burying it under material we know to be two years old
+  // would be a worse guess than the one made here.
+  // Interleave rather than sort into one list.
+  //
+  // Both groups are ranked the same way internally, then taken in turns, so the
+  // head of the corpus — the part the model can afford to read — is about half
+  // complaints by construction. A single sorted pool cannot do this: whatever
+  // the sort key is, one kind of result wins the top and the other is cut.
+  const complaintsFirst = usable.filter((hit) => fromComplaints.has(hit.url)).sort(rankByDiscussionThenRecency);
+  const rest = usable.filter((hit) => !fromComplaints.has(hit.url)).sort(rankByDiscussionThenRecency);
+
+  const ordered: SearchHit[] = [];
+  for (let i = 0; i < Math.max(complaintsFirst.length, rest.length); i += 1) {
+    if (i < complaintsFirst.length) ordered.push(complaintsFirst[i]!);
+    if (i < rest.length) ordered.push(rest[i]!);
+  }
+
+  const fresh = ordered.filter((hit) => hit.date && isRecent(hit.date)).length;
+  const head = ordered.slice(0, SCORE_BUDGET);
+  emit(
+    'info',
+    `${ordered.filter(isOpinionBearing).length} of ${ordered.length} look like real discussion, `
+    + `${fresh} from the last ${RECENT_MONTHS} months`,
+  );
+  emit(
+    'info',
+    `${head.filter((hit) => fromComplaints.has(hit.url)).length}/${head.length} of the mentions the `
+    + `model will read contain complaint language`,
+  );
 
   return ordered
     .map((hit) => ({
@@ -529,50 +607,92 @@ export async function findMentions(
       sentiment: 'neutral' as const,
       score: 0,
       themes: [],
+      discussion: isOpinionBearing(hit),
+      complaint: fromComplaints.has(hit.url),
     }))
-    .slice(0, 60);
+    .slice(0, MENTION_CAP);
 }
 
 /* ------------------------------------------------------------------- feed */
 
-export const FEED_INSTRUCTIONS = `You are a brand's live feed listener. Run the search connectors attached to you and pull the LATEST things that have surfaced about the company — this is a feed, not a survey, so the most recent wins.
-Do the searching yourself with the real tools; do not answer from memory.
-Venue by venue:
-- YouTube first (search_youtube / video search): new videos about the product. For each video, also open its comments and report the notable recent ones verbatim.
-- Reddit and Hacker News: no dedicated tool for either — use Bright Data's search_engine with "site:reddit.com" / "site:news.ycombinator.com" queries, then scrape_as_markdown the threads that come up to read the newest comments verbatim, not a paraphrase.
-- Web search (Bright Data, Brave), X, Telegram, and any other attached connector: whatever fresh posts, comments or reviews turned up.
-Classify each item as a video (an upload), a comment (text inside a thread or under a video), or a post (the thread or post itself).
-For every item report: the venue (the source it came from), the kind (video/comment/post), the headline (video title or post title), the URL that links straight to it, the date it appeared, the author/channel, the snippet (the comment text verbatim when it is a comment, otherwise what the post/video says), and the engagement count.
-Only report things you actually retrieved from a connector result — no invented posts, no recollections. If nothing recent exists, return an empty list rather than making things up. Order newest first, and if two items are the same minute, keep the comment after its thread or video.`;
-
 /** Pull the latest things to surface about a company — new videos, comments and
  *  posts, newest first — by running the attached search connectors (YouTube
  *  search first). */
+/** How many items the feed wants before it stops widening its window. */
+const FEED_TARGET = Number(process.env.FEED_TARGET ?? 120);
+const FEED_CAP = Number(process.env.FEED_CAP ?? 200);
+
 export async function findFeed(
-  company: string, site: string, profiles: Profile[], servers: string[], emit: Emit,
+  company: string, site: string, profiles: Profile[], emit: Emit,
 ): Promise<FeedItem[]> {
   // The feed is the same deterministic search, biased to fresh things and
   // sorted newest first. YouTube gets its own queries because video is the
   // feed's primary source.
+  // Every one of these quotes the company name. Unquoted, `${company} news`
+  // matched the word "news" against every news site's front page — which is
+  // recrawled hourly and therefore always the freshest thing in any window.
+  const brand = brandToken(company, site);
+
   const queries = [
-    `${company} news`,
-    `${company} latest`,
-    `site:youtube.com ${company}`,
-    `site:reddit.com ${company}`,
-    `site:news.ycombinator.com ${company}`,
-    `"${company}" update release`,
+    `"${brand}" news`,
+    `"${brand}" announcement OR launch OR update`,
+    `site:youtube.com "${brand}"`,
+    `site:reddit.com "${brand}"`,
+    `site:news.ycombinator.com "${brand}"`,
+    `site:x.com "${brand}"`,
   ];
 
   for (const profile of profiles.filter((candidate) => candidate.official)) {
-    if (profile.platform === 'youtube') queries.push(`site:youtube.com ${profile.handle} ${company}`);
+    if (profile.platform === 'youtube') queries.push(`site:youtube.com ${profile.handle} ${brand}`);
     if (profile.platform === 'reddit' && profile.handle.startsWith('r/')) {
       queries.push(`site:reddit.com/${profile.handle}`);
     }
   }
 
-  emit('info', `feed: running ${queries.length} searches`);
-  const hits = await braveSearchAll(queries, 10, (query, message) =>
-    emit('warn', `search "${query}" failed — ${message}`));
+  // Starts at the last 24 hours and widens only if that is not enough. The
+  // comment above used to say this stage was "biased to fresh things" while
+  // passing no freshness at all, which is how a feed for a company posting
+  // hourly came back led by something three weeks old.
+  emit('info', `feed: ${queries.length} searches, starting at the last 24 hours`);
+  const { hits, window, steps } = await searchWidening(
+    queries,
+    { count: 20, target: FEED_TARGET, pages: SEARCH_PAGES },
+    (query, message) => emit('warn', `search "${query}" failed — ${message}`),
+    (rung, total) => emit('info', `feed: ${windowLabel(rung)} → ${total} results`),
+  );
+  emit(
+    'info',
+    `feed: settled on ${windowLabel(window)} after ${steps.length} `
+    + `window${steps.length === 1 ? '' : 's'}, ${hits.length} results`,
+  );
+
+  // Fresh is not the same as relevant, and a tight window makes that gap wide:
+  // anything recrawled constantly looks new. Require the company to actually be
+  // named, and drop bare homepages, before anything is called a feed item.
+  //
+  // Two more exclusions specific to a feed:
+  //
+  //  - Reference pages. A Wikipedia article that mentions the company carries an
+  //    edit timestamp, so it arrives looking hours old, and it is nobody saying
+  //    anything — it is an encyclopedia entry that happens to have been touched.
+  //  - The company's own site. Their marketing pages are not news about them.
+  //    Their own *social accounts* stay: an announcement on their X account is a
+  //    real event in the feed, and it lives on x.com, not on their domain.
+  const feedHost = (() => {
+    try {
+      return new URL(site).hostname.replace(/^www\./, '');
+    } catch {
+      return '';
+    }
+  })();
+
+  const relevant = hits.filter((hit) =>
+    namesCompany(hit, brand)
+    && !isHomepage(hit.url)
+    && !/wikipedia\.org|wikimedia\.org|fandom\.com/.test(hit.url)
+    && (!feedHost || !hit.url.includes(feedHost)));
+  const irrelevant = hits.length - relevant.length;
+  if (irrelevant) emit('info', `feed: dropped ${irrelevant} result(s) that never name ${brand}`);
 
   const kindOf = (url: string): FeedItem['kind'] => {
     if (/youtube\.com\/watch|youtu\.be\//.test(url)) return 'video';
@@ -580,7 +700,7 @@ export async function findFeed(
     return 'post';
   };
 
-  const items = hits.map((hit) => ({
+  const items = relevant.map((hit) => ({
     id: randomUUID().slice(0, 8),
     venue: venueOf(hit.url),
     kind: kindOf(hit.url),
@@ -603,7 +723,7 @@ export async function findFeed(
       if (b.date) return 1;
       return 0;
     })
-    .slice(0, 60);
+    .slice(0, FEED_CAP);
 }
 
 function normalizeDate(value: string | null | undefined): string | null {
@@ -617,20 +737,37 @@ function normalizeDate(value: string | null | undefined): string | null {
 
 /* -------------------------------------------------------------------- buzz */
 
-export const BUZZ_INSTRUCTIONS = `You read public discussion and rate how people feel about a product.
-
-Score each item from -1 (hostile) to +1 (delighted). 0 is genuinely neutral — a factual mention with no opinion — not a hedge for "unsure". Rate the commenters' view of the product, not the writing quality, and not the sentiment of the topic.
-
-A frustrated user reporting a bug they want fixed is negative but engaged; mark it negative and tag the theme. Sarcasm reads as its opposite; judge intent.
-
-Themes are two or three words, reusable across items ("cold starts", "pricing", "docs gaps"), not sentence fragments.
-
-The verdict names the direction perception is moving and what is driving it, in one paragraph, citing what you saw rather than generalities.`;
+/** How many mentions the model is asked to score.
+ *
+ *  This is a budget, not a corpus size, and keeping the two separate is the
+ *  point. Retrieval can now collect hundreds of rows for the price of a few
+ *  minutes of paging; scoring is minutes per few dozen on a local model, and
+ *  scoring three hundred would take hours. So everything found is kept and
+ *  shown, and the model reads the top slice of it — which, because the corpus
+ *  is ranked real-discussion-first then newest-first, is the part worth
+ *  reading anyway.
+ *
+ *  Raise it when pointing at a fast hosted model, where the arithmetic is
+ *  completely different. */
+const SCORE_BUDGET = Number(process.env.SCORE_BUDGET ?? 60);
 
 export async function scoreBuzz(
   company: string, mentions: Mention[], emit: Emit,
 ): Promise<{ mentions: Mention[]; verdict: string }> {
   if (mentions.length === 0) return { mentions, verdict: 'No third-party discussion found to score.' };
+
+  // The corpus keeps its order; only the head of it is scored. The unscored
+  // tail stays in the mention list and stays visible in Discovery — it is real
+  // discussion that was found, and hiding it would misrepresent the reach of
+  // the search as the reach of the model.
+  const budgeted = mentions.slice(0, SCORE_BUDGET);
+  if (mentions.length > budgeted.length) {
+    emit(
+      'info',
+      `scoring the top ${budgeted.length} of ${mentions.length} mentions — the rest are collected `
+      + `and listed but not scored (SCORE_BUDGET)`,
+    );
+  }
 
   // Score in batches rather than in one turn.
   //
@@ -653,17 +790,19 @@ export async function scoreBuzz(
    *  search snippet and has to be trimmed to leave output budget. */
   const TEXT_BUDGET = 900;
   const batches: Mention[][] = [];
-  for (let i = 0; i < mentions.length; i += BATCH) batches.push(mentions.slice(i, i + BATCH));
+  for (let i = 0; i < budgeted.length; i += BATCH) batches.push(budgeted.slice(i, i + BATCH));
 
   // Fetch what people actually wrote before scoring any of it. Without this the
-  // model is rating Brave's meta description — SEO copy, not opinion.
-  emit('info', `fetching real page text for ${mentions.length} mentions`);
-  const fetched = await fetchAll(mentions, (done, total, full) =>
+  // model is rating Brave's meta description — SEO copy, not opinion. Only the
+  // budgeted head is fetched: fetching pages nobody will read is the same waste
+  // as scoring them.
+  emit('info', `fetching real page text for ${budgeted.length} mentions`);
+  const fetched = await fetchAll(budgeted, (done, total, full) =>
     emit('info', `fetched ${done}/${total} (${full} with full text)`));
   const fullCount = [...fetched.values()].filter((f) => f.full).length;
-  emit('info', `${fullCount}/${mentions.length} yielded real content; the rest keep their search snippet`);
+  emit('info', `${fullCount}/${budgeted.length} yielded real content; the rest keep their search snippet`);
 
-  emit('info', `scoring ${mentions.length} mentions in ${batches.length} batches of ${BATCH}`);
+  emit('info', `scoring ${budgeted.length} mentions in ${batches.length} batches of ${BATCH}`);
 
   const scores = new Map<string, { sentiment: Mention['sentiment']; score: number; themes?: string[] }>();
   const verdicts: string[] = [];
@@ -687,13 +826,13 @@ export async function scoreBuzz(
     try {
       // Straight to the model endpoint with the schema attached — see
       // app/server/model.ts for why this does not go through a saved agent.
-      const { scored, verdict } = await askJsonDirect<{
+      const { scored, verdict } = await runAgent<{
         scored: { url: string; sentiment: Mention['sentiment']; score: number; themes?: string[] }[];
         verdict: string;
-      }>({
-        instructions: BUZZ_INSTRUCTIONS,
+      }>(buzzAgent, {
         prompt: `Product: "${company}". Score every item and write the verdict.\n\n${JSON.stringify(corpus)}`,
-        schema: buzzSchema,
+        note: `batch ${index + 1}/${batches.length}`,
+        items: corpus.length,
       });
 
       // A model that ignores the -1..1 range (local ones return 0-10 often
@@ -764,14 +903,13 @@ async function summariseVerdict(company: string, mentions: Mention[], emit: Emit
   const top = [...themes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
 
   emit('info', 'writing the verdict over the whole window');
-  const { verdict } = await askJsonDirect<{ verdict: string }>({
-    instructions: BUZZ_INSTRUCTIONS,
+  const { verdict } = await runAgent<{ verdict: string }>(verdictAgent, {
     prompt: `Product: "${company}". Write ONLY the one-paragraph verdict for the whole window — `
       + `which way perception is moving and what is driving it. Do not score anything.\n\n`
       + `Totals across ${mentions.length} mentions: ${JSON.stringify(tally)}\n`
       + `Most common themes: ${JSON.stringify(top)}\n\n`
       + `The most negative and most positive items:\n${JSON.stringify(sample)}`,
-    schema: verdictSchema,
+    items: mentions.length,
   });
   return verdict ?? '';
 }
@@ -779,16 +917,6 @@ async function summariseVerdict(company: string, mentions: Mention[], emit: Emit
 const clamp = (n: number) => Math.max(-1, Math.min(1, Number(n) || 0));
 
 /* ------------------------------------------------------------------ health */
-
-export const HEALTH_INSTRUCTIONS = `You triage public complaints into engineering issues.
-
-Keep only problems in the product: bugs, broken or confusing interfaces, slowness, unreliability, missing documentation, billing surprises, and gaps people hit repeatedly. Discard opinion, pricing objections that are not billing bugs, competitor preference, and anything that is a support question rather than a defect.
-
-Merge duplicates: one issue per underlying cause, with every supporting URL in evidence. An issue raised by four people is one issue.
-
-Severity: critical = data loss, outage, or a security exposure; serious = a broken workflow with no workaround; warning = friction with a workaround; good = a resolved or minor nit.
-
-The draft reply is written to the people who raised it. Acknowledge the specific thing that happened, say plainly what is being done about it, and stop. No apology theatre, no gratitude padding, no promised dates, no marketing.`;
 
 export async function findIssues(
   company: string, mentions: Mention[], emit: Emit,
@@ -799,6 +927,20 @@ export async function findIssues(
   // model's output cap and loses the entire stage, so take the most negative
   // ones — those are the issues worth filing anyway.
   const MAX_COMPLAINTS = 20;
+
+  // Triage selects the worst-scored mentions, so it is only meaningful once
+  // something has scored them. When buzz fails, every mention still carries its
+  // initial score of 0, they all pass the filter, and the "worst 20" is an
+  // arbitrary 20 — which then produced a confident "no defects found". Refuse
+  // instead: a stage that cannot do its job has to say so, not return nothing.
+  const scored = mentions.filter((m) => m.score !== 0 || m.sentiment !== 'neutral');
+  if (mentions.length > 0 && scored.length === 0) {
+    throw new Error(
+      'triage needs scored mentions and none are scored — the sentiment stage did not run or failed, '
+      + 'so there is nothing to rank complaints by',
+    );
+  }
+
   const complaints = mentions
     .filter((m) => m.score < 0.15)
     .sort((a, b) => a.score - b.score)
@@ -839,18 +981,35 @@ export async function findIssues(
   emit('info', `triaging ${complaints.length} complaints in ${batches.length} batches`);
 
   const issues: Omit<Issue, 'id' | 'status' | 'firstSeen' | 'lastSeen'>[] = [];
+  const failures: string[] = [];
+  let succeeded = 0;
   for (const [index, batch] of batches.entries()) {
     try {
-      const result = await askJsonDirect<{ issues: Omit<Issue, 'id' | 'status' | 'firstSeen' | 'lastSeen'>[] }>({
-        instructions: HEALTH_INSTRUCTIONS,
+      const result = await runAgent<{ issues: Omit<Issue, 'id' | 'status' | 'firstSeen' | 'lastSeen'>[] }>(healthAgent, {
         prompt: `Product: "${company}". Triage these complaints.\n\n${JSON.stringify(batch)}`,
-        schema: healthSchema,
+        note: `batch ${index + 1}/${batches.length}`,
+        items: batch.length,
       });
       issues.push(...(result.issues ?? []));
+      succeeded += 1;
       emit('info', `batch ${index + 1}/${batches.length}: ${(result.issues ?? []).length} issue(s)`);
     } catch (error) {
-      emit('warn', `batch ${index + 1}/${batches.length} failed — ${error instanceof Error ? error.message.slice(0, 120) : 'error'}`);
+      failures.push(error instanceof Error ? error.message.slice(0, 120) : 'error');
+      emit('warn', `batch ${index + 1}/${batches.length} failed — ${failures.at(-1)}`);
     }
+  }
+
+  // The bug this guards: every batch failed, the loop swallowed each error, and
+  // an empty list was returned and rendered as "no defects found". A company
+  // with a wall of complaints was reported as healthy because the model was
+  // unreachable. Nothing succeeded means the stage failed.
+  if (succeeded === 0) {
+    throw new Error(
+      `every triage batch failed (${batches.length}/${batches.length}) — ${failures[0] ?? 'unknown error'}`,
+    );
+  }
+  if (failures.length) {
+    emit('warn', `${failures.length}/${batches.length} triage batches failed — this list is incomplete`);
   }
 
   const byUrl = new Map(mentions.map((m) => [m.url, m]));
@@ -872,37 +1031,20 @@ export async function findIssues(
 
 /* ------------------------------------------------------------------- abuse */
 
-export const ABUSE_INSTRUCTIONS = `You look for people abusing a brand's name, and you report only what the evidence supports.
-
-What counts:
-- **Impersonation** — accounts, servers or pages posing as the company, its founders or its support staff.
-- **Phishing and credential theft** — lookalike domains, fake login or wallet-connect pages, "verify your account" flows.
-- **Scams** — fake giveaways, airdrops, investment or refund schemes trading on the brand.
-- **Fake support** — DMs offering help that route users off-platform, a pattern in Discord and Telegram communities.
-- **Counterfeit** — resold licences, cracked builds, unauthorised listings.
-- **Malware** — trojaned packages, installers or extensions using the name.
-- **Spam and harassment** — coordinated posting, or brigading aimed at the company or its users.
-
-Rules:
-- Report only what you saw. A suspicion with no URL behind it is not a finding.
-- A competitor being negative is not abuse. A frustrated user is not abuse. Criticism is not abuse.
-- Do not name or target private individuals. Describe the account or the operation, not a person.
-- Severity is about exposure: critical = users are losing money or credentials right now; serious = an active impersonation with reach; warning = a lookalike or a stale scam post; good = handled or negligible.
-- The recommendation is one concrete action — which platform's report flow, which domain to register or contest, which community to warn.`;
-
 export async function findAbuse(
-  company: string, site: string, mentions: Mention[], servers: string[], emit: Emit,
+  company: string, site: string, mentions: Mention[], emit: Emit,
 ): Promise<AbuseFinding[]> {
   // Same split as the rest of the pipeline: deterministic code goes and finds
   // the candidate pages, then the model is asked once to judge which of them
   // are actually brand abuse. Handing an agent a search tool and asking it to
   // hunt could not produce valid JSON here, and the hunting part is a fixed set
   // of queries anyway — these are the surfaces abuse shows up on.
+  const brand = brandToken(company, site);
   const queries = [
-    `"${company}" scam`,
-    `"${company}" phishing`,
-    `"${company}" fake support`,
-    `"${company}" giveaway airdrop`,
+    `"${brand}" scam`,
+    `"${brand}" phishing`,
+    `"${brand}" fake support`,
+    `"${brand}" giveaway airdrop`,
     `"${company}" impersonating OR impersonation`,
     `"${company}" crack OR nulled OR cracked`,
     `site:npmjs.com ${company}`,
@@ -941,10 +1083,10 @@ export async function findAbuse(
   for (let i = 0; i < candidates.length; i += BATCH) batches.push(candidates.slice(i, i + BATCH));
 
   const findings: Omit<AbuseFinding, 'id' | 'status' | 'firstSeen'>[] = [];
+  let abuseSucceeded = 0;
   for (const [index, batch] of batches.entries()) {
     try {
-      const result = await askJsonDirect<{ findings: Omit<AbuseFinding, 'id' | 'status' | 'firstSeen'>[] }>({
-        instructions: ABUSE_INSTRUCTIONS,
+      const result = await runAgent<{ findings: Omit<AbuseFinding, 'id' | 'status' | 'firstSeen'>[] }>(abuseAgent, {
         prompt: `Company: "${company}" (${site}).
 
 These pages came back from searches for misuse of this brand — impersonating accounts and Discord/Telegram servers, lookalike domains, phishing pages, giveaway and airdrop scams, fake support, counterfeit or cracked distributions, and packages published under the name.
@@ -953,13 +1095,22 @@ Most of them will be ordinary coverage, reviews or discussion that merely uses t
 
 Candidates:
 ${JSON.stringify(batch)}`,
-        schema: abuseSchema,
+        note: `batch ${index + 1}/${batches.length}`,
+        items: batch.length,
       });
       findings.push(...(result.findings ?? []));
+      abuseSucceeded += 1;
       emit('info', `batch ${index + 1}/${batches.length}: ${(result.findings ?? []).length} finding(s)`);
     } catch (error) {
       emit('warn', `batch ${index + 1}/${batches.length} failed — ${error instanceof Error ? error.message.slice(0, 120) : 'error'}`);
     }
+  }
+
+  // As with triage: nothing succeeding is a failed stage, not a clean bill of
+  // health. "Nothing abusing the brand turned up" is a claim, and it must not
+  // be made on the strength of a model that never answered.
+  if (batches.length > 0 && abuseSucceeded === 0) {
+    throw new Error(`every abuse batch failed (${batches.length}/${batches.length}) — nothing could be judged`);
   }
 
   const byUrl = new Map(mentions.map((m) => [m.url, m]));
@@ -1008,6 +1159,240 @@ export function buildBuzz(mentions: Mention[]): BuzzPoint[] {
 }
 
 /** Net sentiment now, and how far it moved across the window. */
+/** Topic volume, with the run's theme vocabulary consolidated by the topics
+ *  agent first.
+ *
+ *  Split from `buildTopics` so the arithmetic stays pure and testable and the
+ *  one model call sits at the edge. If the call fails the mechanical path still
+ *  produces a chart — worse, but real.
+ */
+/** How many distinct themes the grouping call is allowed to see, and how long
+ *  it gets. Both exist because this runs against a local model: the work is
+ *  proportional to the vocabulary, and the panel is worth about a minute of a
+ *  scan's time, not five. */
+const TOPIC_VOCABULARY_LIMIT = 60;
+const TOPIC_GROUPING_TIMEOUT_MS = 150_000;
+
+export async function groupTopics(
+  company: string, mentions: Mention[], emit: Emit,
+): Promise<TopicPoint[]> {
+  const vocabulary = new Map<string, number>();
+  for (const mention of mentions) {
+    if (!mention.date) continue;
+    for (const theme of new Set(mention.themes ?? [])) {
+      const text = theme.trim();
+      if (text) vocabulary.set(text, (vocabulary.get(text) ?? 0) + 1);
+    }
+  }
+
+  // Nothing to consolidate: one call to group nine words is not worth a minute
+  // of a local model's time.
+  if (vocabulary.size < 12) return buildTopics(mentions);
+
+  // The tail is cut rather than sent. Themes are ranked by how often they were
+  // used, so the head carries most of the discussion, and asking a local model
+  // to place two hundred labels that appear once each costs minutes of
+  // generation for almost no coverage.
+  const listed = [...vocabulary.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, TOPIC_VOCABULARY_LIMIT)
+    .map(([theme, count]) => ({ theme, count }));
+
+  try {
+    const { topics } = await runAgent<{ topics: { name: string; members: number[] }[] }>(topicsAgent, {
+      prompt: `Product: "${company}". Group these ${listed.length} themes.\n\n`
+        + listed.map((entry, index) => `${index}: ${entry.theme} (${entry.count})`).join('\n'),
+      items: listed.length,
+      // Time-boxed. This is one nicety on top of a chart that already works
+      // without it, so it must never be the reason a scan sits there.
+      timeoutMs: TOPIC_GROUPING_TIMEOUT_MS,
+    });
+
+    const grouping = new Map<string, string>();
+    for (const topic of topics ?? []) {
+      const name = topic.name?.trim();
+      if (!name) continue;
+      for (const member of topic.members ?? []) {
+        // An index outside the list is a model error, and dropping it is the
+        // only safe response: there is no way to tell which theme was meant,
+        // and guessing would attribute real discussion to the wrong topic.
+        const entry = listed[member];
+        if (entry && !grouping.has(entry.theme)) grouping.set(entry.theme, name);
+      }
+    }
+
+    const covered = [...grouping.keys()].reduce((sum, theme) => sum + (vocabulary.get(theme) ?? 0), 0);
+    const total = [...vocabulary.values()].reduce((sum, n) => sum + n, 0);
+    emit('info', `topics: ${listed.length} themes grouped into ${topics?.length ?? 0} (${Math.round((covered / total) * 100)}% of theme uses matched)`);
+
+    return buildTopics(mentions, { grouping });
+  } catch (error) {
+    emit('warn', `topic grouping failed, falling back to mechanical merge — ${error instanceof Error ? error.message.slice(0, 120) : 'error'}`);
+    return buildTopics(mentions);
+  }
+}
+
+/** Discussion volume per topic over time, from the timestamps the mentions
+ *  already carry.
+ *
+ *  Nothing here is fetched or inferred: user-generated content comes with
+ *  dates, `search.ts` already parses them onto every hit, and the buzz agent
+ *  already names two or three themes per mention while it is scoring it. Topic
+ *  volume is those two facts crossed — theme by month — so it costs one pass
+ *  over data that is already in hand. It was the last panel with no producer at
+ *  all, filled by a fixture of bell curves.
+ *
+ *  The work that is actually needed is consolidation. A model writing themes
+ *  freely across a dozen batches produces "pricing", "credits and pricing",
+ *  "Credits & Pricing" and "pricing model" for one subject, and a stacked chart
+ *  of ninety bands with a count of one each shows nothing. So near-duplicates
+ *  are folded together and the label kept is the spelling that occurred most
+ *  often — the model's own most common phrasing, not one invented here.
+ *
+ *  A mention with three themes counts once toward each, which is what the type
+ *  means by "mentions per topic": the bands answer "how much was said about
+ *  this", so a thread about both pricing and docs is genuinely about both.
+ */
+export function buildTopics(
+  mentions: Mention[],
+  options: { limit?: number; grouping?: Map<string, string> } = {},
+): TopicPoint[] {
+  const limit = options.limit ?? 8;
+  const dated = mentions.filter((m) => m.date && (m.themes ?? []).length > 0);
+  if (dated.length === 0) return [];
+
+  // A theme the topics agent grouped answers to its group's name from here on;
+  // anything it left ungrouped keeps its own wording and goes through the
+  // mechanical merge below, which is also the whole path when that call failed.
+  const resolve = (raw: string) => options.grouping?.get(raw.trim()) ?? raw;
+
+  // 1. Count every theme under a normalised key, remembering the spellings.
+  const counts = new Map<string, number>();
+  const spellings = new Map<string, Map<string, number>>();
+  for (const mention of dated) {
+    for (const raw of new Set((mention.themes ?? []).map(resolve))) {
+      const key = themeKey(raw);
+      if (!key) continue;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+      const seen = spellings.get(key) ?? new Map<string, number>();
+      seen.set(raw.trim(), (seen.get(raw.trim()) ?? 0) + 1);
+      spellings.set(key, seen);
+    }
+  }
+
+  // 2. Fold each key into the most popular key it is a variant of. Ranking
+  //    first means a merge always collapses toward the more established
+  //    phrasing rather than toward whichever happened to be seen first.
+  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const canonical = new Map<string, string>();
+  for (const [key] of ranked) {
+    const target = ranked.find(([other]) => other !== key && canonical.get(other) === other && isVariantOf(key, other));
+    canonical.set(key, target ? canonical.get(target[0])! : key);
+  }
+
+  // 3. Rank the merged topics and keep the ones worth drawing. The chart has
+  //    ten hues; past that it would reuse them and two bands would read as the
+  //    same topic, which is worse than showing fewer. One slot is reserved for
+  //    the remainder, so eight named topics plus "other topics" is nine.
+  const merged = new Map<string, number>();
+  for (const [key, count] of counts) {
+    const root = canonical.get(key)!;
+    merged.set(root, (merged.get(root) ?? 0) + count);
+  }
+  const kept = [...merged.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, Math.min(limit, 9))
+    .map(([root]) => root);
+  const keptSet = new Set(kept);
+
+  // The label is the most common spelling across every key that folded in.
+  const label = new Map<string, string>();
+  for (const root of kept) {
+    const tally = new Map<string, number>();
+    for (const [key, target] of canonical) {
+      if (target !== root) continue;
+      for (const [text, n] of spellings.get(key) ?? []) tally.set(text, (tally.get(text) ?? 0) + n);
+    }
+    const best = [...tally.entries()].sort((a, b) => b[1] - a[1] || a[0].length - b[0].length)[0];
+    label.set(root, best ? best[0] : root);
+  }
+
+  // 4. Cross with the month buckets, using the same convention as buildBuzz so
+  //    the two charts sit on one timeline.
+  const buckets = new Map<string, Record<string, number>>();
+  for (const mention of dated) {
+    const bucket = mention.date!.slice(0, 7);
+    const row = buckets.get(bucket) ?? {};
+    const already = new Set<string>();
+    for (const raw of new Set((mention.themes ?? []).map(resolve))) {
+      const root = canonical.get(themeKey(raw));
+      // One mention counts once per topic even when two of its themes merged
+      // into the same one, or "pricing" plus "credits & pricing" would count it
+      // twice for a distinction that no longer exists.
+      if (!root || already.has(root)) continue;
+      already.add(root);
+      // Everything outside the top few is pooled rather than dropped.
+      //
+      // Real themes are written per mention and come back nearly unique — 88
+      // distinct labels across 60 mentions in testing — so the top handful
+      // accounts for well under half the discussion. Dropping the rest makes a
+      // busy month look quiet, which is the opposite of what this panel is for.
+      // Pooling keeps the height of each month honest, and a large remainder is
+      // itself the finding: attention is diffuse rather than concentrated.
+      const name = keptSet.has(root) ? label.get(root)! : OTHER_TOPICS;
+      if (name === OTHER_TOPICS && already.has(OTHER_TOPICS)) continue;
+      already.add(name);
+      row[name] = (row[name] ?? 0) + 1;
+    }
+    buckets.set(bucket, row);
+  }
+
+  return [...buckets.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([bucket, byTopic]) => ({ bucket: `${bucket}-01`, byTopic }));
+}
+
+/** The pooled remainder. Named so it cannot be mistaken for a topic the model
+ *  actually wrote. */
+const OTHER_TOPICS = 'other topics';
+
+/** A theme reduced to something comparable: case, punctuation and connecting
+ *  words dropped, so "Credits & Pricing" and "credits and pricing" are one. */
+function themeKey(theme: string): string {
+  return theme
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(' ')
+    .filter((word) => word && !THEME_STOPWORDS.has(word))
+    .join(' ')
+    .trim();
+}
+
+const THEME_STOPWORDS = new Set(['and', 'or', 'the', 'a', 'an', 'of', 'for', 'to', 'in', 'on', 'with', 'issues', 'issue', 'problems']);
+
+/** True when `key` is a wordier or plural restatement of `other`.
+ *
+ *  Word-set containment rather than substring: "pricing" and "credits pricing"
+ *  are the same subject, but "port" appearing inside "support" is not. */
+function isVariantOf(key: string, other: string): boolean {
+  if (!key || !other) return false;
+  const a = new Set(key.split(' ').map(stem));
+  const b = new Set(other.split(' ').map(stem));
+  if (a.size === 0 || b.size === 0) return false;
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  return [...small].every((word) => large.has(word));
+}
+
+/** Just enough stemming to collapse the plural of a theme onto its singular.
+ *  Deliberately crude — a real stemmer would merge things a reader would not
+ *  expect to see merged, and these are two-word noun phrases, not prose. */
+function stem(word: string): string {
+  if (word.length > 4 && word.endsWith('ies')) return `${word.slice(0, -3)}y`;
+  if (word.length > 3 && word.endsWith('es') && !word.endsWith('ses')) return word.slice(0, -2);
+  if (word.length > 3 && word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1);
+  return word;
+}
+
 export function netSentiment(buzz: BuzzPoint[]): Scan['net'] {
   if (buzz.length === 0) return { now: 0, delta: 0 };
   const weighted = (points: BuzzPoint[]) => {

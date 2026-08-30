@@ -163,6 +163,94 @@ export const buzzSchema = {
 };
 
 /** Just the verdict, for the pass that writes it over the finished corpus. */
+export const topicsSchema = {
+  name: 'topics',
+  schema: {
+    type: 'object',
+    required: ['topics'],
+    properties: {
+      topics: {
+        type: 'array',
+        description: 'The canonical topics, most discussed first',
+        items: {
+          type: 'object',
+          required: ['name', 'members'],
+          properties: {
+            name: { type: 'string', description: 'Two or three words naming the subject' },
+            members: {
+              type: 'array',
+              description: 'The index numbers of every listed theme belonging to this topic',
+              items: { type: 'integer' },
+            },
+          },
+        },
+      },
+    },
+  },
+} as const;
+
+export const diagnoseSchema = {
+  name: 'diagnosis',
+  schema: {
+    type: 'object',
+    required: ['verdict', 'confidence', 'reasoning', 'suspectFiles', 'likelyCause', 'proposedFix', 'regressionTest', 'unknowns'],
+    properties: {
+      verdict: {
+        type: 'string',
+        description: 'located = the defect is identifiable in the code shown; plausible = consistent with it but not pinned; insufficient = the code shown does not cover it; not-a-defect = the report describes intended behaviour',
+        enum: ['located', 'plausible', 'insufficient', 'not-a-defect'],
+      },
+      confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+      reasoning: { type: 'string', description: 'How the conclusion follows from the code shown' },
+      suspectFiles: {
+        type: 'array',
+        description: 'Files to look at, most likely first',
+        items: {
+          type: 'object',
+          required: ['path', 'why'],
+          properties: {
+            path: { type: 'string' },
+            why: { type: 'string', description: 'What in this file relates to the report' },
+          },
+        },
+      },
+      likelyCause: { type: 'string', description: 'The defect in one or two sentences, or why it cannot be determined' },
+      proposedFix: { type: 'string', description: 'What change would address it, concretely' },
+      regressionTest: { type: 'string', description: 'The test that should exist, named for what it asserts' },
+      unknowns: {
+        type: 'array',
+        description: 'What could not be established from the code provided',
+        items: { type: 'string' },
+      },
+    },
+  },
+} as const;
+
+export const fixSchema = {
+  name: 'fix',
+  schema: {
+    type: 'object',
+    required: ['summary', 'files', 'notes'],
+    properties: {
+      summary: { type: 'string', description: 'What this change does, one or two sentences' },
+      files: {
+        type: 'array',
+        description: 'Every file to write, given in full. Include both the fix and its regression test.',
+        items: {
+          type: 'object',
+          required: ['path', 'contents', 'why'],
+          properties: {
+            path: { type: 'string', description: 'Repo-relative path. May be a new file.' },
+            contents: { type: 'string', description: 'The complete new contents of the file' },
+            why: { type: 'string', description: 'What changed in this file and why' },
+          },
+        },
+      },
+      notes: { type: 'string', description: 'Anything the reviewer should know, including what was not changed' },
+    },
+  },
+} as const;
+
 export const verdictSchema = {
   name: 'verdict',
   schema: {

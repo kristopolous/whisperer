@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Where inference runs. Copy to config/inference.json and edit; that file is gitignored",
+    "because a hosted entry's apiKey belongs in it.",
+    "",
+    "Any OpenAI-compatible /chat/completions endpoint works. Two things are non-negotiable",
+    "for this app: the endpoint must honour response_format json_schema, and it must not sit",
+    "behind a proxy that silently drops it. A proxy that accepts response_format, forwards the",
+    "request without it and returns prose with finish_reason 'stop' is indistinguishable from",
+    "a model that ignored the schema, and cost a day to diagnose — point at the upstream.",
+    "",
+    "  default          which host below to use.",
+    "  INFERENCE_HOST   environment override, for switching without editing the file.",
+    "  ${VAR}           substituted from the environment at load time; keep real keys in .env.",
+    "  contextLength    used to size batches. Set it honestly: too high truncates JSON mid-object",
+    "  maxOutputTokens  and the whole batch is lost."
+  ],
+  "default": "local",
+  "hosts": {
+    "local": {
+      "baseUrl": "http://localhost:8080/v1",
+      "modelId": "qwen3-8b",
+      "contextLength": 15000,
+      "maxOutputTokens": 4096
+    },
+    "openai": {
+      "baseUrl": "https://api.openai.com/v1",
+      "modelId": "gpt-5-6-terra",
+      "apiKey": "${OPENAI_API_KEY}",
+      "contextLength": 400000,
+      "maxOutputTokens": 32000
+    },
+    "anthropic": {
+      "baseUrl": "https://api.anthropic.com/v1",
+      "modelId": "claude-opus-5",
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "contextLength": 200000,
+      "maxOutputTokens": 64000
+    }
+  }
+}

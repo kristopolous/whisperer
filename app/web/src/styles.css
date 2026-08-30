@@ -560,7 +560,14 @@ thead th {
 tbody td { padding: 11px 14px; border-bottom: 1px solid var(--hair); vertical-align: top; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: color-mix(in srgb, var(--signal) 5%, transparent); }
-td.num { font: 400 12px var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+td.num {
+  font: 400 12px var(--mono);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  /* A date is one token. Without this "May 6, 2025" breaks at both spaces and
+     the column renders three lines tall, dragging every row with it. */
+  white-space: nowrap;
+}
 td .quote { color: var(--ink-2); font-size: 12.5px; margin-top: 3px; }
 .scroll { max-height: 460px; overflow: auto; }
 .wide { overflow-x: auto; }
@@ -1296,3 +1303,138 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 .mig-q-at { font: 400 10.5px var(--mono); color: var(--ink-3); margin-left: auto; }
 .mig-quotes blockquote { margin: 5px 0 0; font-size: 12.5px; color: var(--ink-2); }
 .mig-quotes cite { font-style: normal; color: var(--ink-3); font: 400 11px var(--mono); }
+
+/* --- agents --- */
+.conn-dot[data-run='ok']      { background: var(--good); }
+.conn-dot[data-run='failed']  { background: var(--critical); }
+.conn-dot[data-run='running'] { background: var(--signal); animation: run-pulse 1.1s ease-in-out infinite; }
+.conn-dot[data-run='idle']    { background: var(--ink-3); opacity: 0.45; }
+
+@keyframes run-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+.agent-row {
+  width: 100%;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--hair);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.agent-desc { color: var(--ink-3); }
+.run-note { color: var(--ink-3); font: 400 11px var(--mono); }
+
+.agent-detail {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 6px 14px;
+  margin: 0;
+  padding: 12px 16px 16px 36px;
+  border-bottom: 1px solid var(--hair);
+  background: color-mix(in srgb, var(--signal) 3%, transparent);
+  font-size: 12.5px;
+}
+.agent-detail dt { color: var(--ink-3); font: 400 11px var(--mono); }
+.agent-detail dd { margin: 0; color: var(--ink-2); }
+
+/* --- connector editing --- */
+.conn-dot[data-status='unconfigured'] { background: var(--warning); }
+.conn-dot[data-status='planned'] { background: var(--ink-3); opacity: 0.45; }
+
+.conn-edit { display: flex; align-items: center; gap: 10px; white-space: normal; }
+.conn-link { font: 400 11px var(--mono); padding: 2px 6px; }
+.conn-url {
+  flex: 1;
+  min-width: 0;
+  background: var(--paper);
+  border: 1px solid var(--hair);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font: 400 12px var(--mono);
+  color: var(--ink);
+}
+.conn-url:focus { outline: none; border-color: var(--signal); }
+
+/* --- removing a site --- */
+
+/* The base .dash-site .s rule above truncates the site with overflow:hidden.
+   Turning that row into a flex container without moving the clipping onto the
+   text itself put the remove control outside the clipped box, where it was
+   rendered, hit-testable and completely invisible. The URL gets its own element
+   to be truncated, and the row stops clipping. */
+.dash-site .s {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: visible;
+}
+.dash-site .s .s-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.site-remove {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  color: var(--ink-3);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  /* Dim rather than hidden. A control nobody can find is not a safety feature,
+     it is a missing feature; the confirm dialog is what guards the accident. */
+  opacity: 0.4;
+  transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+}
+.dash-site:hover .site-remove,
+.dash-site:focus-within .site-remove { opacity: 1; }
+.site-remove:hover {
+  color: var(--critical);
+  background: color-mix(in srgb, var(--critical) 14%, transparent);
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, #000 62%, transparent);
+  backdrop-filter: blur(2px);
+}
+.lightbox-card {
+  width: min(420px, 100%);
+  background: var(--paper);
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  padding: 22px 24px 18px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+}
+.lightbox-card h3 { margin: 0 0 10px; font-size: 16px; color: var(--ink); }
+.lightbox-card p { margin: 0 0 18px; font-size: 13px; line-height: 1.55; color: var(--ink-2); }
+.lightbox-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.lightbox-actions .danger {
+  background: var(--critical);
+  border: 1px solid var(--critical);
+  color: #fff;
+  border-radius: 5px;
+  padding: 7px 14px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.lightbox-actions .danger:hover { filter: brightness(1.08); }
+.lightbox-actions .danger:disabled { opacity: 0.6; cursor: default; }
+
+/* --- credential entry --- */
+.cred-row { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+.cred-input { display: flex; }
+.cred-input .conn-url { width: 100%; }

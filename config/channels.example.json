@@ -1,0 +1,76 @@
+{
+  "_comment": [
+    "Outbound write channels — everywhere this app would send something to a real person or system.",
+    "Copy to config/channels.json and edit; that file is gitignored.",
+    "",
+    "Reads and writes are kept apart deliberately. config/connectors.json is what we may look at;",
+    "this file is what we may say. A misconfigured read returns nothing; a misconfigured write posts",
+    "in the company's name to a stranger, and cannot be taken back.",
+    "",
+    "  status  'implemented' — the code path exists and runs when its credentials are present.",
+    "          'planned'     — deliberately not built. The notes say what it would actually take,",
+    "                          because every one of these is its own separate problem and pretending",
+    "                          otherwise is how you ship a button that silently does nothing.",
+    "",
+    "Nothing is ever sent without an explicit submit/send on the request. Drafting is free and",
+    "reversible; sending is neither, and the two stay separate calls."
+  ],
+  "ticketing": {
+    "provider": "github",
+    "github": {
+      "owner": "your-org",
+      "repo": "your-repo",
+      "token": "${GITHUB_TOKEN}",
+      "apiBase": "https://api.github.com",
+      "_notes": [
+        "A fine-grained personal access token with Issues: read and write on this repo is enough.",
+        "The issue is the audit record: it opens with the public complaint and the reporters' own",
+        "words, and every later step in the loop — reporter contacted, fix landed, reporter",
+        "confirmed — is appended as a comment on it. Read top to bottom it is the whole history of",
+        "one complaint, which is the point."
+      ]
+    }
+  },
+  "outbound": [
+    {
+      "id": "github",
+      "label": "GitHub issues",
+      "kind": "ticket",
+      "status": "implemented",
+      "requires": ["GITHUB_TOKEN"],
+      "notes": "Files the ticket and appends every subsequent loop step to it as a comment."
+    },
+    {
+      "id": "email",
+      "label": "Email",
+      "kind": "reply",
+      "status": "planned",
+      "requires": ["MAILGUN_API_KEY", "MAILGUN_DOMAIN"],
+      "notes": "Needs a sending domain with SPF/DKIM set up and a Mailgun (or equivalent) account in front of it. Sending cold mail from a fresh domain mostly lands in spam, so this is a deliverability project before it is a code project."
+    },
+    {
+      "id": "reddit",
+      "label": "Reddit",
+      "kind": "reply",
+      "status": "planned",
+      "requires": ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USERNAME", "REDDIT_PASSWORD"],
+      "notes": "Credentials already exist in .env. The work is the OAuth script-app flow plus the fact that a new account replying about a product reads as astroturfing and gets shadowbanned — needs an account with history and per-subreddit self-promotion rules respected."
+    },
+    {
+      "id": "hackernews",
+      "label": "Hacker News",
+      "kind": "reply",
+      "status": "planned",
+      "requires": ["HN_USERNAME", "HN_PASSWORD"],
+      "notes": "No write API — replies go through a logged-in session and a form post. Easier than the others mechanically. HN is unusually hostile to corporate voice, so the reply has to read as a person."
+    },
+    {
+      "id": "x",
+      "label": "X",
+      "kind": "reply",
+      "status": "planned",
+      "requires": ["X_BEARER_TOKEN"],
+      "notes": "Posting needs OAuth 2.0 user context, not the app-only bearer token used for reading, and a paid tier for write access."
+    }
+  ]
+}

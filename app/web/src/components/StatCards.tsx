@@ -21,6 +21,10 @@ export function StatCards({
   const venues = counts(mentions);
   const critical = issues.filter((i) => i.severity === 'critical').length;
   const direction = scan.net.delta > 0.05 ? 'rising' : scan.net.delta < -0.05 ? 'falling' : 'flat';
+  // How many mentions actually carry a score, which is the n behind the
+  // sentiment number — not the size of the corpus, and certainly not the size
+  // of the internet.
+  const scored = scan.mentions.filter((m) => m.score !== 0 || m.sentiment !== 'neutral').length;
 
   const cards: {
     key: OverviewTab | null;
@@ -71,7 +75,15 @@ export function StatCards({
       label: 'Sentiment',
       value: fmtScore(scan.net.now),
       unit: 'net',
-      line: `${direction === 'flat' ? 'holding' : direction}`,
+      // The sample size belongs on the face of the number, not in a footnote.
+      // This is a mean over the mentions that were read, and the mentions that
+      // were read are whatever search ranked highest for a set of deliberately
+      // complaint-biased queries — not a random draw from everyone who has an
+      // opinion. Printing "+0.03" alone invites reading it as "the public feels
+      // slightly positive", which it cannot support at any N.
+      line: scored === 0
+        ? 'nothing scored'
+        : `${direction === 'flat' ? 'holding' : direction} · n=${scored}`,
       tone: scan.net.now >= 0 ? 'pos' : 'neg',
     },
   ];

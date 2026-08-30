@@ -21,6 +21,10 @@
  *      silently passed off as full text.
  */
 
+import { cleanText } from '../shared/html.ts';
+import { secret } from './secrets.ts';
+import { cached, DAY } from './cache.ts';
+
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
 
 /** Bright Data's MCP endpoint, used only as the escape hatch for pages a plain
@@ -33,20 +37,21 @@ const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Geck
  *  code needs its own copy in the environment. Without the token the pipeline
  *  degrades to search snippets for these pages rather than failing. */
 const BRIGHTDATA_MCP = process.env.BRIGHTDATA_MCP_URL ?? 'https://mcp.brightdata.com/mcp';
-const BRIGHTDATA_TOKEN = process.env.BRIGHTDATA_API_TOKEN;
+const BRIGHTDATA_TOKEN = () => secret('BRIGHTDATA_API_TOKEN');
 
-export const brightDataAvailable = () => Boolean(BRIGHTDATA_TOKEN);
+export const brightDataAvailable = () => Boolean(BRIGHTDATA_TOKEN());
 
 /** One MCP tools/call over streamable-http, returning the text content. */
 async function brightDataScrape(url: string, timeoutMs = 60_000): Promise<string | null> {
-  if (!BRIGHTDATA_TOKEN) return null;
+  const token = BRIGHTDATA_TOKEN();
+  if (!token) return null;
 
   const call = async (body: unknown) => fetch(BRIGHTDATA_MCP, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
-      Authorization: `Bearer ${BRIGHTDATA_TOKEN}`,
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
@@ -83,22 +88,19 @@ async function brightDataScrape(url: string, timeoutMs = 60_000): Promise<string
   }
 }
 
-/** Strip a fetched HTML document to readable text. */
+/** Strip a fetched HTML document to readable text.
+ *
+ *  Script, style and noscript bodies go first — their contents are not prose
+ *  and stripping only the tags would leave the code behind. Everything after
+ *  that is the shared treatment in app/shared/html.ts, so a page and a search
+ *  snippet are decoded the same way. */
 function toText(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#x27;|&#39;/g, "'")
-    .replace(/&#x2F;/g, '/')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return cleanText(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' '),
+  );
 }
 
 async function get(url: string, timeoutMs = 15_000): Promise<string | null> {
@@ -146,15 +148,34 @@ export interface Fetched {
  *  Buzz, health and abuse all reason over overlapping slices of the same
  *  corpus. Without this each stage would re-fetch the same threads from the
  *  same servers minutes apart, which is slow and rude. Keyed by URL and kept
- *  for the life of the process. */
-const cache = new Map<string, Fetched>();
+ *  for the life of the process; the disk cache below it survives restarts. */
+const memo = new Map<string, Fetched>();
 
-/** Fetch one page's readable content, falling back to the snippet it came with. */
+/** A thread's text a week later is the same thread's text, near enough — and
+ *  the comments that arrived since are not worth re-fetching every page in the
+ *  corpus to catch. */
+const CONTENT_TTL = 7 * DAY;
+
+/** Fetch one page's readable content, falling back to the snippet it came with.
+ *
+ *  Only successful full reads are cached to disk. A snippet fallback means the
+ *  fetch failed — a bot check, a timeout, a 429 — and remembering that failure
+ *  for a week would turn a momentary block into a permanently empty page. */
 export async function fetchContent(url: string, snippet: string, limit = 4_000): Promise<Fetched> {
-  const hit = cache.get(url);
+  const hit = memo.get(url);
   if (hit) return hit;
-  const fetched = await fetchContentUncached(url, snippet, limit);
-  cache.set(url, fetched);
+
+  const stored = await cached<string | null>('content', url, CONTENT_TTL, async () => {
+    // Fetched unclipped so the stored copy can serve a caller that wants more
+    // text than the first caller did.
+    const fetched = await fetchContentUncached(url, snippet, 200_000);
+    return fetched.full ? fetched.text : null;
+  });
+
+  const fetched: Fetched = stored
+    ? { text: stored.slice(0, limit), full: true }
+    : { text: snippet, full: false };
+  memo.set(url, fetched);
   return fetched;
 }
 

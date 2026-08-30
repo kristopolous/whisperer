@@ -46,3 +46,31 @@ export function siteOf(raw: string): string {
   const value = raw.trim();
   return looksLikeHost(value) ? value : '';
 }
+
+/** The term to actually search for, which is not always what was typed.
+ *
+ *  People describe a subject rather than name it — "gimp image editor" instead
+ *  of "gimp". Every discovery query quotes this term as an exact phrase, and
+ *  almost nobody writes "gimp image editor" in a sentence, so a scan for it came
+ *  back with two results and every downstream panel was empty. The scan did not
+ *  fail; it searched faithfully for a phrase that does not occur.
+ *
+ *  Once the site has been resolved, the domain is the brand: gimp.org is GIMP
+ *  whatever the person typed. So when the subject is a multi-word phrase and a
+ *  site is known, the domain wins.
+ *
+ *  A single typed word is left alone. It is already a term, and second-guessing
+ *  it would break the case where someone deliberately searched for a product
+ *  whose name differs from its domain.
+ */
+export function brandToken(company: string, site: string): string {
+  const typed = (company ?? '').trim();
+  if (!typed) return typed;
+  if (typed.split(/\s+/).length === 1) return typed;
+
+  const host = hostOf(site ?? '');
+  if (!host) return typed;
+
+  const fromHost = cleanName(host);
+  return fromHost.length >= 3 ? fromHost : typed;
+}

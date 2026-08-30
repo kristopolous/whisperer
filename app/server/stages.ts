@@ -1,13 +1,13 @@
 import type { Scan, ScanEvent, Stage } from '../shared/types.ts';
 import {
-  buildBuzz, findAbuse, findFeed, findIssues, findMentions, findPresence,
+  buildBuzz, findAbuse, findFeed, findIssues, findMentions, findPresence, groupTopics,
   netSentiment, resolveSite, scoreBuzz, type Log,
 } from './pipeline.ts';
+import { withRunContext } from './agents/runtime.ts';
 import * as store from './store.ts';
 
 export interface StageCtx {
   scan: Scan;
-  servers: string[];
   log: Log;
   send: (event: ScanEvent) => void;
 }
@@ -103,71 +103,90 @@ export function explainFailure(
  *  Only a failure outside the stage itself (no scan, unreachable backend while
  *  getting the connector list) throws and takes the run down. */
 export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
-  const { scan, servers, log, send } = ctx;
+  const { scan, log, send } = ctx;
   const started = Date.now();
   send({ type: 'stage', stage: next });
 
-  try {
-    switch (next) {
-    case 'presence': {
-      scan.site = await resolveSite(scan.company, log);
-      send({ type: 'patch', scan: { site: scan.site } });
-      log('info', `mapping ${scan.company}'s footprint (site + web sweep)`);
-      scan.profiles = await findPresence(scan.company, scan.site, log);
-      log('info', `footprint: ${scan.profiles.length} channels (${scan.profiles.filter((p) => p.official).length} official, ${scan.profiles.filter((p) => !p.official).length} unofficial)`);
-      send({ type: 'patch', scan: { profiles: scan.profiles } });
-      break;
-    }
-    case 'discovery': {
-      scan.mentions = await findMentions(scan.company, scan.site, scan.profiles, servers, log);
-      log('info', `${scan.mentions.length} mentions, ${scan.mentions.filter((m) => m.date).length} of them dated`);
-      send({ type: 'patch', scan: { mentions: scan.mentions } });
-      break;
-    }
-    case 'feed': {
-      scan.feed = await findFeed(scan.company, scan.site, scan.profiles, servers, log);
-      log('info', `feed: ${scan.feed.length} latest items, newest first`);
-      send({ type: 'patch', scan: { feed: scan.feed } });
-      break;
-    }
-    case 'buzz': {
-      const buzz = await scoreBuzz(scan.company, scan.mentions, log);
-      scan.mentions = buzz.mentions;
-      scan.verdict = buzz.verdict;
-      scan.buzz = buildBuzz(scan.mentions);
-      scan.net = netSentiment(scan.buzz);
-      log('info', `net sentiment ${scan.net.now.toFixed(2)} across ${scan.buzz.length} months`);
-      send({ type: 'patch', scan: { mentions: scan.mentions, buzz: scan.buzz, net: scan.net, verdict: scan.verdict } });
-      break;
-    }
-    case 'health': {
-      scan.issues = await findIssues(scan.company, scan.mentions, log);
-      log('info', `${scan.issues.length} issues catalogued`);
-      send({ type: 'patch', scan: { issues: scan.issues } });
-      break;
-    }
-    case 'abuse': {
-      scan.abuse = await findAbuse(scan.company, scan.site, scan.mentions, servers, log);
-      log(scan.abuse.length ? 'warn' : 'info',
-        scan.abuse.length ? `${scan.abuse.length} integrity findings` : 'nothing abusing the brand turned up');
-      send({ type: 'patch', scan: { abuse: scan.abuse } });
-      break;
-    }
-    case 'queued':
-    case 'done':
-      return;
-    }
-  } catch (error) {
-    const raw = error instanceof Error ? error.message : String(error);
-    const { message, kind } = explainFailure(next, raw);
-    log('error', `failed at ${next}: ${raw}`);
-    scan.error = message;
-    scan.errorDetail = raw;
-    scan.errorKind = kind;
-    scan.failedStage = next;
-  }
+  // Everything below runs inside this context, so an agent fired anywhere down
+  // the call tree is attributed to this scan and stage without the stage
+  // functions having to carry the ids around in their signatures.
+  return withRunContext({ scanId: scan.id, stage: next }, async () => {
+    try {
+      switch (next) {
+      case 'presence': {
+        scan.site = await resolveSite(scan.company, log);
+        send({ type: 'patch', scan: { site: scan.site } });
+        log('info', `mapping ${scan.company}'s footprint (site + web sweep)`);
+        scan.profiles = await findPresence(scan.company, scan.site, log);
+        log('info', `footprint: ${scan.profiles.length} channels (${scan.profiles.filter((p) => p.official).length} official, ${scan.profiles.filter((p) => !p.official).length} unofficial)`);
+        send({ type: 'patch', scan: { profiles: scan.profiles } });
+        break;
+      }
+      case 'discovery': {
+        scan.mentions = await findMentions(scan.company, scan.site, scan.profiles, log);
+        log('info', `${scan.mentions.length} mentions, ${scan.mentions.filter((m) => m.date).length} of them dated`);
+        send({ type: 'patch', scan: { mentions: scan.mentions } });
+        break;
+      }
+      case 'feed': {
+        scan.feed = await findFeed(scan.company, scan.site, scan.profiles, log);
+        log('info', `feed: ${scan.feed.length} latest items, newest first`);
+        send({ type: 'patch', scan: { feed: scan.feed } });
+        break;
+      }
+      case 'buzz': {
+        const buzz = await scoreBuzz(scan.company, scan.mentions, log);
+        scan.mentions = buzz.mentions;
+        scan.verdict = buzz.verdict;
+        scan.buzz = buildBuzz(scan.mentions);
+        scan.net = netSentiment(scan.buzz);
+        log('info', `net sentiment ${scan.net.now.toFixed(2)} across ${scan.buzz.length} months`);
 
-  scan.timings[next] = Date.now() - started;
-  scan.stage = next;
-  store.put(scan);
+        // Built here rather than in its own stage: it needs the themes the buzz
+        // agent has just written onto each mention, and it is a grouping over
+        // data already in hand — no fetch, no model call.
+        scan.topics = await groupTopics(scan.company, scan.mentions, log);
+        const placeable = scan.mentions.filter((m) => m.date && (m.themes ?? []).length > 0).length;
+        const themed = scan.mentions.filter((m) => (m.themes ?? []).length > 0).length;
+        const bands = new Set(scan.topics.flatMap((point) => Object.keys(point.byTopic)));
+        log(
+          'info',
+          `topics: ${bands.size} over ${scan.topics.length} months, from ${placeable} of ${themed} themed mentions`
+          + (themed > placeable ? ` (${themed - placeable} undated, so unplaceable on a timeline)` : ''),
+        );
+
+        send({ type: 'patch', scan: { mentions: scan.mentions, buzz: scan.buzz, net: scan.net, verdict: scan.verdict, topics: scan.topics } });
+        break;
+      }
+      case 'health': {
+        scan.issues = await findIssues(scan.company, scan.mentions, log);
+        log('info', `${scan.issues.length} issues catalogued`);
+        send({ type: 'patch', scan: { issues: scan.issues } });
+        break;
+      }
+      case 'abuse': {
+        scan.abuse = await findAbuse(scan.company, scan.site, scan.mentions, log);
+        log(scan.abuse.length ? 'warn' : 'info',
+          scan.abuse.length ? `${scan.abuse.length} integrity findings` : 'nothing abusing the brand turned up');
+        send({ type: 'patch', scan: { abuse: scan.abuse } });
+        break;
+      }
+      case 'queued':
+      case 'done':
+        return;
+      }
+    } catch (error) {
+      const raw = error instanceof Error ? error.message : String(error);
+      const { message, kind } = explainFailure(next, raw);
+      log('error', `failed at ${next}: ${raw}`);
+      scan.error = message;
+      scan.errorDetail = raw;
+      scan.errorKind = kind;
+      scan.failedStage = next;
+    }
+
+    scan.timings[next] = Date.now() - started;
+    scan.stage = next;
+    store.put(scan);
+  });
 }

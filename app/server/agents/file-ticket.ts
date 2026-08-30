@@ -24,9 +24,11 @@
 
 import { randomUUID } from 'node:crypto';
 import type { Issue, LoopEvent, Scan, Tracker } from '../../shared/types.ts';
-import { askJsonDirect } from '../model.ts';
+import { runAgent } from './runtime.ts';
+import type { AgentDefinition } from './types.ts';
 import { ticketSchema } from '../schemas.ts';
 import { buildPayload, type FilePayload } from '../trackers.ts';
+import { createIssue, githubConfigured } from '../channels/github.ts';
 
 export const FILE_TICKET_INSTRUCTIONS = `You turn a public bug report into an engineering ticket.
 
@@ -57,11 +59,12 @@ export async function fileTicket(
     .filter((m): m is NonNullable<typeof m> => Boolean(m))
     .map((m) => ({ venue: m.venue, url: m.url, date: m.date, title: m.title, said: m.excerpt.slice(0, 700) }));
 
-  const drafted = await askJsonDirect<{
+  const drafted = await runAgent<{
     title: string; body: string; labels: string[];
     reproSteps: string[]; expected: string; actual: string; acceptance: string[];
-  }>({
-    instructions: FILE_TICKET_INSTRUCTIONS,
+  }>(fileTicketAgent, {
+    scanId: scan.id,
+    note: issue.title.slice(0, 60),
     prompt: `Product: "${scan.company}" (${scan.site}).
 
 Issue as triaged:
@@ -71,7 +74,6 @@ What the reporters actually wrote:
 ${JSON.stringify(reports)}
 
 Write the ticket.`,
-    schema: ticketSchema,
   });
 
   // The envelope (endpoint, label conventions, tracker-specific formatting)
@@ -124,22 +126,90 @@ export function ticketFiledEvent(tracker: Tracker, ref: string, url?: string): L
 
 /** Actually write the ticket to a tracker.
  *
- *  Unimplemented on purpose rather than half-implemented. Every tracker here
- *  needs a credential this repo does not hold, and a wrong guess writes into
- *  someone's real backlog — so the honest state is to produce the exact payload
- *  and stop, which is what `clipboard` has always meant in this codebase.
+ *  GitHub is implemented, because it is the one where the ticket can also be
+ *  the audit record: the issue opens with the public complaint and every later
+ *  step of the loop is appended to it as a comment, so "was the person who
+ *  reported this ever told anything?" has an answer written down at the time
+ *  rather than reconstructed afterwards.
  *
- *  Wiring a real one is small: take the payload, POST it, return the ref. The
- *  reason it is not done here is that it should be an explicit decision by
- *  whoever owns the tracker, not something that quietly starts happening. */
-export async function submitTicket(
-  payload: DraftedTicket,
-): Promise<{ filed: false; reason: string; payload: DraftedTicket }> {
-  return {
-    filed: false,
-    reason:
-      `No credential is configured for ${payload.tracker}. The payload above is exactly what would be sent; `
-      + 'filing it is a deliberate step someone with tracker access should turn on.',
-    payload,
-  };
+ *  Linear and Jira are not implemented, and that is a decision rather than an
+ *  omission — each needs a credential this repo does not hold, and a wrong guess
+ *  writes into someone's real backlog. `clipboard` produces exactly what would
+ *  be sent and stops, which is what it has always meant here.
+ *
+ *  Nothing on this path runs unless the request explicitly asked to submit.
+ */
+export interface SubmitResult {
+  filed: boolean;
+  reason: string;
+  payload: DraftedTicket;
+  /** Tracker reference once filed — "#128" for GitHub. */
+  ref?: string;
+  url?: string;
 }
+
+export async function submitTicket(
+  payload: DraftedTicket, scan?: Scan, issue?: Issue,
+): Promise<SubmitResult> {
+  if (payload.tracker !== 'github') {
+    return {
+      filed: false,
+      reason:
+        `Filing to ${payload.tracker} is not implemented. The payload above is exactly what would be sent; `
+        + 'GitHub is the tracker that is wired up, and switching to it is a one-line change on this request.',
+      payload,
+    };
+  }
+
+  if (!githubConfigured()) {
+    return {
+      filed: false,
+      reason:
+        'GitHub filing is built but not configured — set ticketing.github owner/repo in '
+        + 'config/channels.json and a GITHUB_TOKEN with Issues: read and write.',
+      payload,
+    };
+  }
+
+  if (!scan || !issue) {
+    return { filed: false, reason: 'internal: filing needs the scan and issue for the audit header', payload };
+  }
+
+  try {
+    const filed = await createIssue(scan, issue, payload.title, payload.body, payload.labels);
+    return {
+      filed: true,
+      reason: `Filed as #${filed.number}. Every later step of the loop will be appended to it as a comment.`,
+      payload,
+      ref: `#${filed.number}`,
+      url: filed.url,
+    };
+  } catch (error) {
+    return {
+      filed: false,
+      reason: error instanceof Error ? error.message : 'filing failed',
+      payload,
+    };
+  }
+}
+
+/** The portable definition, for the agent list and for export to a platform.
+ *
+ *  Tool-free by contract: a repro step invented from a web search rather than
+ *  taken from what the reporters wrote is precisely the failure this agent
+ *  exists to prevent, so it must not be able to search.
+ */
+export const fileTicketAgent: AgentDefinition = {
+  name: 'whisperer-file-ticket',
+  title: 'File ticket',
+  description: "Reconstructs repro steps, expected/actual and acceptance criteria from reporters' own words.",
+  surface: 'loop',
+  instructions: FILE_TICKET_INSTRUCTIONS,
+  invocation:
+    '\n\nHow you are invoked: the first message names the product, gives the triaged issue as JSON, and '
+    + 'then gives what the reporters actually wrote. Write the ticket from those words.',
+  schema: ticketSchema,
+  connectors: [],
+  effort: 'medium',
+  inPipeline: true,
+};

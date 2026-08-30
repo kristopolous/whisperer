@@ -9,6 +9,7 @@ import { Login } from './components/Login.tsx';
 import { Overview } from './components/Overview.tsx';
 import { PresenceView } from './components/Presence.tsx';
 import { RunDashboard, type RunSummary } from './components/RunDashboard.tsx';
+import { AgentsPanel } from './components/AgentsPanel.tsx';
 import { SettingsPanel } from './components/SettingsPanel.tsx';
 import { StatCards, type OverviewTab } from './components/StatCards.tsx';
 import { api, cleanName, normalize, siteOf } from './lib.ts';
@@ -70,6 +71,7 @@ export function App() {
   const [rerunningStage, setRerunningStage] = useState<Stage | null>(null);
   const [authed, setAuthed] = useState(() => sessionStorage.getItem('whisperer.auth') === '1');
   const [showSettings, setShowSettings] = useState(false);
+  const [showAgents, setShowAgents] = useState(false);
   // Elapsed clocks: runStart/stageStart are wall-clock instants (ms) each set
   // when a run or a stage kicks off; clock is the live tick repainted every
   // second so a long, silent stage still visibly moves instead of looking hung.
@@ -79,11 +81,46 @@ export function App() {
 
   const openSettings = useCallback(() => {
     setShowSettings(true);
+    setShowAgents(false);
     source.current?.close();
     window.location.hash = '#/';
   }, []);
 
   const closeSettings = useCallback(() => setShowSettings(false), []);
+
+  // The agent list is deliberately not a scan tab: it is about the machinery
+  // rather than about one company's results, and it stays useful — arguably is
+  // most useful — when a scan has just failed and there is nothing to show.
+  const openAgents = useCallback(() => {
+    setShowAgents(true);
+    setShowSettings(false);
+    source.current?.close();
+    window.location.hash = '#/';
+  }, []);
+
+  const closeAgents = useCallback(() => setShowAgents(false), []);
+
+  /** Delete a company's scans, then reconcile the view.
+   *
+   *  If the row being removed is the one on screen, the canvas has to go back
+   *  to the landing state — leaving a deleted scan rendered, with tabs that
+   *  fetch 404s, is worse than an empty page. */
+  const removeRun = useCallback(async (id: string) => {
+    const wasOpen = scanIdRef.current === id;
+    const { runs: remaining } = await api<{ removed: string[]; runs: RunSummary[] }>(
+      `api/scans/${id}`, { method: 'DELETE' },
+    );
+    setRuns(remaining);
+    if (wasOpen) {
+      source.current?.close();
+      scanIdRef.current = '';
+      setScan(BLANK);
+      setLog([]);
+      setStage('queued');
+      setRunning(false);
+      window.location.hash = '#/';
+    }
+  }, []);
 
   const login = useCallback(() => {
     sessionStorage.setItem('whisperer.auth', '1');
@@ -364,6 +401,7 @@ useEffect(() => {
         <div className="rig">
           <span className={`lamp ${running ? 'busy' : rig ? 'live' : ''}`} />
           {rig ? `${rig.model} · ${rig.servers.length} connectors` : 'no api'}
+          <button className="logout" onClick={openAgents} title="Agents and their runs">agents</button>
           <button className="logout" onClick={openSettings} title="Connector API keys">settings</button>
           <button className="logout" onClick={logout} title="Sign out">sign out</button>
         </div>
@@ -375,10 +413,13 @@ useEffect(() => {
           activeId={scan.id}
           onOpen={open}
           onNew={onNew}
+          onRemove={removeRun}
         />
 
         <main className="shell dash-main">
-          {showSettings ? (
+          {showAgents ? (
+            <AgentsPanel onClose={closeAgents} />
+          ) : showSettings ? (
             <SettingsPanel onClose={closeSettings} />
           ) : (
           <>
@@ -411,7 +452,11 @@ useEffect(() => {
               {rig && rig.servers.length === 0 && (
                 <div className="notice" style={{ marginTop: 22, maxWidth: '62ch' }}>
                   <span className="tag warning">no connectors</span>
-                  <span>No MCP servers are registered on this TrueForge instance, so discovery has nothing to search. Run <code>npm run setup</code> first.</span>
+                  <span>
+                    No MCP connectors are usable — check <code>config/connectors.json</code> and the
+                    credentials it names in Settings. Search itself only needs <code>BRAVE_API_KEY</code>,
+                    so a scan may still work; the connectors add the venue-specific reach.
+                  </span>
                 </div>
               )}
             </div>

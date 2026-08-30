@@ -11,6 +11,9 @@
  *  over text that has already been fetched.
  */
 
+import { cleanText } from '../shared/html.ts';
+import { cached, HOUR } from './cache.ts';
+import { secret } from './secrets.ts';
 import type { Venue } from '../shared/types.ts';
 
 const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search';
@@ -44,21 +47,131 @@ function serialize<T>(fn: () => Promise<T>): Promise<T> {
 /** Brave reports dates as prose ("2 weeks ago") or as a date string. Keep only
  *  what parses; a wrong date is worse than no date. */
 function parseAge(age: string | undefined, pageAge: string | undefined): string | null {
+  // A date in the future is a CMS template or a timezone artefact, not news,
+  // and it sorts above everything real in a newest-first feed. A day of slack
+  // covers timezones without letting "published next March" through.
+  const horizon = Date.now() + 86_400_000;
+  const take = (value: number) => (value <= horizon ? new Date(value).toISOString() : null);
+
   const iso = pageAge && Date.parse(pageAge);
-  if (iso && !Number.isNaN(iso)) return new Date(iso).toISOString();
+  if (iso && !Number.isNaN(iso)) return take(iso);
   if (age) {
     const direct = Date.parse(age);
-    if (!Number.isNaN(direct)) return new Date(direct).toISOString();
+    if (!Number.isNaN(direct)) return take(direct);
   }
   return null;
 }
 
-export async function braveSearch(query: string, count = 10): Promise<SearchHit[]> {
-  const key = process.env.BRAVE_API_KEY;
-  if (!key) throw new Error('BRAVE_API_KEY is not set — deterministic search has nothing to query');
+/** Does this result actually name the company anywhere?
+ *
+ *  The single most effective relevance filter available here, and it became
+ *  necessary the moment the search started asking for the freshest possible
+ *  results. Every news site's front page is recrawled continuously, so it is
+ *  permanently "from the last hour" — searching a tight window for "<company>
+ *  news" returns CNN, Reuters and Google News ahead of anything about the
+ *  company, because those pages are fresh by construction and match the word
+ *  "news". Requiring the name to appear removes all of them for the cost of one
+ *  string comparison.
+ */
+export function namesCompany(hit: SearchHit, company: string): boolean {
+  const needle = company.toLowerCase().trim();
+  if (!needle) return true;
+  const haystack = `${hit.title} ${hit.description} ${hit.url}`.toLowerCase();
+  if (haystack.includes(needle)) return true;
+  // "Hacker News" for "hackernews", "next.js" for "nextjs".
+  const squashed = needle.replace(/[^a-z0-9]/g, '');
+  return squashed.length > 2 && haystack.replace(/[^a-z0-9]/g, '').includes(squashed);
+}
 
-  return serialize(async () => {
-    const url = `${BRAVE_ENDPOINT}?${new URLSearchParams({ q: query, count: String(count) })}`;
+/** Does the text itself read as somebody complaining?
+ *
+ *  Needed because "which query found it" turned out to be nearly useless as a
+ *  signal. Brave treats `OR` terms as soft preferences rather than requirements,
+ *  so a query like `site:reddit.com "gimp" sucks OR terrible OR frustrating`
+ *  happily returns ordinary GIMP discussion — and once the complaint pass runs
+ *  a dozen such queries, almost every result in the corpus has been "found by a
+ *  complaint search" and the flag marks everything.
+ *
+ *  The vocabulary below is the one that survived measurement against real
+ *  results, and it covers the registers people actually use: blunt verdict,
+ *  rhetorical question, past-tense failure event, and the polite negation or
+ *  wish that means the same thing in a more measured venue. */
+const COMPLAINT_LANGUAGE = new RegExp([
+  // blunt verdict, and the euphemisms for it
+  String.raw`\bsucks?\b`, String.raw`\b(is|are) (trash|garbage|awful|terrible|crap|crappy|rubbish|junk)\b`,
+  String.raw`\bhot garbage\b`, String.raw`\bdumpster fire\b`, String.raw`\bhate[sd]? (it|this|using)?\b`,
+  String.raw`\bthe worst\b`, String.raw`\bbull ?shit\b`, String.raw`\bwaste of (time|money)\b`,
+  String.raw`\bnot worth it\b`, String.raw`\boverrated\b`,
+  // rhetorical question
+  String.raw`\bwhy (is|does|do|can'?t|would)\b.{0,40}\b(so|still|such|always)\b`,
+  String.raw`\bwho (thought|decided|designed)\b`,
+  // the failure as an event
+  String.raw`\b(froze|frozen|crashe[sd]|crashing|hangs?|hung|locked up)\b`,
+  String.raw`\b(lost|deleted) (my|all my)\b`, String.raw`\bkeeps? (crashing|freezing|failing)\b`,
+  // things that stopped working
+  String.raw`\b(is|are|was|were) broken\b`, String.raw`\bdoesn'?t work\b`, String.raw`\bnot working\b`,
+  String.raw`\bstopped working\b`, String.raw`\bused to work\b`,
+  // friction
+  String.raw`\bfrustrat(ing|ed)\b`, String.raw`\bunusable\b`, String.raw`\bclunky\b`,
+  String.raw`\bunintuitive\b`, String.raw`\bconfusing\b`, String.raw`\bpainful\b`,
+  String.raw`\bsteep learning curve\b`, String.raw`\bhard to use\b`,
+  // polite register — the same complaint from a more measured writer
+  String.raw`\bdisappoint(ed|ing)\b`, String.raw`\bfalls? short\b`, String.raw`\blacks?\b`,
+  String.raw`\bwish (it|they|the)\b`, String.raw`\bneeds? (better|fixing|work|improvement)\b`,
+  String.raw`\bstruggl(ed|ing) with\b`, String.raw`\bgave up on\b`, String.raw`\bgiving up on\b`,
+  String.raw`\bswitched away\b`, String.raw`\bnot a fan\b`,
+].join('|'), 'i');
+
+export const looksLikeComplaint = (hit: SearchHit): boolean =>
+  COMPLAINT_LANGUAGE.test(`${hit.title} ${hit.description}`);
+
+/** A bare domain root is a homepage, never a specific post or thread. */
+export function isHomepage(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.pathname.replace(/\/+$/, '') === '' && !parsed.search;
+  } catch {
+    return false;
+  }
+}
+
+/** How long a result set for a query stays good. Six hours: long enough that
+ *  re-running a scan while working on a downstream stage is free, short enough
+ *  that a feed of "the newest discussion" is still newest. */
+const SEARCH_TTL = 6 * HOUR;
+
+/** Brave's freshness filter: pd/pw/pm/py, or an explicit `YYYY-MM-DDtoYYYY-MM-DD`. */
+export type Freshness = 'pd' | 'pw' | 'pm' | 'py' | (string & {});
+
+/** Brave returns at most 20 results per request and paginates with `offset`,
+ *  which tops out at 9 — so one query can reach ~200 results, not 20.
+ *
+ *  Not paginating was the single biggest reason the corpus was tiny: twenty
+ *  queries could never return more than twenty results each no matter how much
+ *  the internet had to say, and after overlap and filtering that is a few dozen
+ *  rows about a thirty-year-old program with a large, loud user base. */
+export const MAX_PAGES = 10;
+export const MAX_COUNT = 20;
+
+export async function braveSearch(
+  query: string, count = 10, freshness?: Freshness, offset = 0,
+): Promise<SearchHit[]> {
+  const key = secret('BRAVE_API_KEY');
+  if (!key) throw new Error('BRAVE_API_KEY is not set — add it in Settings, or export it, or search has nothing to query');
+
+  // The cache is checked outside the rate-limit gate on purpose. A cached query
+  // should cost nothing at all — queueing it behind the 1.1s pacer would make a
+  // forty-query scan take forty seconds to serve results it already had.
+  // Freshness is part of the cache key: the same query restricted to the last
+  // year is a different question with a different answer.
+  const cacheKey = `brave:${count}:${freshness ?? 'all'}:${offset}:${query}`;
+  return cached(`search`, cacheKey, SEARCH_TTL, () => serialize(async () => {
+    const url = `${BRAVE_ENDPOINT}?${new URLSearchParams({
+      q: query,
+      count: String(Math.min(count, MAX_COUNT)),
+      ...(offset ? { offset: String(Math.min(offset, MAX_PAGES - 1)) } : {}),
+      ...(freshness ? { freshness } : {}),
+    })}`;
     const response = await fetch(url, {
       headers: { 'X-Subscription-Token': key, Accept: 'application/json' },
       signal: AbortSignal.timeout(20_000),
@@ -71,13 +184,83 @@ export async function braveSearch(query: string, count = 10): Promise<SearchHit[
     return (body.web?.results ?? [])
       .filter((r): r is typeof r & { url: string } => Boolean(r.url))
       .map((r) => ({
-        title: (r.title ?? '').replace(/<\/?strong>/g, '').trim(),
+        // Brave sends escaped markup, not text: `<strong>` around the matched
+        // words and every apostrophe as `&#x27;`. This is both rendered in the
+        // dashboard and fed to the model as somebody's words, so it is decoded
+        // once here rather than papered over at either end.
+        title: cleanText(r.title ?? ''),
         url: r.url,
-        description: (r.description ?? '').replace(/<\/?strong>/g, '').trim(),
+        description: cleanText(r.description ?? ''),
         age: r.age ?? null,
         date: parseAge(r.age, r.page_age),
       }));
-  });
+  }));
+}
+
+/** Windows to try, narrowest first.
+ *
+ *  A fixed window cannot serve both ends of the range this tool is pointed at.
+ *  A company the size of Replit produces more discussion in a day than a small
+ *  one does in a year: asking for the last twelve months buries today's threads
+ *  under a year of accumulated relevance, while asking for the last day would
+ *  return nothing at all for a quieter subject. So the window is not a setting,
+ *  it is a search: start at the last 24 hours and widen only until there is
+ *  enough to work with.
+ *
+ *  The practical effect is that the busier the company, the fresher the corpus,
+ *  which is exactly the right behaviour — nobody watching a brand that is
+ *  discussed hourly wants to read last spring.
+ */
+export const FRESHNESS_LADDER: Freshness[] = ['pd', 'pw', 'pm', 'py'];
+
+const WINDOW_LABEL: Record<string, string> = {
+  pd: 'last 24 hours',
+  pw: 'last week',
+  pm: 'last month',
+  py: 'last year',
+};
+
+export const windowLabel = (freshness?: Freshness) =>
+  (freshness ? WINDOW_LABEL[freshness] ?? freshness : 'all time');
+
+export interface WideningResult {
+  hits: SearchHit[];
+  /** The window that finally satisfied the target, or the widest one tried. */
+  window?: Freshness;
+  /** What each rung returned, for the log — this is the line that tells you
+   *  whether a thin feed means a quiet company or a broken search. */
+  steps: { window: Freshness; hits: number }[];
+}
+
+/** Run the query set through progressively wider windows, stopping as soon as
+ *  `target` distinct results are in hand.
+ *
+ *  Results accumulate rather than being replaced: a wider window is a superset,
+ *  and keeping the narrower pass's copy of a URL preserves the fresher metadata
+ *  the API returned for it.
+ */
+export async function searchWidening(
+  queries: string[],
+  options: { count?: number; target?: number; ladder?: Freshness[]; pages?: number },
+  onError?: (query: string, message: string) => void,
+  onStep?: (window: Freshness, total: number) => void,
+): Promise<WideningResult> {
+  const { count = 20, target = 60, ladder = FRESHNESS_LADDER, pages = 1 } = options;
+  const merged = new Map<string, SearchHit>();
+  const steps: { window: Freshness; hits: number }[] = [];
+  let window: Freshness | undefined;
+
+  for (const rung of ladder) {
+    window = rung;
+    for (const hit of await braveSearchAll(queries, count, onError, rung, pages)) {
+      if (!merged.has(hit.url)) merged.set(hit.url, hit);
+    }
+    steps.push({ window: rung, hits: merged.size });
+    onStep?.(rung, merged.size);
+    if (merged.size >= target) break;
+  }
+
+  return { hits: [...merged.values()], window, steps };
 }
 
 /** Run several queries and merge, keeping first-seen order and dropping repeats.
@@ -87,15 +270,25 @@ export async function braveSearchAll(
   queries: string[],
   count: number,
   onError?: (query: string, message: string) => void,
+  freshness?: Freshness,
+  pages = 1,
 ): Promise<SearchHit[]> {
   const merged = new Map<string, SearchHit>();
   for (const query of queries) {
-    try {
-      for (const hit of await braveSearch(query, count)) {
-        if (!merged.has(hit.url)) merged.set(hit.url, hit);
+    for (let page = 0; page < Math.min(pages, MAX_PAGES); page += 1) {
+      try {
+        const hits = await braveSearch(query, count, freshness, page);
+        for (const hit of hits) if (!merged.has(hit.url)) merged.set(hit.url, hit);
+        // A short page is the last page; asking for the next one spends a
+        // second of the rate limit to be told the same thing.
+        if (hits.length < Math.min(count, MAX_COUNT)) break;
+      } catch (error) {
+        onError?.(query, error instanceof Error ? error.message : String(error));
+        // A failure is usually a 429, and the next page of the same query will
+        // fail the same way. Move to the next query rather than burning the
+        // budget paging into a wall.
+        break;
       }
-    } catch (error) {
-      onError?.(query, error instanceof Error ? error.message : String(error));
     }
   }
   return [...merged.values()];
@@ -230,9 +423,23 @@ export function profileHandle(url: string): string | null {
  *  "alternatives to X" roundup is weak evidence but it is still someone
  *  writing about the product. It is demoted rather than dropped — see
  *  `isOpinionBearing`. */
+/** Hosts and phrasing that are never product discussion whatever the query
+ *  matched.
+ *
+ *  Needed because a brand can share a name with an unrelated word. "GIMP" is
+ *  the obvious case — the image editor and a fetish term — and a search for
+ *  complaints about it returns adult directory listings that pass every other
+ *  filter: they are recent, they name the brand, they are not dictionary pages.
+ *  There is no sentiment about the software to read in them, so they are noise
+ *  in exactly the same sense a spelling page is. */
+const OFF_TOPIC_HOSTS = /porn|xxx|nsfw|fetish|escort|camgirl|onlyfans|xhamster|xvideos|redtube|pornhub|adultdeepfake|rule34|hentai|bdsm/i;
+const OFF_TOPIC_TEXT = /\bporn (sites?|tube)\b|\bfetish (tube|sites?)\b|\bcam ?sites?\b|\bsex (cams?|sites?)\b|\bescort(s| service)\b|\bnsfw\b.{0,20}\b(tube|sites?)\b/i;
+
 export function isLexicalNoise(hit: SearchHit): boolean {
   const h = host(hit.url);
   const text = `${hit.title} ${hit.description}`.toLowerCase();
+
+  if (OFF_TOPIC_HOSTS.test(h) || OFF_TOPIC_TEXT.test(text)) return true;
 
   if (/merriam-webster|dictionary\.com|thesaurus|vocabulary\.com|wordnik|collinsdictionary|cambridge\.org|wiktionary|grammarly|thefreedictionary/.test(h)) {
     return true;
@@ -251,14 +458,46 @@ export function isLexicalNoise(hit: SearchHit): boolean {
  *  Used to order a corpus, not to censor it: real discussion should be scored
  *  and triaged first, and a vendor-comparison listicle should not outweigh ten
  *  people in a thread. */
+/** Directories, marketplaces and review aggregators. Their pages are about a
+ *  product but are nobody's opinion of it: the text is submitted blurbs and
+ *  star averages, regenerated constantly so they always look fresh, which makes
+ *  them the single most misleading thing that can reach the top of a
+ *  recency-sorted brand watch. */
+const LISTING_HOSTS = /capterra|g2\.com|getapp|softwareadvice|trustradius|trustpilot|crozdesk|saasworthy|alternativeto|stackshare|slashdot|sourceforge|producthunt|product-hunt|gartner|softwaresuggest|goodfirms|aws\.amazon\.com\/marketplace/;
+
+/** Titles that mark a page as written for search engines rather than by someone
+ *  with something to say. Deliberately aggressive: this only decides ranking,
+ *  so a wrongly demoted page still appears, one place further down. */
+const SEO_TITLE = new RegExp([
+  String.raw`\b\d+\s+(best|top|great|popular)\b`,          // "10 best ..."
+  String.raw`\b\d+\s+[\w\s]{0,24}alternatives?\b`,        // "7 Replit alternatives"
+  String.raw`\bbest\s+\w+\s+alternatives?\b`,
+  String.raw`\balternatives? (for|in|to)\s+20\d\d\b`,
+  String.raw`\breviews?\b[^.]{0,40}\b20\d\d\b`,           // "Replit Review 2026"
+  String.raw`\b20\d\d\b[^.]{0,20}\breviews?\b`,
+  String.raw`\bverified reviews?\b`,
+  String.raw`\bpros\b\s*(&|and|\+)\s*\bcons\b`,
+  String.raw`\bwhich is (best|better)\b`,
+  String.raw`\bhonest verdict\b`,
+  String.raw`\b(is it worth it|should you use)\b[^.]{0,20}\?`,
+  String.raw`\[20\d\d\]`,                                  // "... [2026]"
+].join('|'));
+
+/** Does this read as somebody actually discussing the product?
+ *
+ *  The default used to be "yes unless it is obviously a listicle", which let
+ *  every "Product Review 2026" and directory listing through. That matters more
+ *  than it sounds now that the corpus is ranked by recency: those pages carry a
+ *  fresh date by construction, so a loose test hands them the top of the list
+ *  ahead of the thing a real customer posted last week.
+ */
 export function isOpinionBearing(hit: SearchHit): boolean {
   const venue = venueOf(hit.url);
+  // Somebody had to type it for it to exist on these.
   if (['reddit', 'hackernews', 'x', 'github', 'youtube', 'forum'].includes(venue)) return true;
 
+  if (LISTING_HOSTS.test(host(hit.url))) return false;
+
   const text = `${hit.title} ${hit.description}`.toLowerCase();
-  // "10 best alternatives", "top 7 tools", "X vs Y compared" — SEO roundups.
-  if (/\b\d+\s+(best|top|great|popular)\b|\bbest\s+\w+\s+alternatives?\b|\balternatives? (for|in|to)\s+20\d\d\b/.test(text)) {
-    return false;
-  }
-  return true;
+  return !SEO_TITLE.test(text);
 }

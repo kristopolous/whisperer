@@ -13,7 +13,7 @@
 import { createInterface } from 'node:readline/promises';
 import { isEventDelta, mergeEventDelta, type TrueForgeApi } from '@truefoundry/trueforge-sdk';
 import { client, MODEL } from './client.ts';
-import { mcpServers } from './registry.ts';
+import { usableConnectors } from '../app/server/config.ts';
 
 const args = process.argv.slice(2);
 const autoApprove = args.includes('--yes');
@@ -27,8 +27,8 @@ const { data: session } = await client.sessions.create({
     spec: {
       model: { name: MODEL },
       instructions: 'You are a concise assistant. Prefer tools over guessing.',
-      mcpServers: mcpServers.map((m) => ({
-        name: m.name,
+      mcpServers: usableConnectors().map((connector) => ({
+        name: connector.name,
         // Deferred discovery: schemas load only when the agent reaches for them.
         preload: false,
         // Reads run unattended; anything that writes stops for a human.

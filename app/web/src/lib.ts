@@ -10,7 +10,9 @@ export function normalize(scan: Scan): Scan {
     ...scan,
     company: looksLikeHost(scan.company) ? cleanName(scan.company) : scan.company,
     profiles: (scan.profiles ?? []).map((p) => ({ ...p, official: p.official ?? true, confidence: p.confidence ?? 'low' })),
-    mentions: scan.mentions ?? [],
+    // Scans stored before the flag existed get the benefit of the doubt; they
+    // were ranked discussion-first anyway.
+    mentions: (scan.mentions ?? []).map((m) => ({ ...m, discussion: m.discussion ?? true })),
     issues: scan.issues ?? [],
     abuse: scan.abuse ?? [],
     buzz: scan.buzz ?? [],

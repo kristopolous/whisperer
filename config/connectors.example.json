@@ -1,0 +1,128 @@
+{
+  "_comment": [
+    "MCP connectors, as data. Copy to config/connectors.json and edit; that file is gitignored.",
+    "This example is also the fallback, so the app runs with no real file present.",
+    "",
+    "  url       a streamable-http MCP endpoint. Everything here is dialled directly \u2014",
+    "            these are ordinary HTTP services and never needed a broker in front of them.",
+    "  requires  environment variables that must be non-empty for the connector to work.",
+    "            A connector missing its credential is reported as 'unconfigured', not 'down':",
+    "            one needs a key added, the other needs a service restarted.",
+    "  auth      bearer token or explicit headers. ${VAR} is substituted from the environment",
+    "            at load time, so no secret is ever written into this file.",
+    "  enabled   set false to keep an entry documented but out of the running set."
+  ],
+  "connectors": [
+    {
+      "name": "bright-data",
+      "url": "https://mcp.brightdata.com/mcp",
+      "description": "Paid, unmetered scraping. The escape hatch for pages a plain fetch cannot read \u2014 Reddit, and anything behind a bot check. Never tried first, because it is metered.",
+      "requires": [
+        "BRIGHTDATA_API_TOKEN"
+      ],
+      "auth": {
+        "type": "bearer",
+        "token": "${BRIGHTDATA_API_TOKEN}"
+      }
+    },
+    {
+      "name": "brave",
+      "url": "http://localhost:8094/mcp",
+      "description": "Brave web, news, video and image search. Note the free tier is one request per second and 429s anything faster \u2014 app/server/search.ts serialises every call in the process for exactly this reason.",
+      "requires": [
+        "BRAVE_API_KEY"
+      ]
+    },
+    {
+      "name": "youtube",
+      "url": "http://localhost:8091/mcp",
+      "description": "YouTube search over videos, channels and playlists, with view/like/comment counts and publish dates. The primary feed source, and the fastest to answer.",
+      "requires": [
+        "YOUTUBE_API_KEY"
+      ]
+    },
+    {
+      "name": "x",
+      "url": "https://api.x.com/mcp",
+      "description": "X (Twitter): posts and their likers/reposters/quoters, full-archive search, user timelines and mentions, trends.",
+      "requires": [
+        "X_BEARER_TOKEN"
+      ],
+      "auth": {
+        "type": "bearer",
+        "token": "${X_BEARER_TOKEN}"
+      }
+    },
+    {
+      "name": "tiktok",
+      "url": "http://localhost:8093/mcp",
+      "description": "TikTok keyword search plus a video's full metadata and captions/transcript.",
+      "requires": [
+        "TIKNEURON_MCP_API_KEY"
+      ]
+    },
+    {
+      "name": "hn",
+      "url": "http://localhost:8086/mcp",
+      "description": "Hacker News stories, full comment threads and user profiles. Largely redundant now: a plain fetch of an HN item page already yields every comment, so app/server/content.ts reads threads without going through here.",
+      "enabled": false
+    },
+    {
+      "name": "reddit",
+      "url": "http://localhost:3000/mcp",
+      "description": "Reddit. Disabled: Reddit blocks unauthenticated requests from this network on every route tried, so the connector reports up and returns nothing. Reddit is reached through bright-data instead.",
+      "enabled": false
+    },
+    {
+      "name": "exa",
+      "url": "http://localhost:8095/mcp",
+      "description": "Exa neural search. Disabled: the shared endpoint returned empty results and 429s for a full day, and a broken connector wired into every stage just makes turns fail and panels come back blank.",
+      "enabled": false
+    },
+    {
+      "name": "discord",
+      "url": "http://localhost:8085/mcp",
+      "description": "Discord bot control: channels, messages, reactions, roles, moderation, webhooks, forums and invites. The bot token lives in the container, which is bound to loopback, so no auth block here.",
+      "requires": [
+        "DISCORD_TOKEN"
+      ]
+    },
+    {
+      "name": "linkedin",
+      "url": "http://localhost:8087/mcp",
+      "description": "LinkedIn through a logged-in browser session: profiles, company pages and post search. The session lives in the container's own browser profile, so there is no credential here to check \u2014 if it is logged out, the probe is what tells you."
+    },
+    {
+      "name": "telegram",
+      "url": "http://localhost:8765/mcp",
+      "description": "Telegram as your own account: chats, groups, contacts, messages, folders and media.",
+      "requires": [
+        "TELEGRAM_SESSION_STRING"
+      ]
+    },
+    {
+      "name": "signal",
+      "url": "http://localhost:8089/mcp",
+      "description": "Signal via a registered signal-cli number: send and receive direct and group messages.",
+      "requires": [
+        "SIGNAL_USER_ID"
+      ]
+    },
+    {
+      "name": "whatsapp",
+      "url": "http://localhost:8090/mcp",
+      "description": "WhatsApp through a linked phone: contacts, chat history, sending messages and media.",
+      "requires": [
+        "WHATSAPP_MCP_ENABLED"
+      ]
+    },
+    {
+      "name": "instagram",
+      "url": "http://localhost:8092/mcp",
+      "description": "The company's own Instagram Business account: profile, recent posts and their insights, connected pages, DMs. Manages an owned account rather than searching.",
+      "requires": [
+        "INSTAGRAM_ACCESS_TOKEN"
+      ]
+    }
+  ]
+}

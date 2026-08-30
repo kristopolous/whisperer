@@ -34,6 +34,16 @@ export interface Mention {
   /** -1 (hostile) .. +1 (delighted) */
   score: number;
   themes: string[];
+  /** True when a complaint-shaped search found this — "X broken", "X doesn't
+   *  work". Not a claim that it *is* a complaint, only that it came from asking
+   *  for one; triage decides. Carried so the corpus can guarantee these a share
+   *  of what the model reads instead of letting recency bury them. */
+  complaint?: boolean;
+  /** Whether this reads as somebody actually discussing the product, rather
+   *  than a listing, directory or "best alternatives" roundup that merely names
+   *  it. Decided during discovery and carried through so the dashboard can rank
+   *  the same way the corpus was ranked. */
+  discussion?: boolean;
 }
 
 export type IssueKind = 'bug' | 'ux' | 'performance' | 'docs' | 'billing' | 'reliability' | 'feature-gap';

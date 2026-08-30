@@ -23,3 +23,7 @@ trueforge/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Local config (may hold endpoints and keys) — the .example files are the committed shape
+config/*.json
+!config/*.example.json

@@ -1,31 +1,30 @@
 /** One direct, schema-constrained model call. No agent, no framework.
  *
- *  Why this exists rather than going through a saved TrueForge agent:
+ *  Why this exists rather than going through a saved agent on a platform:
  *
- *  TrueForge cannot deliver schema-constrained JSON from a `custom` provider
- *  (which is what a local llama.cpp / Ollama endpoint is registered as). Both
- *  ways of asking fail, and they fail differently:
+ *  A platform cannot reliably deliver schema-constrained JSON from a `custom`
+ *  provider (which is what a local llama.cpp / Ollama endpoint is registered
+ *  as). Both ways of asking fail, and they fail differently:
  *
  *    - with tools attached, llama.cpp rejects the request outright —
  *      `400 Failed to initialize samplers: failed to parse grammar` — because a
  *      json_schema response_format and a tools array cannot both be compiled
- *      into one grammar. Note that TrueForge injects built-in tools whenever
- *      dynamicSubAgents or generativeUi are on, so an agent with no MCP servers
- *      is still affected.
+ *      into one grammar. Note that a platform injects its own built-in tools
+ *      whenever features like dynamic sub-agents or generative UI are on, so an
+ *      agent with no MCP servers is still affected.
  *    - with tools off, the request succeeds and the schema is simply not
  *      enforced: the model answers in markdown prose and the caller gets
  *      "no JSON in model output".
  *
  *  Called directly, the very same endpoint and the very same schema return
- *  clean, valid JSON every time. So the stages that only need classification
- *  over already-fetched text call the endpoint themselves.
+ *  clean, valid JSON every time.
  *
- *  The endpoint is still whatever the user configured in TrueForge's
- *  Settings → Models, read from TrueForge at call time — so there is one place
- *  to change the model, and this module does not become a second config.
+ *  Which endpoint that is comes from config/inference.json — see
+ *  app/server/config.ts. One file, readable in the repo, rather than a lookup
+ *  against a service that has to be running before this app can think.
  */
 
-const TRUEFORGE = process.env.TRUEFORGE_BASE_URL ?? 'http://localhost:8790';
+import { inferenceHost } from './config.ts';
 
 interface Endpoint {
   baseUrl: string;
@@ -35,89 +34,25 @@ interface Endpoint {
   maxOutputTokens: number;
 }
 
-let cached: Endpoint | null = null;
-
-/** Resolve TRUEFORGE_MODEL ("ollama/qwen3.8") to the provider base URL and the
- *  model id that provider actually expects. */
-export async function resolveEndpoint(): Promise<Endpoint> {
-  if (cached) return cached;
-
-  // Standalone mode: give both the URL and the model id and TrueForge is not
-  // consulted at all. Reading the endpoint out of TrueForge is convenient on a
-  // workstation where it is already running and holds the credential, but it
-  // makes TrueForge a hard dependency of the three reasoning stages — on a
-  // deployment with a perfectly good model endpoint and no TrueForge, they
-  // would fail for want of a lookup. These two variables are the whole config.
-  if (process.env.LLM_BASE_URL && process.env.LLM_MODEL_ID) {
-    cached = {
-      baseUrl: process.env.LLM_BASE_URL.replace(/\/$/, ''),
-      modelId: process.env.LLM_MODEL_ID,
-      apiKey: process.env.LLM_API_KEY,
-      contextLength: Number(process.env.LLM_CONTEXT_LENGTH ?? 15_000),
-      maxOutputTokens: Number(process.env.LLM_MAX_OUTPUT_TOKENS ?? 4_096),
-    };
-    return cached;
-  }
-
-  const wanted = process.env.TRUEFORGE_MODEL ?? '';
-  const [providerName, ...rest] = wanted.split('/');
-  const modelName = rest.join('/');
-  if (!providerName || !modelName) {
-    throw new Error(`TRUEFORGE_MODEL must look like "provider/model", got "${wanted}"`);
-  }
-
-  const response = await fetch(`${TRUEFORGE}/api/v1/settings/model-providers`, {
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (!response.ok) throw new Error(`cannot read model providers from TrueForge (${response.status})`);
-
-  const body = (await response.json()) as {
-    data?: {
-      name?: string;
-      manifest?: {
-        base_url?: string;
-        auth?: { api_key?: string };
-        models?: { model_id?: string; name?: string; properties?: { context_length?: number; max_output_tokens?: number } }[];
-      };
-    }[];
+/** Resolve the configured inference host to a concrete endpoint.
+ *
+ *  A note that cost a day: point this at the upstream endpoint, not at a proxy
+ *  in front of it. The proxy in front of this setup accepts `response_format`,
+ *  forwards the request without it, and returns prose with finish_reason
+ *  "stop" — no error, just a schema that was never applied (and intermittent
+ *  503s when its own upstream is unreachable). The identical request against
+ *  the upstream returns valid JSON.
+ */
+export function resolveEndpoint(): Endpoint {
+  const host = inferenceHost();
+  if (!host.baseUrl) throw new Error(`inference host "${host.key}" has no baseUrl`);
+  return {
+    baseUrl: host.baseUrl.replace(/\/$/, ''),
+    modelId: host.modelId,
+    apiKey: host.apiKey || undefined,
+    contextLength: host.contextLength ?? 15_000,
+    maxOutputTokens: host.maxOutputTokens ?? 4_096,
   };
-
-  const provider = body.data?.find((entry) => entry.name === providerName);
-  if (!provider?.manifest) throw new Error(`provider "${providerName}" is not configured in TrueForge`);
-
-  const model = provider.manifest.models?.find((m) => m.name === modelName || m.model_id === modelName);
-  if (!model) throw new Error(`model "${modelName}" is not configured on provider "${providerName}"`);
-
-  // A hosted provider has no base_url in the manifest; only a custom/local one
-  // can be called directly like this.
-  //
-  // LLM_BASE_URL overrides whatever TrueForge has registered. That exists
-  // because a provider URL can point at a proxy that quietly breaks structured
-  // output: the one in front of this setup accepts `response_format`, forwards
-  // the request without it, and returns prose with finish_reason "stop" — no
-  // error, just a schema that was never applied (and intermittent 503s when its
-  // own upstream is unreachable). Pointing straight at the upstream endpoint
-  // makes the identical request return valid JSON.
-  const baseUrl = process.env.LLM_BASE_URL ?? provider.manifest.base_url;
-  if (!baseUrl) {
-    throw new Error(
-      `provider "${providerName}" has no base_url — direct calls only work for a custom/local OpenAI-compatible endpoint`,
-    );
-  }
-
-  // TrueForge redacts the stored key when it serves settings, so a provider
-  // that genuinely needs one has to supply it here.
-  const stored = provider.manifest.auth?.api_key;
-  const apiKey = process.env.LLM_API_KEY ?? (stored && !stored.includes('REDACTED') ? stored : undefined);
-
-  cached = {
-    baseUrl: baseUrl.replace(/\/$/, ''),
-    modelId: model.model_id ?? modelName,
-    apiKey,
-    contextLength: model.properties?.context_length ?? 15_000,
-    maxOutputTokens: model.properties?.max_output_tokens ?? 4_096,
-  };
-  return cached;
 }
 
 /** Models wrap JSON in prose or fences often enough that this is not optional,
@@ -141,14 +76,44 @@ export interface AskOptions {
   timeoutMs?: number;
 }
 
-/** Ask the configured model for JSON matching `schema`, and return it parsed. */
+/** Pull the assistant text out of one SSE frame, tolerating both the streaming
+ *  shape (`delta.content`) and the occasional server that sends a whole
+ *  `message` on the final frame. */
+function frameText(payload: string): string {
+  try {
+    const frame = JSON.parse(payload) as {
+      choices?: { delta?: { content?: string }; message?: { content?: string } }[];
+    };
+    const choice = frame.choices?.[0];
+    return choice?.delta?.content ?? choice?.message?.content ?? '';
+  } catch {
+    // A partial frame at a chunk boundary is normal; the caller re-buffers it.
+    return '';
+  }
+}
+
+/** Ask the configured model for JSON matching `schema`, and return it parsed.
+ *
+ *  The request streams, and that is load-bearing rather than a nicety. The
+ *  endpoint this runs against sits behind a gateway with a **60 second**
+ *  response timeout: a non-streaming request that takes longer to generate is
+ *  answered with `502 all servers failed` at exactly sixty seconds, no matter
+ *  how patient the client is. That is not a rare case here — grouping ninety
+ *  themes, or triaging a batch of complaints on a local model, routinely takes
+ *  two or three minutes. Streaming keeps bytes moving, so the gateway sees a
+ *  live response and the generation runs to completion.
+ *
+ *  Diagnosed the hard way: the identical request returned 502 at 60s
+ *  unstreamed and completed normally streamed.
+ */
 export async function askJsonDirect<T>(options: AskOptions): Promise<T> {
-  const endpoint = await resolveEndpoint();
+  const endpoint = resolveEndpoint();
 
   const response = await fetch(`${endpoint.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
       ...(endpoint.apiKey ? { Authorization: `Bearer ${endpoint.apiKey}` } : {}),
     },
     body: JSON.stringify({
@@ -157,26 +122,53 @@ export async function askJsonDirect<T>(options: AskOptions): Promise<T> {
         { role: 'system', content: options.instructions },
         { role: 'user', content: options.prompt },
       ],
-      stream: false,
+      stream: true,
       response_format: {
         type: 'json_schema',
         json_schema: { name: options.schema.name, schema: options.schema.schema, strict: true },
       },
     }),
-    // Local models are slow: a dozen classified items is a minute and a half of
+    // Local models are slow: a batch of a dozen items is a minute and a half of
     // generation, and cutting that off mid-stream loses the whole batch.
-    signal: AbortSignal.timeout(options.timeoutMs ?? 300_000),
+    signal: AbortSignal.timeout(options.timeoutMs ?? 600_000),
   });
 
-  if (!response.ok) {
+  if (!response.ok || !response.body) {
     const detail = await response.text().catch(() => '');
     throw new Error(`model endpoint ${response.status}: ${detail.slice(0, 200)}`);
   }
 
-  const body = (await response.json()) as {
-    choices?: { message?: { content?: string } }[];
-  };
-  const content = body.choices?.[0]?.message?.content ?? '';
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+
+  for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
+    buffer += decoder.decode(chunk, { stream: true });
+
+    // Frames are separated by a blank line, but a chunk can split one, so only
+    // whole frames are consumed and the tail is kept for the next chunk.
+    let boundary = buffer.indexOf('\n\n');
+    while (boundary !== -1) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        content += frameText(payload);
+      }
+      boundary = buffer.indexOf('\n\n');
+    }
+  }
+
+  // Whatever is left when the stream ends, in case the server did not terminate
+  // the last frame with a blank line.
+  for (const line of buffer.split('\n')) {
+    if (!line.startsWith('data:')) continue;
+    const payload = line.slice(5).trim();
+    if (payload && payload !== '[DONE]') content += frameText(payload);
+  }
+
   if (!content.trim()) throw new Error('model returned an empty response');
   return parseJson<T>(content);
 }

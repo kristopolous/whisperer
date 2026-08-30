@@ -23,7 +23,9 @@
 
 import { randomUUID } from 'node:crypto';
 import type { Issue, LoopEvent, Reporter, Scan } from '../../shared/types.ts';
-import { askJsonDirect } from '../model.ts';
+import { holdReply } from '../outbox.ts';
+import { runAgent } from './runtime.ts';
+import type { AgentDefinition } from './types.ts';
 import { replySchema } from '../schemas.ts';
 
 export const RESPOND_INSTRUCTIONS = `You write replies to people who reported a problem in public.
@@ -81,8 +83,9 @@ export async function respondToUser(
       + `${options.whatChanged ? `: ${options.whatChanged}` : ''}, then ask them to try the thing that broke on them `
       + `and tell you if it is still wrong. Do not assert that it works for them — they decide that.`;
 
-  const drafted = await askJsonDirect<{ message: string; tone: string; addresses: string[] }>({
-    instructions: RESPOND_INSTRUCTIONS,
+  const drafted = await runAgent<{ message: string; tone: string; addresses: string[] }>(respondAgent, {
+    scanId: scan.id,
+    note: `${phase} — ${issue.title.slice(0, 50)}`,
     prompt: `Product: "${scan.company}".
 Venue: ${reporter?.venue ?? 'unknown'}${reporter ? ` — replying to ${reporter.handle}` : ''}.
 
@@ -93,7 +96,6 @@ What they actually wrote:
 ${JSON.stringify(theirWords)}
 
 ${brief}`,
-    schema: replySchema,
   });
 
   return {
@@ -141,13 +143,56 @@ export function replyEvent(reply: DraftedReply, reporter?: Reporter): LoopEvent 
  *  nowhere. */
 export async function deliverReply(
   reply: DraftedReply,
-): Promise<{ sent: false; reason: string; reply: DraftedReply }> {
+  context?: { scan: Scan; issue: Issue; phase: ReplyPhase },
+): Promise<{ sent: false; reason: string; reply: DraftedReply; held?: string }> {
+  // Not sent — but not thrown away either.
+  //
+  // The draft is the product's actual output for this step, and "what would we
+  // have posted?" is the only way to tell whether these replies are any good.
+  // Discarding them means the question can never be asked. So it goes to the
+  // outbox: addressed, timestamped, attached to its issue, and clearly marked
+  // as never delivered.
+  const held = context
+    ? holdReply(
+      context.scan,
+      context.issue,
+      reply.message,
+      reply.destination,
+      context.phase === 'fix-notify' ? 'follow-up' : 'reply',
+    )
+    : undefined;
+
   return {
     sent: false,
     reason:
       'Posting is not enabled. The draft above is exactly what would be sent, to '
-      + `${reply.destination}. Turning delivery on is a deliberate choice: it publishes text in the `
-      + 'company’s name to a named person, and it is the one step in this loop that cannot be taken back.',
+      + `${reply.destination}, and has been kept in the outbox`
+      + `${held ? ` as ${held.id}` : ''}. Turning delivery on is a deliberate choice: it publishes `
+      + 'text in the company’s name to a named person, and it is the one step in this loop that '
+      + 'cannot be taken back.',
     reply,
+    held: held?.id,
   };
 }
+
+/** The portable definition, for the agent list and for export to a platform.
+ *
+ *  Tool-free by contract. This agent writes something that gets posted under
+ *  the company's name to the person who complained; everything it says has to
+ *  come from the issue and the thread it was handed, never from a search.
+ */
+export const respondAgent: AgentDefinition = {
+  name: 'whisperer-respond',
+  title: 'Respond',
+  description: 'Drafts the public reply to someone who reported a problem — acknowledgement or shipped-fix follow-up.',
+  surface: 'loop',
+  instructions: RESPOND_INSTRUCTIONS,
+  invocation:
+    '\n\nHow you are invoked: the first message names the product and venue, gives the triaged issue, quotes '
+    + 'what the reporter wrote, and says which reply to write — the acknowledgement (nothing is fixed yet) or '
+    + 'the follow-up (the fix shipped, ask them to check).',
+  schema: replySchema,
+  connectors: [],
+  effort: 'medium',
+  inPipeline: true,
+};

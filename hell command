@@ -1,0 +1,240 @@
+[33mcommit c35c765b874fb71fa04f20629b07e6748f157f3b[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mdeterministic-pipeline[m[33m, [m[1;31morigin/deterministic-pipeline[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 21:51:51 2026 -0700
+
+    Add the file-ticket and respond-to-user agents
+    
+    Two steps of the resolution loop that were mocked now have working
+    implementations in the repo, registered in TrueForge by npm run provision and
+    callable directly by the API.
+    
+    file-ticket reconstructs what a template cannot: repro steps, expected versus
+    actual, and acceptance criteria, taken from what the reporters actually wrote.
+    Its instructions forbid inventing a step nobody described, because a plausible
+    invented step gets a real bug closed as cannot-reproduce.
+    
+    respond-to-user writes the reply in the venue's register, in two distinct
+    phases. Acknowledgement goes out before anything is fixed and must not imply
+    otherwise; the follow-up asks the reporter to check rather than asserting the
+    fix works, because only they can establish that.
+    
+    Both separate drafting from sending. Drafting is free and reversible. Filing
+    writes to someone's backlog and replying is speech in the company's name to a
+    named person on a platform where it cannot be unsaid, so submitTicket and
+    deliverReply are gates rather than omissions. The loop's promise that no staff
+    member has to act survives a gate, since a gate is a policy set once rather
+    than a person reviewing each message.
+    
+    Closing stays exclusive to the reporter: /confirm is the only route that can
+    close an issue and it requires their actual words, since an audit trail is
+    worth nothing if 'the reporter confirmed' can be recorded without what they
+    said.
+    
+    npm run trueforge starts TrueForge and npm run provision waits for it and
+    registers every agent, so a fresh checkout can populate itself.
+    
+    Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01SrXyqxcSgvZbzdx8CqGyCL
+
+[33mcommit 71c9be80956cba1e3879e3f058df9d454b009b7b[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 21:46:50 2026 -0700
+
+    style updates
+
+[33mcommit 38025c0c7f83c55e6e382991e7c03b089a85f543[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 21:44:01 2026 -0700
+
+    update
+
+[33mcommit 603a5c66fc1c4005eb0ba487dd305d81afa4602c[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 19:18:51 2026 -0700
+
+    Write one verdict over the whole window, and batch the abuse stage
+    
+    The first run that completed every model stage exposed both of these.
+    
+    The verdict argued with itself — 'drifting negative, and the pull is growing
+    steeper' followed immediately by 'flat-to-slightly-positive' — because the
+    batch verdicts were concatenated, and each batch had only seen four items and
+    generalised from them. A verdict is a claim about the whole window, so it is
+    now written by one pass that can see the whole window, reasoning over the
+    tallies, the common themes and the most extreme items rather than the full
+    corpus.
+    
+    Abuse was the last un-batched model call and duly timed out, losing the stage
+    and returning no findings. Ten candidates per turn completes, and a failed
+    batch now costs only its own ten.
+    
+    Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01SrXyqxcSgvZbzdx8CqGyCL
+
+[33mcommit 089ed2dfca97fd410dcc2610a1d685624b9a5bc7[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 18:52:49 2026 -0700
+
+    Serve the dashboard from the API process, and keep the default bind on loopback
+    
+    A deployment otherwise needs a second process purely to hand over static
+    files. Registered after every route so it cannot shadow /api, and skipped
+    entirely when no build exists, which is the development case where Vite owns
+    the UI and proxies to this.
+    
+    The bind address becomes configurable but stays on 127.0.0.1 by default: a
+    scan report quotes real people by name, so 'reachable from the internet
+    because it started on a server' is the wrong default.
+    
+    Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01SrXyqxcSgvZbzdx8CqGyCL
+
+[33mcommit d2a96f7244ade725d49439af6b1fb8c9ff064329[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 18:48:59 2026 -0700
+
+    Let the model endpoint be configured without TrueForge
+    
+    Reading the endpoint out of TrueForge's provider settings is convenient on a
+    workstation where it is already running, but it makes TrueForge a hard
+    dependency of the three reasoning stages. A deployment with a working model
+    endpoint and no TrueForge would fail for want of a lookup.
+    
+    Setting both LLM_BASE_URL and LLM_MODEL_ID now skips TrueForge entirely.
+    
+    Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01SrXyqxcSgvZbzdx8CqGyCL
+
+[33mcommit 29d60df54c222e6426aa28fc973e60f278005d47[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 18:44:20 2026 -0700
+
+    Add migration flow, topic volume, and the resolution loop
+    
+    Three views the demo needed, and the mock data to exercise them.
+    
+    Migration flow: publicly stated moves to and from competing products, as a
+    diverging bar per competitor. Direction is stored rather than inferred, since
+    reading it backwards would invert the most consequential number on the page,
+    and each row keeps the verbatim quote that justifies its direction. Moves
+    stated only as intent ("might switch", "still deciding") are shown but
+    excluded from net, because counting an intention as a migration inflates
+    churn. Rows sort by net so the tools taking users cluster together — an
+    aggregate churn figure would average them into one number and hide that a
+    single competitor accounts for most departures, for one coherent reason.
+    
+    Topic volume: discussion per product topic over time, stacked, so attention
+    moving between features is visible rather than reconstructed. Largest total
+    sits on the baseline where a stacked band reads accurately.
+    
+    Resolution loop: the audit trail from a public complaint to the reporter
+    agreeing it is fixed. The ordering is the contract — a fix is not announced
+    before it exists and a test guards it, and nothing but the reporter's own
+    confirmation closes an issue. The seeded data includes one loop that stops at
+    "asked them to confirm" and stays open, because a dashboard that counted that
+    as resolved would be lying about the one thing the flow promises. Outgoing
+    messages are quoted in full: a reply posted in the company's name is what an
+    audit needs to reread.
+    
+    Discord and LinkedIn become first-class venues, which needed the Venue union,
+    the schema enum, the server's URL mapping, and two more categorical palette
+    slots across all three theme blocks.
+    
+    Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01SrXyqxcSgvZbzdx8CqGyCL
+
+[33mcommit cc998d534586fc9436b0a23fcd29bc32eca7981c[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 17:38:15 2026 -0700
+
+    Improve dashboard persistence, tool attribution, and run resiliency
+    
+    Frontend:
+    - Extract the five summary stat cards into a persistent StatCards
+      component rendered above the tabs, visible on every scan tab.
+    - Rerun now targets the rail-selected scan via a synchronous ref instead
+      of a possibly-stale state closure, so it can no longer hit the wrong
+      site; drop the applyHash early-return that skipped loading a new pick.
+    - Add a live elapsed clock (this stage + total) to the running panel so
+      long, silent stages visibly move instead of looking hung.
+    - Refresh the scanned-sites rail immediately when a new run starts.
+    
+    Backend:
+    - Attribute tool log lines to the real connector/tool (e.g.
+      brave.brave_web_search) by accumulating chunked model.message.delta
+      arguments and correlating tool.response ids, instead of anonymous
+      "tool returned N B" / "failed -- 429" lines.
+    - Remove exa from every stage's connector list and the site agent: the
+      shared endpoint has been returning empty results and 429s.
+    - Add discord/linkedin venues and a topics collection.
+    
+    Pipeline tuning for real thread text: shrink scoring/issue batches and
+    per-item text budget so turns complete within the model output cap.
+
+[33mcommit 84a97e3d3cd537570dee157518db58c047f1de71[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 17:12:16 2026 -0700
+
+    Replace the agentic fetch pipeline with deterministic search
+    
+    Every stage returned empty while the UI reported "done". Six causes, each
+    hiding the next:
+    
+    - runStage caught stage errors without rethrowing, so index.ts set
+      status:'done' unconditionally. A scan where all six stages failed was
+      presented as a completed scan with six empty panels. A run that produces
+      nothing is now an error, and a partial run says which section is short.
+    
+    - Retrieval ran through an LLM tool-calling loop. Underneath it is a handful
+      of HTTP requests, so presence/discovery/feed now issue them directly
+      (app/server/search.ts). resolveSite is one search rather than an agent turn.
+    
+    - TrueForge cannot produce schema-constrained JSON from a custom provider:
+      with tools attached llama.cpp returns 400 "failed to parse grammar" (a
+      json_schema grammar and a tool grammar cannot compile together), and with
+      tools off the schema is ignored and the model answers in prose. Buzz,
+      health and abuse call the endpoint directly instead (app/server/model.ts).
+      TrueForge injects built-in tools when dynamicSubAgents/generativeUi are on,
+      so those are now off for the reasoning agents.
+    
+    - The provider URL pointed at a proxy that accepts response_format, forwards
+      the request without it, and returns prose with finish_reason "stop" — a
+      silently dropped schema. LLM_BASE_URL overrides it.
+    
+    - Buzz and health emitted their whole result in one turn, breaching the 4k
+      output cap. Both are batched now; a failed batch costs only itself.
+    
+    - Sentiment and triage reasoned over Brave meta descriptions, not over what
+      anyone wrote. That is why four copies of the same "best alternatives"
+      listicle scored -0.30/-0.20/0.00/0.00 and why triage found no complaints
+      in sixty mentions. app/server/content.ts fetches real page text (HN yields
+      full comment threads), discovery adds complaint-language queries, and
+      dictionary/spelling results are dropped for brands that are ordinary words.
+    
+    Reddit blocks this network on every route and its .env credentials are empty,
+    so those mentions keep their snippet and are flagged isFullText:false rather
+    than passed off as someone's words. Bright Data is wired as the escape hatch
+    for blocked pages, gated on BRIGHTDATA_API_TOKEN.
+    
+    Also: drop the reddit and linkedin connectors, using exa in linkedin's place;
+    send reasoningEffort only to models that advertise support; restore the score
+    range in the buzz schema description, since strictify() removes minimum and
+    maximum and the model was returning 7 on a -1..1 scale.
+    
+    Result for "lovable": 22 accounts, 60 mentions, 60 feed items, 17 monthly
+    sentiment buckets. Previously zero of each.
+    
+    Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01SrXyqxcSgvZbzdx8CqGyCL
+
+[33mcommit 53f804ef0eb14537f95ea3e745d4f1564a78db6f[m[33m ([m[1;32mmain[m[33m)[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 12:30:59 2026 -0700
+
+    update
+
+[33mcommit fc2836d35300b23df78f7489d50b7254186869cd[m
+Author: Chris McKenzie <kristopolous@yahoo.com>
+Date:   Sat Aug 29 12:15:25 2026 -0700
+
+    Initial commit

@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { Scan, Stage } from '../../../shared/types.ts';
 import { cleanName, fmtMonth } from '../lib.ts';
 
@@ -39,12 +40,30 @@ export function RunDashboard({
   activeId,
   onOpen,
   onNew,
+  onRemove,
 }: {
   runs: RunSummary[];
   activeId: string;
   onOpen: (id: string) => void;
   onNew: () => void;
+  onRemove: (id: string) => Promise<void> | void;
 }) {
+  // Deleting is not undoable, so it asks first. Held as the pending run rather
+  // than a boolean so the dialog can name what is about to go.
+  const [pending, setPending] = useState<RunSummary | null>(null);
+  const [removing, setRemoving] = useState(false);
+
+  const confirm = async () => {
+    if (!pending) return;
+    setRemoving(true);
+    try {
+      await onRemove(pending.id);
+      setPending(null);
+    } finally {
+      setRemoving(false);
+    }
+  };
+
   return (
     <aside className="dash-rail">
       <div className="dash-rail-top">
@@ -76,7 +95,26 @@ export function RunDashboard({
               <span className="t-name">{cleanName(run.company)}</span>
               <span className={`st-dot ${run.status === 'done' ? 'ok' : run.status === 'error' ? 'bad' : 'warn'}`} />
             </span>
-            <span className="s">{cleanSite(run.site) || fmtMonth(run.createdAt)}</span>
+            <span className="s">
+              <span className="s-url">{cleanSite(run.site) || fmtMonth(run.createdAt)}</span>
+              <span
+                className="site-remove"
+                role="button"
+                tabIndex={0}
+                title={`Remove ${cleanName(run.company)}`}
+                aria-label={`Remove ${cleanName(run.company)}`}
+                onClick={(event) => { event.stopPropagation(); setPending(run); }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setPending(run);
+                  }
+                }}
+              >
+                ×
+              </span>
+            </span>
             <span className="m">
               <span className={`l-arr ${run.net.now >= 0 ? 'up' : 'down'}`}>
                 {fmtScore(run.net.now)}
@@ -89,6 +127,32 @@ export function RunDashboard({
           </button>
         ))}
       </div>
+
+      {pending && (
+        <div
+          className="lightbox"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="remove-title"
+          onClick={() => !removing && setPending(null)}
+        >
+          <div className="lightbox-card" onClick={(event) => event.stopPropagation()}>
+            <h3 id="remove-title">Remove {cleanName(pending.company)}?</h3>
+            <p>
+              This deletes every scan of {cleanName(pending.company)} — the mentions, issues and
+              history behind this row. It cannot be undone.
+            </p>
+            <div className="lightbox-actions">
+              <button className="ghost" onClick={() => setPending(null)} disabled={removing}>
+                Cancel
+              </button>
+              <button className="danger" onClick={confirm} disabled={removing}>
+                {removing ? 'Removing…' : 'Remove'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </aside>
   );
 }

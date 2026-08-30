@@ -92,6 +92,30 @@ export function put(scan: Scan) {
   return scan;
 }
 
+/** Delete a scan and every other attempt at the same company.
+ *
+ *  The sidebar collapses re-scans into one row per company, so a row does not
+ *  stand for one record — removing only the scan behind it would make an older
+ *  attempt at the same company pop straight back into the list, which reads as
+ *  the delete having failed. What the row means is "this company", so that is
+ *  what goes.
+ *
+ *  Returns the ids actually removed, so the caller can say what happened rather
+ *  than claiming a single deletion.
+ */
+export function remove(id: string): string[] {
+  const target = get(id);
+  if (!target) return [];
+
+  const key = companyKey(target);
+  const doomed = scans.filter((scan) => scan.id === id || (key && companyKey(scan) === key));
+  const ids = new Set(doomed.map((scan) => scan.id));
+
+  scans = scans.filter((scan) => !ids.has(scan.id));
+  flush();
+  return [...ids];
+}
+
 export function patch(id: string, changes: Partial<Scan>) {
   const scan = get(id);
   if (!scan) return undefined;

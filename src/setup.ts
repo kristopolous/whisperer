@@ -2,11 +2,14 @@
  * Applies src/registry.ts to the local TrueForge instance, then probes each MCP
  * server so a container that is down or misconfigured shows up here rather than
  * mid-conversation.
+ *
+ * The agents themselves are defined in app/server/agents/ as plain data and
+ * converted here — this script pushes them to TrueForge, it does not own them.
  */
-import { availableServers } from '../app/server/pipeline.ts';
-import { agents } from './agents.ts';
+import { toTrueForgeAgents, toTrueForgeMcpServers } from '../app/server/agents/trueforge.ts';
+import { usableConnectors } from '../app/server/config.ts';
 import { client } from './client.ts';
-import { mcpServers, skills } from './registry.ts';
+import { skills } from './registry.ts';
 
 for (const manifest of skills) {
   const { data: skill } = await client.settings.skills.createOrUpdate({ manifest });
@@ -19,9 +22,10 @@ const agentIdByName = new Map(existingAgents.map((a) => [a.name, a.id]));
 
 // A saved agent is validated eagerly: TrueForge 422s if it names a connector
 // that isn't currently configured (unlike a live session, which only finds out
-// when the model tries to call it — see the preload:false note in pipeline.ts).
-// src/agents.ts lists what each agent wants; narrow to what this instance has.
-const connected = new Set(await availableServers());
+// when the model tries to call it). Each definition lists what its agent wants;
+// narrow that to the connectors this machine can actually reach.
+const connected = new Set(usableConnectors().map((c) => c.name));
+const agents = await toTrueForgeAgents();
 
 for (const { name, manifest } of agents) {
   const wanted = manifest.mcpServers ?? [];
@@ -38,7 +42,7 @@ for (const { name, manifest } of agents) {
   if (skipped.length) console.log(`       skipped (not configured): ${skipped.join(', ')}`);
 }
 
-for (const manifest of mcpServers) {
+for (const manifest of toTrueForgeMcpServers()) {
   const { data: server } = await client.settings.mcpServers.createOrUpdate({ manifest });
   console.log(`mcp    ${server.name}  <- ${manifest.url}  auth=${server.authStatus.status}`);
 

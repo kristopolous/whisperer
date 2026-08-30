@@ -6,8 +6,17 @@ import express from 'express';
 import type { Scan, ScanEvent, Stage, Tracker } from '../shared/types.ts';
 import { STAGES } from '../shared/types.ts';
 import { cleanName, siteOf } from '../shared/name.ts';
-import { availableServers, type Log } from './pipeline.ts';
-import { checkConnectors, reconnectConnectors } from './connectors.ts';
+import type { Log } from './pipeline.ts';
+import { AGENTS } from './agents/registry.ts';
+import { onAgentRun, recentRuns, runsForScan, statsFor } from './agents/runtime.ts';
+import { cacheSize, cacheStats, clearCache } from './cache.ts';
+import { askJsonDirect } from './model.ts';
+import { recordLoopStep } from './channels/github.ts';
+import { channelStates, reloadChannels } from './channels/index.ts';
+import { enabledConnectors, inferenceConfig, inferenceHost, inferenceHosts, patchConnector, patchInferenceHost, reloadConfig } from './config.ts';
+import { discard, outbox } from './outbox.ts';
+import { secretSource, setSecrets } from './secrets.ts';
+import { availableConnectors, checkConnectors } from './mcp.ts';
 import { runStage, explainFailure } from './stages.ts';
 import * as store from './store.ts';
 import { buildPayload } from './trackers.ts';
@@ -20,12 +29,82 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
-app.get('/api/health', async (_req, res) => {
-  const servers = await availableServers();
-  res.json({ servers, model: process.env.TRUEFORGE_MODEL ?? 'openai/gpt-5-5' });
+app.get('/api/health', (_req, res) => {
+  const host = inferenceHost();
+  res.json({
+    servers: availableConnectors(),
+    model: `${host.key}/${host.modelId}`,
+    inference: { host: host.key, baseUrl: host.baseUrl, isExample: inferenceConfig().isExample },
+  });
 });
 
 app.get('/api/scans', (_req, res) => res.json(store.list()));
+
+/** The agent list: every agent this app has, what it is for, and how its runs
+ *  have actually gone.
+ *
+ *  This is the thing a hosted agent platform would not tell us. An agent that
+ *  has never run, one that ran and failed, and one that runs fine but takes
+ *  ninety seconds are three completely different situations, and they are
+ *  indistinguishable from an empty dashboard panel. */
+app.get('/api/agents', (_req, res) => {
+  res.json(AGENTS.map((agent) => ({
+    name: agent.name,
+    title: agent.title,
+    description: agent.description,
+    surface: agent.surface,
+    stage: agent.stage,
+    connectors: agent.connectors,
+    effort: agent.effort,
+    inPipeline: agent.inPipeline,
+    /** Roughly how big the standing instructions are — the prompt is the asset,
+     *  and its size is worth seeing next to a context-length limit. */
+    instructionChars: agent.instructions.length,
+    stats: statsFor(agent.name),
+  })));
+});
+
+/** The run log, newest first. */
+app.get('/api/agents/runs', (req, res) => {
+  const scanId = req.query.scan ? String(req.query.scan) : null;
+  res.json(scanId ? runsForScan(scanId) : recentRuns(Number(req.query.limit ?? 100)));
+});
+
+/** Live run events, so the agent list moves while a scan is going. */
+app.get('/api/agents/stream', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  for (const run of recentRuns(25).reverse()) res.write(`data: ${JSON.stringify(run)}\n\n`);
+  const off = onAgentRun((run) => res.write(`data: ${JSON.stringify(run)}\n\n`));
+  req.on('close', off);
+});
+
+/** What the disk cache is holding, and whether it is being hit. A stage that
+ *  finishes suspiciously fast should be explainable rather than surprising. */
+app.get('/api/cache', (_req, res) => {
+  res.json({ stats: cacheStats(), namespaces: cacheSize() });
+});
+
+app.delete('/api/cache', (req, res) => {
+  clearCache(req.query.namespace ? String(req.query.namespace) : undefined);
+  res.json({ cleared: true, namespaces: cacheSize() });
+});
+
+/** Outbound write channels and what each is actually blocked on. Separate
+ *  endpoint from /api/connectors because reads and writes are separate
+ *  concerns: one is what we may look at, the other is what we may say. */
+app.get('/api/channels', (_req, res) => {
+  try {
+    reloadChannels();
+    res.json(channelStates());
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
 
 /** Health of the currently-registered search connectors, for the failure UI. */
 app.get('/api/connectors', async (_req, res) => {
@@ -36,11 +115,155 @@ app.get('/api/connectors', async (_req, res) => {
   }
 });
 
-/** Re-apply the connector manifests and re-probe. This is the corrective path
- *  for a connector that went stale or lost its credentials. */
+/** Which credentials the configured connectors and channels want, whether each
+ *  is set, and where it came from. Never the values themselves. */
+app.get('/api/credentials', (_req, res) => {
+  try {
+    const fromConnectors = enabledConnectors().flatMap((c) =>
+      (c.requires ?? []).map((name) => ({ name, usedBy: c.name, kind: 'connector' as const })));
+    const fromChannels = channelStates().flatMap((c) =>
+      (c.requires ?? []).map((name) => ({ name, usedBy: c.label, kind: 'channel' as const })));
+
+    // One row per credential, listing everything that wants it — several
+    // connectors can share a key and asking for it twice would be silly.
+    const byName = new Map<string, { name: string; usedBy: string[]; kind: string; source: string }>();
+    for (const entry of [...fromConnectors, ...fromChannels]) {
+      const row = byName.get(entry.name) ?? {
+        name: entry.name, usedBy: [], kind: entry.kind, source: secretSource(entry.name),
+      };
+      row.usedBy.push(entry.usedBy);
+      byName.set(entry.name, row);
+    }
+    res.json([...byName.values()].sort((a, b) => a.name.localeCompare(b.name)));
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Save credentials typed into the settings screen. Write-only: the values are
+ *  never read back out, and an empty string clears one. */
+app.put('/api/credentials', async (req, res) => {
+  try {
+    const values = req.body as Record<string, string>;
+    if (!values || typeof values !== 'object') return res.status(400).json({ error: 'expected an object' });
+    setSecrets(values);
+    // Re-probe immediately: the point of typing a key is to find out whether it
+    // works, and making someone press a second button to learn that is the same
+    // failure as sending them to .env.
+    res.json(await checkConnectors());
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** What the system would have said to real people, and did not.
+ *
+ *  Kept as its own surface rather than buried in each issue: the useful review
+ *  question is "read everything we were about to post", not "click through
+ *  twelve issues". */
+app.get('/api/outbox', (req, res) => {
+  res.json(outbox(req.query.scan ? String(req.query.scan) : undefined));
+});
+
+app.post('/api/outbox/:id/discard', (req, res) => {
+  res.json({ discarded: discard(req.params.id) });
+});
+
+/** The configured inference hosts, without their keys. */
+app.get('/api/inference', (_req, res) => {
+  try {
+    res.json(inferenceHosts());
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Change where inference runs — endpoint, model id, and optionally a key.
+ *
+ *  `apiKey` is write-only and optional: omit it to leave whatever is stored
+ *  alone, send an empty string to remove it. A local endpoint usually needs
+ *  none at all, so "no key" is a normal state rather than a misconfiguration. */
+app.put('/api/inference', (req, res) => {
+  try {
+    const hostKey = String(req.body?.host ?? '').trim();
+    if (!hostKey) return res.status(400).json({ error: 'host is required' });
+
+    const changes: Parameters<typeof patchInferenceHost>[1] = {};
+    if (typeof req.body.baseUrl === 'string') changes.baseUrl = req.body.baseUrl.trim();
+    if (typeof req.body.modelId === 'string') changes.modelId = req.body.modelId;
+    if (typeof req.body.apiKey === 'string') changes.apiKey = req.body.apiKey;
+    if (Number.isFinite(req.body.contextLength)) changes.contextLength = Number(req.body.contextLength);
+    if (Number.isFinite(req.body.maxOutputTokens)) changes.maxOutputTokens = Number(req.body.maxOutputTokens);
+    if (req.body.makeDefault === true) changes.makeDefault = true;
+
+    patchInferenceHost(hostKey, changes);
+    res.json(inferenceHosts());
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Ask the configured endpoint for one tiny schema-constrained answer.
+ *
+ *  Worth having as its own button: the endpoint being reachable, the model
+ *  existing, and the endpoint honouring `response_format` are three separate
+ *  things, and only the third one is what this app actually depends on. A proxy
+ *  that accepts the schema and quietly forwards the request without it looks
+ *  identical to success until a stage returns prose. */
+app.post('/api/inference/test', async (_req, res) => {
+  const started = Date.now();
+  try {
+    const answer = await askJsonDirect<{ ok: string }>({
+      instructions: 'You reply only with JSON matching the schema.',
+      prompt: 'Set ok to the string "ok".',
+      schema: {
+        name: 'probe',
+        schema: {
+          type: 'object', required: ['ok'], additionalProperties: false,
+          properties: { ok: { type: 'string' } },
+        },
+      },
+      timeoutMs: 120_000,
+    });
+    res.json({
+      ok: true,
+      ms: Date.now() - started,
+      schemaHonoured: typeof answer?.ok === 'string',
+    });
+  } catch (error) {
+    res.json({
+      ok: false,
+      ms: Date.now() - started,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+/** Edit one connector from the settings dashboard — where it lives, and
+ *  whether it is in play. Credentials are not editable here on purpose: they
+ *  belong in .env, and the connector's `requires` list is what reports a
+ *  missing one. */
+app.put('/api/connectors/:name', async (req, res) => {
+  try {
+    const changes: { url?: string; enabled?: boolean } = {};
+    if (typeof req.body?.url === 'string') changes.url = req.body.url.trim();
+    if (typeof req.body?.enabled === 'boolean') changes.enabled = req.body.enabled;
+    patchConnector(req.params.name, changes);
+    // Re-probe everything rather than just this row: enabling one connector
+    // changes what the list means, and a stale neighbour is confusing.
+    res.json(await checkConnectors());
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Re-read config/connectors.json and re-probe. Connectors are dialled
+ *  directly now, so there are no manifests to re-apply — the corrective path
+ *  for one that went stale is to pick up any config edit and dial it again. */
 app.post('/api/connectors/reconnect', async (_req, res) => {
   try {
-    res.json(await reconnectConnectors());
+    reloadConfig();
+    res.json(await checkConnectors());
   } catch (error) {
     res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
   }
@@ -129,14 +352,14 @@ app.get('/api/scans/:id/stream', async (req, res) => {
   };
 
   try {
-    const servers = await availableServers();
+    const servers = availableConnectors();
     log('info', `${servers.length} connectors: ${servers.join(', ') || 'none'}`);
-    if (servers.length === 0) log('warn', 'nothing to search with — run `npm run setup`');
+    if (servers.length === 0) log('warn', 'no usable connectors — check config/connectors.json and the credentials it names');
 
     for (const next of STAGE_KEYS) {
       send({ type: 'stage', stage: next });
       try {
-        await runStage({ scan, servers, log, send }, next);
+        await runStage({ scan, log, send }, next);
       } catch (error) {
         const raw = error instanceof Error ? error.message : String(error);
         const { message, detail, kind } = explainFailure(next, raw);
@@ -228,11 +451,11 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
   };
 
   try {
-    const servers = await availableServers();
+    const servers = availableConnectors();
     scan.status = 'running';
     scan.stage = next;
     store.put(scan);
-    await runStage({ scan, servers, log, send }, next);
+    await runStage({ scan, log, send }, next);
     scan.status = 'done';
     scan.stage = 'done';
     store.put(scan);
@@ -258,6 +481,16 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
 });
 
 app.post('/api/scans', (_req, res) => res.json({ id: randomUUID().slice(0, 8) }));
+
+/** Remove a scan, and every other attempt at the same company, since that is
+ *  what one row in the sidebar stands for. Deliberately explicit about how many
+ *  records went: "removed 1" and "removed 4" are different events and the
+ *  caller should be able to tell the user which happened. */
+app.delete('/api/scans/:id', (req, res) => {
+  const removed = store.remove(req.params.id);
+  if (removed.length === 0) return res.status(404).json({ error: 'no such scan' });
+  res.json({ removed, runs: store.list() });
+});
 
 /** Preview what would be filed. Nothing leaves this machine on a preview. */
 app.post('/api/scans/:id/issues/:issueId/payload', (req, res) => {
@@ -327,11 +560,11 @@ app.post('/api/scans/:id/issues/:issueId/ticket', async (req, res) => {
     // until a tracker credential is configured — but the distinction between
     // drafting and filing lives here rather than being blurred.
     if (req.body?.submit) {
-      const result = await submitTicket(draft);
+      const result = await submitTicket(draft, scan, issue);
       if (result.filed) {
         issue.status = 'filed';
-        issue.filedTo = { tracker, ref: 'filed', at: new Date().toISOString() };
-        issue.loop = [...(issue.loop ?? []), ticketFiledEvent(tracker, 'filed')];
+        issue.filedTo = { tracker, ref: result.ref ?? 'filed', at: new Date().toISOString() };
+        issue.loop = [...(issue.loop ?? []), ticketFiledEvent(tracker, result.ref ?? 'filed', result.url)];
         store.put(scan);
       }
       return res.json({ draft, ...result });
@@ -366,11 +599,15 @@ app.post('/api/scans/:id/issues/:issueId/reply', async (req, res) => {
     });
 
     if (req.body?.send) {
-      const result = await deliverReply(draft);
+      const result = await deliverReply(draft, { scan, issue, phase });
       if (result.sent) {
-        issue.loop = [...(issue.loop ?? []), replyEvent(draft, issue.reporter)];
+        const event = replyEvent(draft, issue.reporter);
+        issue.loop = [...(issue.loop ?? []), event];
         if (phase === 'acknowledge') issue.status = 'responded';
         store.put(scan);
+        // The ledger gets the verbatim message. Annotating it must never fail
+        // the send that already happened, so this swallows its own errors.
+        await recordLoopStep(issue, event);
       }
       return res.json({ draft, ...result });
     }
@@ -386,7 +623,7 @@ app.post('/api/scans/:id/issues/:issueId/reply', async (req, res) => {
  *  Deliberately the only route that can close an issue, and it takes their
  *  words rather than a boolean — the audit trail is worth nothing if "the
  *  reporter confirmed" can be recorded without what they said. */
-app.post('/api/scans/:id/issues/:issueId/confirm', (req, res) => {
+app.post('/api/scans/:id/issues/:issueId/confirm', async (req, res) => {
   const scan = store.get(req.params.id);
   const issue = scan?.issues.find((i) => i.id === req.params.issueId);
   if (!scan || !issue) return res.status(404).json({ error: 'no such issue' });
@@ -418,6 +655,11 @@ app.post('/api/scans/:id/issues/:issueId/confirm', (req, res) => {
   ];
   issue.status = 'closed';
   store.put(scan);
+
+  // Both closing steps go onto the ledger, so the filed issue ends with the
+  // reporter's own words rather than with someone's assertion that it is done.
+  for (const event of issue.loop.slice(-2)) await recordLoopStep(issue, event);
+
   res.json(issue);
 });
 

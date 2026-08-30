@@ -26,14 +26,66 @@ export function Health({ scan, onChange }: { scan: Scan; onChange: (issue: Issue
     [scan.id, issues.length]);
 
   if (issues.length === 0) {
+    // Three different situations produce an empty list, and calling all of them
+    // "nothing to fix" is a lie in two of them. Claiming a company has no
+    // complaints when the triage step never executed is the worst thing this
+    // panel can say, because it is both confident and wrong.
+    //
+    // `timings.health` is written when the stage finishes, whether it succeeded
+    // or failed, so its absence is a reliable "this has not run".
+    const ran = scan.timings?.health !== undefined;
+    const failed = scan.failedStage === 'health';
+
+    if (!ran) {
+      return (
+        <div className="panel">
+          <div className="empty">
+            <h3>Triage hasn't run yet</h3>
+            <p>
+              This scan stopped at <b>{scan.stage}</b>, so nothing has been read for complaints. This
+              is not a finding about {scan.company} — it is a run that did not get this far. Use
+              <b> ↻ Rerun</b> above to triage the {scan.mentions.length} mention
+              {scan.mentions.length === 1 ? '' : 's'} already collected.
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    if (failed) {
+      return (
+        <div className="panel">
+          <div className="empty">
+            <h3>Triage failed</h3>
+            <p>{scan.error ?? 'The triage step errored, so no issues were produced. Rerun it above.'}</p>
+          </div>
+        </div>
+      );
+    }
+
+    if (scan.mentions.length === 0) {
+      return (
+        <div className="panel">
+          <div className="empty">
+            <h3>Nothing to triage</h3>
+            <p>
+              Discovery returned no third-party discussion, so triage had nothing to read. The gap is
+              upstream of this tab — rerun discovery first.
+            </p>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="panel">
         <div className="empty">
-          <h3>Nothing to fix</h3>
+          <h3>No defects found in {scan.mentions.length} mentions</h3>
           <p>
-            No complaint in the discussion pointed at a real defect. That is a finding, not an
-            empty result — the criticism that did come up was opinion or preference, and it stays
-            in the ledger above.
+            Triage read every mention and none of them pointed at a reproducible defect — the
+            criticism that came up was opinion or preference, and it stays in the ledger above. For a
+            widely used product that is worth a second look rather than taking at face value: rerun
+            the triage, or check Discovery for whether the corpus actually contains complaints.
           </p>
         </div>
       </div>
