@@ -11,7 +11,7 @@ export interface RunSummary {
   status: Scan['status'];
   stage: Scan['stage'];
   error?: string;
-  counts: { mentions: number; issues: number };
+  counts: { mentions: number; issues: number; scored?: number };
   net: { now: number; delta: number };
   verdict: string;
   sessionId?: string;
@@ -116,8 +116,10 @@ export function RunDashboard({
               </span>
             </span>
             <span className="m">
-              <span className={`l-arr ${run.net.now >= 0 ? 'up' : 'down'}`}>
-                {fmtScore(run.net.now)}
+              {/* An em dash rather than +0.00 when nothing was scored — the
+                  difference between neutral opinion and no opinion read. */}
+              <span className={`l-arr ${run.counts.scored ? (run.net.now >= 0 ? 'up' : 'down') : ''}`}>
+                {run.counts.scored ? fmtScore(run.net.now) : '—'}
               </span>
               <span className="c">{run.counts.issues} issues</span>
               <span className={`tag ${run.status === 'done' ? 'good' : run.status === 'error' ? 'critical' : 'warning'}`}>

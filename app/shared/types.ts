@@ -34,6 +34,13 @@ export interface Mention {
   /** -1 (hostile) .. +1 (delighted) */
   score: number;
   themes: string[];
+  /** Whether the sentiment pass actually judged this one.
+   *
+   *  Needed because a mention scored a genuine, considered 0.0 and a mention
+   *  nothing has looked at both read as `score: 0, sentiment: 'neutral'`.
+   *  Inferring "scored" from a non-zero score undercounts every honestly
+   *  neutral item — on a real run it reported 27 of 40. */
+  scored?: boolean;
   /** True when a complaint-shaped search found this — "X broken", "X doesn't
    *  work". Not a claim that it *is* a complaint, only that it came from asking
    *  for one; triage decides. Carried so the corpus can guarantee these a share
@@ -70,6 +77,44 @@ export interface Issue {
   reporter?: Reporter;
   /** The full audit trail, oldest first. Empty until the loop starts. */
   loop?: LoopEvent[];
+  /** What reading the source concluded, once someone asked. */
+  diagnosis?: Diagnosis;
+  /** The patch, and whether its tests actually passed. */
+  fix?: FixResult;
+}
+
+/** The result of reading a project's source against a reported defect. */
+export interface Diagnosis {
+  verdict: 'located' | 'plausible' | 'insufficient' | 'not-a-defect';
+  confidence: 'high' | 'medium' | 'low';
+  reasoning: string;
+  suspectFiles: { path: string; why: string }[];
+  likelyCause: string;
+  proposedFix: string;
+  regressionTest: string;
+  unknowns: string[];
+  /** What the search actually covered, so the verdict can be judged. */
+  searched: { terms: string[]; files: string[]; hits: number };
+  at: string;
+}
+
+/** A patch produced for a diagnosed defect, and the evidence it works.
+ *
+ *  `applied` means the tests passed in a throwaway copy — never that anything
+ *  was committed, pushed or merged. `provesTheBug` is the one that matters: a
+ *  regression test that passes against the ORIGINAL code has not tested the
+ *  fix, and a green suite means nothing without it. */
+export interface FixResult {
+  applied: boolean;
+  summary: string;
+  notes: string;
+  files: { path: string; contents: string; why: string }[];
+  diff: string;
+  tests: { command: string; passed: boolean; output: string };
+  provesTheBug: { checked: boolean; failedOnOriginal: boolean; detail: string };
+  attempts: number;
+  workdir: string;
+  at: string;
 }
 
 export type Tracker = 'linear' | 'jira' | 'github' | 'clipboard';
@@ -258,8 +303,30 @@ export interface Scan {
   topics: TopicPoint[];
   /** Publicly stated moves to and from competing products. */
   migrations: Migration[];
+  /** Public scores on review sites — the reputation a buyer actually looks up. */
+  reviews: ReviewScore[];
   /** Newest-first stream of the latest comments, videos and posts. */
   feed: FeedItem[];
+  /** Exactly what was typed into the box, before anything interpreted it.
+   *
+   *  Kept because every interpretation downstream is a guess that can be wrong,
+   *  and the raw string is the only thing that cannot be. Pasting a repository
+   *  URL used to be reduced to "GitHub" by a hostname cleaner before the
+   *  resolver ever saw it — so the resolver was asked to identify the wrong
+   *  thing and did so correctly. */
+  input?: string;
+  /** What the typed input was resolved to, once, at the start. */
+  subject?: Subject;
+  /** The fork everything is written to. Never the upstream project. */
+  fork?: string;
+  /** When each stage last finished, as an ISO timestamp.
+   *
+   *  Distinct from `timings`, which records how long a stage took. "This took
+   *  95 seconds" and "this was fetched three days ago" answer different
+   *  questions, and only the second one tells you whether to believe what is on
+   *  screen. A scan is a snapshot of a moving internet; without this, a panel
+   *  from last week looks exactly like one from a minute ago. */
+  pulledAt?: Partial<Record<Stage, string>>;
   /** Everything the run printed, kept with the scan so a finished run can still
    *  be audited. */
   log: LogLine[];
@@ -308,3 +375,50 @@ export type ScanEvent =
       /** What class of failure this is, so the UI can offer the right remedy. */
       kind?: 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'other';
     };
+
+/** Which reputation a score measures. They are not interchangeable: a company
+ *  can be loved by software buyers and hated by its own staff, and averaging
+ *  the two describes nobody. */
+export type ReviewKind = 'software' | 'customer' | 'app' | 'employer';
+
+/** A public score on a review site, as read out of a search result. */
+export interface ReviewScore {
+  site: string;
+  rating: number;
+  /** Usually 5, sometimes 10. Stated rather than assumed. */
+  scale: number;
+  /** How many reviews the score is over — the difference between a signal and
+   *  an anecdote. Null when the source did not say. */
+  count: number | null;
+  url: string;
+  /** From the review site's own page, rather than someone quoting it. */
+  firstParty: boolean;
+  /** The sentence it was read out of, so a wrong number is traceable. */
+  quote: string;
+  kind: ReviewKind;
+}
+
+/** What the person typed, worked out into something the pipeline can use.
+ *
+ *  Resolved once at the start of a scan so nothing downstream has to interpret
+ *  the raw input again. Everything after this point works from `searchTerm` and
+ *  `name` rather than from whatever was in the box. */
+export interface Subject {
+  /** Exactly what was typed, kept so the resolution can be second-guessed. */
+  input: string;
+  /** What to call it on screen. */
+  name: string;
+  /** The term to quote into web searches. */
+  searchTerm: string;
+  /** Other names the same thing is discussed under. */
+  aliases: string[];
+  /** Unrelated things sharing the name, which searches should not return. */
+  excludeTerms: string[];
+  site: string;
+  /** Source repository, when known — this is what makes diagnose and fix
+   *  available without anyone editing a config file. */
+  repo: string;
+  kind: 'open-source project' | 'commercial product' | 'company' | 'service' | 'unknown';
+  summary: string;
+  confidence: 'high' | 'medium' | 'low';
+}

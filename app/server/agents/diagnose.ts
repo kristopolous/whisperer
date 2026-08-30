@@ -52,6 +52,7 @@ export const diagnoseAgent: AgentDefinition = {
     + 'Diagnose against those excerpts only.',
   schema: diagnoseSchema,
   connectors: [],
+  role: 'coding',
   effort: 'high',
   inPipeline: false,
 };

@@ -16,6 +16,7 @@
  */
 
 import type { Issue, LoopEvent, Scan } from '../../shared/types.ts';
+import { assertWritable } from './fork.ts';
 import { channelsConfig } from './index.ts';
 
 const ACCEPT = 'application/vnd.github+json';
@@ -42,10 +43,10 @@ export function githubConfigured(): boolean {
   }
 }
 
-async function call<T>(path: string, body?: unknown): Promise<T> {
+async function call<T>(path: string, body?: unknown, method?: 'POST' | 'PUT'): Promise<T> {
   const config = github();
   const response = await fetch(`${config.apiBase}/repos/${config.owner}/${config.repo}${path}`, {
-    method: body ? 'POST' : 'GET',
+    method: method ?? (body ? 'POST' : 'GET'),
     headers: {
       Accept: ACCEPT,
       Authorization: `Bearer ${config.token}`,
@@ -78,6 +79,12 @@ export interface FiledIssue {
 export async function createIssue(
   scan: Scan, issue: Issue, title: string, body: string, labels: string[],
 ): Promise<FiledIssue> {
+  // Hard stop before anything is written. Filing a bot-written ticket on
+  // somebody else's tracker wastes a maintainer's time and cannot be undone by
+  // deleting it afterwards — they have already read it.
+  const target = github();
+  await assertWritable(target.owner, target.repo);
+
   const created = await call<{ number: number; html_url: string }>('/issues', {
     title,
     body: `${auditHeader(scan, issue)}\n\n---\n\n${body}`,
@@ -87,6 +94,8 @@ export async function createIssue(
 }
 
 export async function commentOnIssue(number: number, body: string): Promise<string> {
+  const target = github();
+  await assertWritable(target.owner, target.repo);
   const created = await call<{ html_url: string }>(`/issues/${number}/comments`, { body });
   return created.html_url;
 }
@@ -138,4 +147,73 @@ export async function recordLoopStep(issue: Issue, event: LoopEvent): Promise<st
   } catch {
     return null;
   }
+}
+
+/** Open a pull request on OUR fork, carrying the patched files.
+ *
+ *  Committed through the API rather than by pushing a git branch: the work copy
+ *  the fix ran in is a throwaway clone of the upstream with no credentials and
+ *  no remote of ours, and wiring git auth into it would be a second way to
+ *  write to a repository — which is exactly the thing being kept to one guarded
+ *  path.
+ *
+ *  Every call goes through `assertWritable` first. A pull request against an
+ *  upstream project is the single most costly thing this pipeline could do by
+ *  accident: it notifies maintainers, it sits in their queue, and deleting it
+ *  afterwards does not unsend it.
+ */
+export interface OpenedPr {
+  number: number;
+  url: string;
+  branch: string;
+}
+
+export async function openPullRequest(
+  files: { path: string; contents: string }[],
+  title: string,
+  body: string,
+  emit: (level: 'info' | 'warn', text: string) => void,
+): Promise<OpenedPr> {
+  const target = github();
+  await assertWritable(target.owner, target.repo);
+  if (files.length === 0) throw new Error('nothing to open a pull request with');
+
+  const repo = await call<{ default_branch: string }>('');
+  const base = repo.default_branch;
+  const branch = `whisperer/fix-${Date.now().toString(36)}`;
+
+  const head = await call<{ object: { sha: string } }>(`/git/ref/heads/${base}`);
+  await call(`/git/refs`, { ref: `refs/heads/${branch}`, sha: head.object.sha });
+  emit('info', `branch ${branch} created on ${target.owner}/${target.repo}`);
+
+  for (const file of files) {
+    // An existing file needs its blob sha to be replaced; a new one must not
+    // carry a sha at all.
+    let sha: string | undefined;
+    try {
+      const existing = await call<{ sha: string }>(`/contents/${encodeURI(file.path)}?ref=${branch}`);
+      sha = existing.sha;
+    } catch {
+      sha = undefined;
+    }
+
+    await call(`/contents/${encodeURI(file.path)}`, {
+      message: `${sha ? 'Update' : 'Add'} ${file.path}`,
+      content: Buffer.from(file.contents, 'utf8').toString('base64'),
+      branch,
+      ...(sha ? { sha } : {}),
+    }, 'PUT');
+    emit('info', `committed ${file.path}`);
+  }
+
+  const pr = await call<{ number: number; html_url: string }>('/pulls', {
+    title,
+    body,
+    head: branch,
+    // Against our own fork's default branch — never the upstream.
+    base,
+  });
+
+  emit('info', `pull request #${pr.number} opened on the fork`);
+  return { number: pr.number, url: pr.html_url, branch };
 }

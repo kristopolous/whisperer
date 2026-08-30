@@ -74,6 +74,10 @@ function summarize({ mentions, issues, abuse, log, ...rest }: Scan) {
     log: [],
     counts: {
       mentions: mentions.length,
+      // How many mentions carry a judgement. The sidebar shows a net sentiment
+      // per run, and without this it cannot tell "neutral" from "never scored"
+      // — so every failed scoring pass showed as a confident +0.00.
+      scored: mentions.filter((m) => m.scored ?? (m.score !== 0 || m.sentiment !== 'neutral')).length,
       issues: issues.length,
       abuse: abuse?.length ?? 0,
       critical: (issues ?? []).filter((i) => i.severity === 'critical').length

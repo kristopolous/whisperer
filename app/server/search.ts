@@ -13,6 +13,9 @@
 
 import { cleanText } from '../shared/html.ts';
 import { cached, HOUR } from './cache.ts';
+import { usableConnectors } from './config.ts';
+import { unwrapUntrusted } from './content.ts';
+import { callTool } from './mcp.ts';
 import { secret } from './secrets.ts';
 import type { Venue } from '../shared/types.ts';
 
@@ -73,14 +76,44 @@ function parseAge(age: string | undefined, pageAge: string | undefined): string 
  *  "news". Requiring the name to appear removes all of them for the cost of one
  *  string comparison.
  */
+const escapeRe = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 export function namesCompany(hit: SearchHit, company: string): boolean {
   const needle = company.toLowerCase().trim();
   if (!needle) return true;
-  const haystack = `${hit.title} ${hit.description} ${hit.url}`.toLowerCase();
-  if (haystack.includes(needle)) return true;
-  // "Hacker News" for "hackernews", "next.js" for "nextjs".
+
+  const text = `${hit.title} ${hit.description}`.toLowerCase();
+  const url = hit.url.toLowerCase();
+
+  // Whole word, not substring.
+  //
+  // Substring matching is why a scan for "Bolt" came back with "Boltt Evo,
+  // Boltt Ace 5G Software Update Policy" — a different company whose name
+  // merely starts the same way. It would equally admit Usain Bolt, the Chevy
+  // Bolt EV, "bolted", and every lightning bolt on the internet. Short brand
+  // names are common English words often enough that this is the normal case,
+  // not an edge one.
+  //
+  // A boundary here is a non-letter, deliberately rather than \b: \b treats a
+  // digit as a word character, so "bolt" would still match "bolt3d", and it
+  // treats an apostrophe as a boundary, which is what makes "GIMP's" match.
+  const boundary = new RegExp(`(^|[^a-z])${escapeRe(needle)}([^a-z]|$)`, 'i');
+  if (boundary.test(text)) return true;
+
+  // The URL is a weaker signal — a path segment can contain anything — so it
+  // has to look like an identifier rather than appear anywhere in the string.
+  if (new RegExp(`(^|[^a-z0-9])${escapeRe(needle.replace(/\s+/g, '[-_]?'))}([^a-z0-9]|$)`, 'i').test(url)) {
+    return true;
+  }
+
+  // Punctuation-insensitive form, for brands that carry it: "next.js" written
+  // as "nextjs", "Hacker News" as "hackernews". Only when squashing actually
+  // changes the needle, so a plain word like "bolt" never reaches this and
+  // cannot match "boltt" by accident.
   const squashed = needle.replace(/[^a-z0-9]/g, '');
-  return squashed.length > 2 && haystack.replace(/[^a-z0-9]/g, '').includes(squashed);
+  if (squashed === needle || squashed.length <= 2) return false;
+  return new RegExp(`(^|[^a-z0-9])${escapeRe(squashed)}([^a-z0-9]|$)`, 'i')
+    .test(`${text} ${url}`.replace(/[^a-z0-9\s]/g, ''));
 }
 
 /** Does the text itself read as somebody complaining?
@@ -153,6 +186,54 @@ export type Freshness = 'pd' | 'pw' | 'pm' | 'py' | (string & {});
 export const MAX_PAGES = 10;
 export const MAX_COUNT = 20;
 
+/** The same search, through Bright Data's SERP tool.
+ *
+ *  Brave's free tier is one request a second and a finite monthly quota, and a
+ *  scan now issues a couple of hundred queries — so 429s are a normal operating
+ *  condition rather than an outage, and losing a whole stage to one is not
+ *  acceptable. Bright Data is already configured here for scraping and does
+ *  search too.
+ *
+ *  Two things do not survive the switch, and are handled rather than hidden:
+ *  freshness becomes Google's `after:` operator, which is coarser than Brave's
+ *  windows but real; and pagination is a cursor rather than an offset, so a
+ *  fallback returns the first page only. A thinner result from the backup beats
+ *  an empty one from the primary.
+ */
+async function brightDataSearch(
+  query: string, freshness?: Freshness,
+): Promise<SearchHit[] | null> {
+  const connector = usableConnectors().find((c) => c.name === 'bright-data');
+  if (!connector) return null;
+
+  const since = freshness === 'pd' ? 1 : freshness === 'pw' ? 7 : freshness === 'pm' ? 31 : freshness === 'py' ? 365 : 0;
+  const dated = since
+    ? `${query} after:${new Date(Date.now() - since * 86_400_000).toISOString().slice(0, 10)}`
+    : query;
+
+  try {
+    const result = await callTool(connector, 'search_engine', { query: dated, engine: 'google' }, 60_000);
+    if (result.isError) return null;
+
+    const body = unwrapUntrusted(result.text);
+    const parsed = JSON.parse(body.slice(body.indexOf('{'), body.lastIndexOf('}') + 1)) as {
+      organic?: { link?: string; title?: string; description?: string; date?: string }[];
+    };
+
+    return (parsed.organic ?? [])
+      .filter((row): row is typeof row & { link: string } => Boolean(row.link))
+      .map((row) => ({
+        title: cleanText(row.title ?? ''),
+        url: row.link,
+        description: cleanText(row.description ?? ''),
+        age: row.date ?? null,
+        date: row.date ? parseAge(row.date, undefined) : null,
+      }));
+  } catch {
+    return null;
+  }
+}
+
 export async function braveSearch(
   query: string, count = 10, freshness?: Freshness, offset = 0,
 ): Promise<SearchHit[]> {
@@ -176,7 +257,16 @@ export async function braveSearch(
       headers: { 'X-Subscription-Token': key, Accept: 'application/json' },
       signal: AbortSignal.timeout(20_000),
     });
-    if (!response.ok) throw new Error(`brave ${response.status} for "${query}"`);
+    if (!response.ok) {
+      // Rate limits and outages are exactly what the backup is for. Anything
+      // else — a bad key, a malformed query — would fail the same way there,
+      // so only the recoverable ones fall through.
+      if (response.status === 429 || response.status >= 500) {
+        const backup = await brightDataSearch(query, freshness);
+        if (backup && backup.length) return backup;
+      }
+      throw new Error(`brave ${response.status} for "${query}"`);
+    }
 
     const body = (await response.json()) as {
       web?: { results?: { title?: string; url?: string; description?: string; age?: string; page_age?: string }[] };

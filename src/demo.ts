@@ -578,6 +578,7 @@ const demo: Scan = {
   buzz,
   topics: topicsOver(buzz.map((point) => point.bucket)),
   migrations: migrationsMock(),
+  reviews: [],
   feed: [...extraFeed(), ...source.feed]
     .sort((a, b) => (b.date ?? '').localeCompare(a.date ?? '')),
   log: [

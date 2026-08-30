@@ -71,3 +71,7 @@ export function setSecrets(values: Record<string, string>): void {
 }
 
 export const reloadSecrets = () => { store = null; };
+
+/** Everything currently stored, for the mismatch checks. Values never leave the
+ *  server — only the warnings derived from them do. */
+export const storedSecrets = (): Record<string, string> => ({ ...load() });

@@ -4,6 +4,9 @@ import {
   netSentiment, resolveSite, scoreBuzz, type Log,
 } from './pipeline.ts';
 import { withRunContext } from './agents/runtime.ts';
+import { resolveSubject } from './agents/resolve-run.ts';
+import { findReviewScores } from './reviews.ts';
+import { brandToken } from '../shared/name.ts';
 import * as store from './store.ts';
 
 export interface StageCtx {
@@ -114,8 +117,12 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
     try {
       switch (next) {
       case 'presence': {
-        scan.site = await resolveSite(scan.company, log);
-        send({ type: 'patch', scan: { site: scan.site } });
+        // Settle what the input actually is, before thirty searches quote it.
+        const subject = await resolveSubject(scan.input || scan.subject?.input || scan.company, log);
+        scan.subject = subject;
+        if (subject.name) scan.company = subject.name;
+        scan.site = subject.site || await resolveSite(subject.searchTerm || scan.company, log);
+        send({ type: 'patch', scan: { subject, company: scan.company, site: scan.site } });
         log('info', `mapping ${scan.company}'s footprint (site + web sweep)`);
         scan.profiles = await findPresence(scan.company, scan.site, log);
         log('info', `footprint: ${scan.profiles.length} channels (${scan.profiles.filter((p) => p.official).length} official, ${scan.profiles.filter((p) => !p.official).length} unofficial)`);
@@ -123,13 +130,13 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
         break;
       }
       case 'discovery': {
-        scan.mentions = await findMentions(scan.company, scan.site, scan.profiles, log);
+        scan.mentions = await findMentions(scan.company, scan.site, scan.profiles, log, scan.subject);
         log('info', `${scan.mentions.length} mentions, ${scan.mentions.filter((m) => m.date).length} of them dated`);
         send({ type: 'patch', scan: { mentions: scan.mentions } });
         break;
       }
       case 'feed': {
-        scan.feed = await findFeed(scan.company, scan.site, scan.profiles, log);
+        scan.feed = await findFeed(scan.company, scan.site, scan.profiles, log, scan.subject);
         log('info', `feed: ${scan.feed.length} latest items, newest first`);
         send({ type: 'patch', scan: { feed: scan.feed } });
         break;
@@ -165,7 +172,33 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
         break;
       }
       case 'abuse': {
-        scan.abuse = await findAbuse(scan.company, scan.site, scan.mentions, log);
+        // The scorecard first, because it is the part anyone actually checks:
+        // what the company scores on the sites a buyer looks up. It is also
+        // cheap and reliable — one search per site, no fetching, no model — so
+        // it lands even when the abuse sweep below finds nothing, which is most
+        // of the time.
+        scan.reviews = await findReviewScores(scan.subject?.searchTerm ?? brandToken(scan.company, scan.site), scan.site, log);
+        if (scan.reviews.length) {
+          const worst = [...scan.reviews].sort((a, b) => a.rating / a.scale - b.rating / b.scale)[0]!;
+          log('info', `lowest score: ${worst.site} ${worst.rating}/${worst.scale}`);
+        }
+        send({ type: 'patch', scan: { reviews: scan.reviews } });
+        // Saved before the slow half runs. The scorecard is sixteen searches and
+        // lands in about twenty seconds; the abuse judging is minutes of model
+        // time and frequently the thing that times out. Persisting only at the
+        // end of the stage meant a cheap, finished result was thrown away
+        // whenever the expensive one failed — and could not be seen at all until
+        // it succeeded.
+        //
+        // Written as a patch, not a whole-record put. A stage handler holds its
+        // `scan` object for minutes while the model works, so writing the whole
+        // snapshot reverts anything another run persisted in the meantime —
+        // which is exactly what happened here: a still-running abuse pass
+        // finished and wrote its stale copy over a freshly-collected scorecard,
+        // taking the stage marker back to `feed` with it.
+        store.patch(scan.id, { reviews: scan.reviews });
+
+        scan.abuse = await findAbuse(scan.company, scan.site, scan.mentions, log, scan.subject);
         log(scan.abuse.length ? 'warn' : 'info',
           scan.abuse.length ? `${scan.abuse.length} integrity findings` : 'nothing abusing the brand turned up');
         send({ type: 'patch', scan: { abuse: scan.abuse } });
@@ -186,6 +219,7 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
     }
 
     scan.timings[next] = Date.now() - started;
+    scan.pulledAt = { ...scan.pulledAt, [next]: new Date().toISOString() };
     scan.stage = next;
     store.put(scan);
   });

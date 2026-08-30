@@ -105,7 +105,13 @@ export interface ConnectorConfig {
    *  than dialled and reported as down — those are different problems with
    *  different fixes. */
   requires?: string[];
-  auth?: { type: 'bearer'; token: string } | { type: 'header'; headers: Record<string, string> };
+  auth?:
+    | { type: 'bearer'; token: string }
+    | { type: 'header'; headers: Record<string, string> }
+    /** Some hosted MCP endpoints authenticate on the URL rather than a header —
+     *  Bright Data's is one, and it answers 401 to a perfectly good token sent
+     *  as a Bearer. */
+    | { type: 'query'; param: string; value: string };
   /** Set false to keep an entry documented but out of the running set. */
   enabled?: boolean;
 }
@@ -189,9 +195,24 @@ export interface InferenceHost {
   maxOutputTokens?: number;
 }
 
+/** What kind of work a model is being asked to do.
+ *
+ *  `general` is reading text and forming a judgement about it — scoring
+ *  sentiment, triaging a complaint, grouping themes. `coding` is reasoning
+ *  about source: locating a defect in unfamiliar code, writing a patch that
+ *  compiles and passes tests.
+ *
+ *  A mid-sized general model is genuinely good at the first and noticeably
+ *  worse at the second, so pinning both to one endpoint means either paying
+ *  for a coding model to score tweets or asking a chat model to patch C. */
+export type ModelRole = 'general' | 'coding';
+
 export interface InferenceConfig {
-  /** Key into `hosts`. */
+  /** Key into `hosts`, used when a role has no host of its own. */
   default: string;
+  /** Which host handles which kind of work. A role with no entry falls back to
+   *  `default`, so a single-model setup needs none of this. */
+  roles?: Partial<Record<ModelRole, string>>;
   hosts: Record<string, InferenceHost>;
 }
 
@@ -224,6 +245,8 @@ export function patchInferenceHost(
     contextLength?: number;
     maxOutputTokens?: number;
     makeDefault?: boolean;
+    /** Roles this host should handle from now on. */
+    roles?: ModelRole[];
   },
 ): void {
   const raw = loadRaw<InferenceConfig>('inference');
@@ -255,6 +278,10 @@ export function patchInferenceHost(
 
   config.hosts[hostKey] = host;
   if (changes.makeDefault) config.default = hostKey;
+  if (changes.roles) {
+    config.roles = { ...config.roles };
+    for (const role of changes.roles) config.roles[role] = hostKey;
+  }
 
   writeRaw('inference', config);
   inferenceCacheRef.value = null;
@@ -267,6 +294,7 @@ export function patchInferenceHost(
 export function inferenceHosts(): {
   default: string;
   active: string;
+  roles: Partial<Record<ModelRole, string>>;
   isExample: boolean;
   hosts: {
     key: string; baseUrl: string; modelId: string; hasKey: boolean;
@@ -277,6 +305,7 @@ export function inferenceHosts(): {
   return {
     default: loaded.value.default,
     active: process.env.INFERENCE_HOST ?? loaded.value.default,
+    roles: loaded.value.roles ?? {},
     isExample: loaded.isExample,
     hosts: Object.entries(loaded.value.hosts ?? {}).map(([key, host]) => ({
       key,
@@ -292,14 +321,21 @@ export function inferenceHosts(): {
 /** The host to run inference against. `INFERENCE_HOST` picks a different entry
  *  without editing the file, which is what you want when switching between a
  *  local model and a hosted one mid-session. */
-export function inferenceHost(): InferenceHost & { key: string } {
+export function inferenceHost(role: ModelRole = 'general'): InferenceHost & { key: string; role: ModelRole } {
   const { value } = inferenceConfig();
-  const key = process.env.INFERENCE_HOST ?? value.default;
+
+  // An explicit environment override wins, then the host assigned to this role,
+  // then the default. The fallback chain is what lets a machine with one model
+  // keep working without knowing roles exist.
+  const key = process.env.INFERENCE_HOST
+    ?? value.roles?.[role]
+    ?? value.default;
+
   const host = value.hosts[key];
   if (!host) {
     throw new Error(
       `inference host "${key}" is not in config/inference.json (have: ${Object.keys(value.hosts).join(', ') || 'none'})`,
     );
   }
-  return { ...host, key };
+  return { ...host, key, role };
 }

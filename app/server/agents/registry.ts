@@ -9,6 +9,7 @@
 
 import { abuseAgent } from './abuse.ts';
 import { buzzAgent } from './buzz.ts';
+import { crawlAgent } from './crawl.ts';
 import { diagnoseAgent } from './diagnose.ts';
 import { discoveryAgent } from './discovery.ts';
 import { feedAgent } from './feed.ts';
@@ -16,6 +17,7 @@ import { fileTicketAgent } from './file-ticket.ts';
 import { fixAgent } from './fix.ts';
 import { footprintAgent } from './footprint.ts';
 import { healthAgent } from './health.ts';
+import { resolveAgent } from './resolve.ts';
 import { respondAgent } from './respond-to-user.ts';
 import { siteAgent } from './site.ts';
 import { topicsAgent } from './topics.ts';
@@ -25,6 +27,8 @@ import type { AgentDefinition } from './types.ts';
 /** Scan order first, then the agents a person fires by hand — the order the
  *  agent list should read in. */
 export const AGENTS: AgentDefinition[] = [
+  resolveAgent,
+  crawlAgent,
   footprintAgent,
   discoveryAgent,
   feedAgent,

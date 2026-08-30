@@ -411,7 +411,8 @@ section { margin-top: 44px; }
 
 .ocards {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  /* Fits six, wraps rather than crushing them on a narrow window. */
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 14px;
   margin-bottom: 22px;
 }
@@ -428,15 +429,10 @@ section { margin-top: 44px; }
   overflow: visible;
   transition: transform 0.18s var(--ease), box-shadow 0.18s var(--ease), border-color 0.15s ease;
 }
-.ocard::before {
-  content: '';
-  position: absolute; left: 0; top: 12px; bottom: 12px;
-  width: 3px;
-  border-radius: 0 2px 2px 0;
-  background: var(--signal);
-  opacity: 0.85;
-  transition: opacity 0.15s ease;
-}
+/* No accent bar. Six cards each wearing a blue stripe is six decorations
+   competing with the six numbers that are the actual content, and the stripe
+   carried no information — every card had one regardless of state. State is
+   shown where it means something: on the value itself. */
 .ocard:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--signal) 45%, var(--hair));
   box-shadow: var(--shadow);
@@ -1438,3 +1434,137 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 .cred-row { grid-template-columns: auto minmax(0, 1fr) auto auto; }
 .cred-input { display: flex; }
 .cred-input .conn-url { width: 100%; }
+
+
+/* --- stat cards that have nothing to say yet --- */
+
+/* A card keeps its place before its stage has run, so the shape of the finished
+   page is visible from the first second and an empty slot is never mistaken for
+   a result. Dimmed and not clickable, because there is nothing to drill into. */
+.ocard[data-state='live'] { cursor: default; box-shadow: none; }
+/* Dimmed, but still the button that starts the thing. */
+.ocard[data-state='pending'] { opacity: 0.55; box-shadow: none; }
+.ocard[data-state='pending']:hover:not(:disabled) {
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--signal) 45%, var(--hair));
+}
+
+/* The stage running right now. The pulse lives on the placeholder where the
+   number will appear, so a scan quietly working through a slow model call looks
+   alive without adding furniture to every other card. */
+.ocard[data-state='live'] .oline { color: var(--signal); }
+
+@keyframes ocard-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+
+/* Stands in for the number, at its height, so nothing shifts when it arrives. */
+.opending {
+  display: inline-block;
+  width: 34px;
+  height: 0.62em;
+  border-radius: 3px;
+  background: currentColor;
+  opacity: 0.16;
+}
+.ocard[data-state='live'] .opending {
+  animation: ocard-pulse 1.4s ease-in-out infinite;
+  opacity: 0.35;
+}
+
+/* --- diagnosis and patch results --- */
+.source-result {
+  margin: 10px 0 18px;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  padding: 12px 14px 14px;
+  background: color-mix(in srgb, var(--signal) 3%, transparent);
+}
+.source-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.source-result h6 {
+  margin: 14px 0 6px;
+  font: 500 10.5px var(--mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.source-result .agent-detail { padding: 0; background: none; border: 0; grid-template-columns: 110px minmax(0, 1fr); }
+.source-result .payload { max-height: 320px; }
+
+/* --- credential hints --- */
+.cred-what { display: block; margin-top: 3px; font-size: 12px; color: var(--ink-2); white-space: normal; }
+.cred-where { display: block; font: 400 11px var(--mono); color: var(--ink-3); white-space: normal; }
+.cred-row { align-items: start; }
+
+/* --- credentials, inline in the row that needs them --- */
+.conn-detail {
+  padding: 14px 16px 16px 36px;
+  border-bottom: 1px solid var(--hair);
+  background: color-mix(in srgb, var(--signal) 3%, transparent);
+}
+.cred-fields { display: flex; flex-direction: column; gap: 14px; margin-bottom: 12px; }
+.cred-field { display: flex; flex-direction: column; gap: 3px; }
+.cred-field-head { display: flex; align-items: center; gap: 8px; }
+.cred-field-head code { font: 500 11.5px var(--mono); color: var(--ink); }
+.cred-field .conn-url { margin-top: 4px; width: 100%; }
+.conn-detail .set-actions { padding: 4px 0 0; }
+
+/* --- public scorecard --- */
+.score-group { padding: 0 16px 14px; }
+.score-kind {
+  display: block;
+  margin-bottom: 8px;
+  font: 500 10.5px var(--mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.score-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.score {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 132px;
+  padding: 10px 12px;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  text-decoration: none;
+  background: var(--paper);
+  transition: border-color 0.15s ease;
+}
+.score:hover { border-color: color-mix(in srgb, var(--signal) 45%, var(--hair)); }
+.score-site { font-size: 12px; color: var(--ink-2); }
+.score-value { font: 600 20px var(--sans, inherit); color: var(--ink); line-height: 1.1; }
+.score-scale { font-size: 12px; color: var(--ink-3); font-weight: 400; }
+.score-meta { font: 400 10.5px var(--mono); color: var(--ink-3); }
+/* Tone follows the score as a share of its own scale, so 8.2/10 and 4.1/5 read
+   the same — a raw number cannot be compared across sites that disagree on the
+   maximum. */
+.score[data-tone='good'] .score-value { color: var(--pos); }
+.score[data-tone='bad'] .score-value { color: var(--neg); }
+
+/* When the data behind a card was last fetched. Small and grey — it matters
+   when it is large, and should not compete with the number when it is not. */
+.opulled { font: 400 10px var(--mono); color: var(--ink-3); }
+
+/* --- list search --- */
+.filter { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--hair); }
+.filter-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--paper);
+  border: 1px solid var(--hair);
+  border-radius: 5px;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+}
+.filter-input:focus { outline: none; border-color: var(--signal); }
+.filter-input::placeholder { color: var(--ink-3); }
+.filter-count { font: 400 11px var(--mono); color: var(--ink-3); white-space: nowrap; }
+.filter-clear { font: 400 11px var(--mono); padding: 3px 8px; }
+
+/* --- model roles --- */
+.role-picker { display: flex; flex-direction: column; gap: 7px; padding: 4px 16px 12px; }
+.role-option { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; color: var(--ink-2); }
+.role-option input { margin-top: 2px; }
+.role-option b { color: var(--ink); font-weight: 500; }

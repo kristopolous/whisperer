@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "Which source repository belongs to which company, so a reported defect can be",
+    "diagnosed and patched against real code. Copy to config/repos.json; that file is",
+    "gitignored because a private repo's URL can carry a token.",
+    "",
+    "  company      matched case-insensitively against the company a scan was run for.",
+    "  url          clone URL. Cloned shallow and blobless on first use, into data/repos/.",
+    "  path         an existing checkout to use instead of cloning. Takes precedence.",
+    "  testCommand  only when it cannot be detected (pytest, npm test, cargo, go test).",
+    "",
+    "Checkouts are read-only to this app: the fix runner copies one before touching it,",
+    "and nothing here ever commits or pushes."
+  ],
+  "repos": [
+    {
+      "company": "hangman-test",
+      "url": "https://github.com/kristopolous/hangman-test.git"
+    },
+    {
+      "company": "gimp",
+      "url": "https://gitlab.gnome.org/GNOME/gimp.git",
+      "_note": "203MB at depth 1. Diagnosis works; there is no test suite to verify a fix against."
+    },
+    {
+      "company": "krita",
+      "url": "https://invent.kde.org/graphics/krita.git",
+      "tracker": "https://bugs.kde.org/rest/bug?product=krita",
+      "_note": "Tracker is a Bugzilla, separate from the repo host \u2014 hence the explicit tracker."
+    }
+  ]
+}

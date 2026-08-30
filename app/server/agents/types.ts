@@ -58,6 +58,14 @@ export interface AgentDefinition {
    *  over a corpus they are handed and must not be able to go looking for more,
    *  because an invented citation is worse than a missing one. */
   connectors: string[];
+  /** Which model answers for this agent.
+   *
+   *  Defaults to `general`. Only the agents that read and write source ask for
+   *  `coding` — a mid-sized general model scores sentiment perfectly well and
+   *  is noticeably worse at locating a defect in unfamiliar code, so pinning
+   *  both to one endpoint means paying for the wrong thing in one direction or
+   *  the other. */
+  role?: 'general' | 'coding';
   effort: Effort;
   /** False when the live pipeline no longer calls this agent, but it is kept
    *  because it is still worth having as a saved, manually fireable agent.

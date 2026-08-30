@@ -1,12 +1,13 @@
-import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import type {
   AbuseFinding, BuzzPoint, FeedItem, Issue, LogLevel, Mention, Profile, Scan, ScanEvent, Stage,
-  TopicPoint, Venue,
+  Subject, TopicPoint, Venue,
 } from '../shared/types.ts';
 import { brandToken } from '../shared/name.ts';
+import { repoFor } from './repos.ts';
+import { fetchUpstreamIssues } from './upstream.ts';
+import { crawlSite } from './agents/crawl-run.ts';
 import { fetchAll } from './content.ts';
 import { runAgent } from './agents/runtime.ts';
 import { abuseAgent } from './agents/abuse.ts';
@@ -20,9 +21,7 @@ import {
   type SearchHit,
 } from './search.ts';
 
-const run = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, '../..');
-const SKILL = path.join(ROOT, 'skills/extract-social-media/scripts');
 
 export type Log = (level: LogLevel, text: string) => void;
 type Emit = Log;
@@ -78,17 +77,24 @@ function parseJson<T>(raw: string): T {
 }
 
 /** Run a command with `input` on its stdin and collect stdout. */
-function pipeThrough(command: string, args: string[], input: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args);
-    let out = '', err = '';
-    child.stdout.setEncoding('utf8').on('data', (chunk) => { out += chunk; });
-    child.stderr.setEncoding('utf8').on('data', (chunk) => { err += chunk; });
-    child.on('error', reject);
-    child.on('close', (code) =>
-      code === 0 ? resolve(out) : reject(new Error(`${command} exited ${code}: ${err.slice(0, 300)}`)));
-    child.stdin.end(input);
-  });
+/** An exec failure, with the part that says what went wrong.
+ *
+ *  Node's execFile puts "Command failed: <the command>" in `error.message` and
+ *  the actual reason on `error.stderr`, which is dropped by anything that logs
+ *  only the message. In development that is merely unhelpful; on a deployed
+ *  instance it is the difference between a diagnosable failure and "site scrape
+ *  failed" with no cause, on a machine you cannot attach a debugger to.
+ *
+ *  Common real causes this now surfaces: the interpreter missing from a
+ *  service's minimal PATH, a sandboxed /tmp the helper cannot write its cached
+ *  binary into, no outbound network, or the skills directory not present in the
+ *  deployed tree at all. */
+function describeExecFailure(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const e = error as Error & { stderr?: string; code?: number | string; signal?: string };
+  const detail = (e.stderr ?? '').toString().trim().split('\n').slice(-4).join(' | ').slice(0, 400);
+  const status = e.code !== undefined ? ` (exit ${e.code}${e.signal ? `, ${e.signal}` : ''})` : '';
+  return `${e.message.split('\n')[0]}${status}${detail ? ` — ${detail}` : ' — no stderr'}`;
 }
 
 /* ---------------------------------------------------------------- presence */
@@ -141,29 +147,21 @@ export async function findPresence(
   // search misses accounts that are only ever linked from the site.
   const merged = new Map<string, Profile>();
 
+  // The site crawl is an agent now: it opens the homepage, decides which of
+  // that site's pages are worth reading next, and walks a few of them.
+  //
+  // A single scrape of the front page only works when a company keeps its
+  // accounts in the footer. Plenty keep them behind Community, Contact, or
+  // buried in documentation — and a one-shot fetch reports those as "no
+  // accounts", which reads as a finding rather than a failure to look.
   try {
-    const { stdout: html } = await run('bash', [path.join(SKILL, 'scrape.sh'), site], {
-      maxBuffer: 64 * 1024 * 1024,
-      timeout: 120_000,
-      encoding: 'utf8',
-    });
-
-    // A bot check returns HTTP 200 with a challenge page in the body, so a
-    // "successful" scrape can still carry no site content at all. Say so —
-    // silently returning zero accounts reads as "this company has none".
-    if (/Just a moment|Performing security verification|Checking your browser|cf-browser-verification/i.test(html)) {
-      emit('warn', `${site} is behind a bot check — reading its accounts from search instead`);
-    } else {
-      const stdout = await pipeThrough('python3', [path.join(SKILL, 'extract_social.py'), '--base', site], html);
-      const parsed = JSON.parse(stdout) as { profiles: Profile[] };
-      for (const profile of parsed.profiles ?? []) {
-        if (!profile?.url) continue;
-        merged.set(canonicalProfileKey(profile.url), { ...profile, official: true });
-      }
-      emit('info', `${merged.size} accounts linked from ${company}'s own site`);
+    const crawled = await crawlSite(company, site, emit);
+    for (const profile of crawled.profiles) {
+      merged.set(canonicalProfileKey(profile.url), profile);
     }
+    if (crawled.notes) emit('info', `crawl: ${crawled.notes.slice(0, 160)}`);
   } catch (error) {
-    emit('warn', `site scrape failed: ${error instanceof Error ? error.message : 'error'} — falling back to search`);
+    emit('warn', `site crawl failed: ${describeExecFailure(error)} — falling back to search`);
   }
 
   const fromSite = merged.size;
@@ -256,6 +254,34 @@ export async function resolveSite(company: string, emit: Emit): Promise<string> 
 
 /* --------------------------------------------------------------- discovery */
 
+/** The term to search for, and what it must not be confused with.
+ *
+ *  Prefers the resolved subject over anything inferred from the raw input:
+ *  "gimp image editor" resolves to GIMP, which is what people write, rather
+ *  than to a phrase that occurs nowhere. Falls back to the old derivation for
+ *  scans that predate the resolve step. */
+function searchIdentity(company: string, site: string, subject?: Subject) {
+  if (subject?.searchTerm) {
+    return { brand: subject.searchTerm, exclude: subject.excludeTerms ?? [], aliases: subject.aliases ?? [] };
+  }
+  return { brand: brandToken(company, site), exclude: [], aliases: [] };
+}
+
+/** Does a result look like it is about something else that shares the name?
+ *
+ *  The resolve step names the collisions — "bolt" for bolt.new, "image editor"
+ *  for GIMP — and a hit whose title leads with one of them is almost always the
+ *  other thing. Checked against the title only: an excluded word appearing deep
+ *  in a page's description is usually incidental. */
+function isWrongSubject(hit: SearchHit, exclude: string[]): boolean {
+  if (exclude.length === 0) return false;
+  const title = hit.title.toLowerCase();
+  return exclude.some((term) => {
+    const needle = term.toLowerCase().trim();
+    return needle.length > 2 && new RegExp(`(^|[^a-z])${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z]|$)`, 'i').test(title);
+  });
+}
+
 /** How far back still counts as current for a brand watch. A year is the outer
  *  edge of useful: a complaint from thirteen months ago has either been fixed
  *  or has stopped being news. */
@@ -275,15 +301,15 @@ const RECENT_MONTHS = 12;
  *  extra page across twenty queries is another twenty seconds of wall clock.
  *  Three pages is the default because it roughly triples the corpus for about a
  *  minute more, and going wider is a plan question, not a code one. */
-const SEARCH_PAGES = Number(process.env.SEARCH_PAGES ?? 3);
+const SEARCH_PAGES = Number(process.env.SEARCH_PAGES ?? 6);
 
 /** How many results discovery wants before it stops widening its window. */
-const DISCOVERY_TARGET = Number(process.env.DISCOVERY_TARGET ?? 150);
+const DISCOVERY_TARGET = Number(process.env.DISCOVERY_TARGET ?? 400);
 
 /** How many complaint-shaped results to gather before the complaint pass stops
  *  widening. Separate from the general target because this is the half of the
  *  corpus the product actually exists to act on. */
-const COMPLAINT_TARGET = Number(process.env.COMPLAINT_TARGET ?? 120);
+const COMPLAINT_TARGET = Number(process.env.COMPLAINT_TARGET ?? 300);
 
 /** How many mentions the corpus keeps.
  *
@@ -291,8 +317,13 @@ const COMPLAINT_TARGET = Number(process.env.COMPLAINT_TARGET ?? 120);
  *  are nearly free — they are a title, a URL and a snippet — while scoring is
  *  minutes per few dozen. Conflating the two is what made "how much did we
  *  find" and "how much can we afford to think about" the same number, and the
- *  smaller of the two won. */
-const MENTION_CAP = Number(process.env.MENTION_CAP ?? 300);
+ *  smaller of the two won.
+ *
+ *  Raising pages costs wall-clock rather than breadth of window: Brave paginates
+ *  to ten and rate-limits to one request a second, so each extra page across
+ *  thirty queries is another thirty seconds. Six pages is roughly a thousand raw
+ *  results before dedup and filtering. Past that it is a Brave plan question. */
+const MENTION_CAP = Number(process.env.MENTION_CAP ?? 1000);
 
 /** The few questions whose best answers are old by nature. Everything else goes
  *  through the widening recent sweep. */
@@ -320,8 +351,25 @@ function rankByDiscussionThenRecency(a: SearchHit, b: SearchHit): number {
   return (b.date ?? '').localeCompare(a.date ?? '');
 }
 
+/** Open issues from the company's own tracker, when one is configured.
+ *
+ *  Silent and empty when there is no repository for this company — most scans
+ *  are of products whose source nobody here has. */
+async function upstreamMentions(company: string, site: string, emit: Emit): Promise<Mention[]> {
+  const repo = repoFor(company);
+  const source = repo?.tracker ?? repo?.url;
+  if (!source) return [];
+
+  try {
+    return await fetchUpstreamIssues(source, emit);
+  } catch (error) {
+    emit('warn', `tracker lookup failed — ${error instanceof Error ? error.message.slice(0, 100) : 'error'}`);
+    return [];
+  }
+}
+
 export async function findMentions(
-  company: string, site: string, profiles: Profile[], emit: Emit,
+  company: string, site: string, profiles: Profile[], emit: Emit, subject?: Subject,
 ): Promise<Mention[]> {
   // Venue by venue, as site-scoped queries. No agent decides which of these to
   // run or in what order — they all run, every time, and a failure in one is a
@@ -337,10 +385,11 @@ export async function findMentions(
   // What to search for is not always what was typed — see brandToken. Every
   // query below quotes this as an exact phrase, so a descriptive subject like
   // "gimp image editor" would otherwise search for a phrase nobody writes.
-  const brand = brandToken(company, site);
+  const { brand, exclude } = searchIdentity(company, site, subject);
   if (brand.toLowerCase() !== company.toLowerCase()) {
-    emit('info', `searching for "${brand}" (from ${site}) rather than the phrase "${company}"`);
+    emit('info', `searching for "${brand}" rather than the phrase "${company}"`);
   }
+  if (exclude.length) emit('info', `excluding results about: ${exclude.join(', ')}`);
 
   // Two query sets, run as two passes and merged with a guaranteed share each.
   //
@@ -351,13 +400,48 @@ export async function findMentions(
   // them. Measured on a real corpus, complaint-bearing mentions fell from 15 of
   // 60 to 3 of 48 as the recency ranking was tightened. The product is about
   // turning gripes into fixes, so that is the corpus quietly losing its point.
+  // Breadth comes from distinct angles, not from more pages.
+  //
+  // Paging deeper mostly returns URLs the other queries already found: going
+  // from three pages to six raised the raw count by about a sixth, because the
+  // same thirty queries were競 competing for the same results. Each new query
+  // shape below reaches material none of the others do — a venue nobody else
+  // searched, or a subject people discuss without ever writing "review".
   const generalQueries = [
+    // Where developers talk, one venue at a time. A site: query is its own
+    // result space; merged into a general search it would never surface.
     `site:reddit.com ${brand}`,
     `site:news.ycombinator.com ${brand}`,
     `site:x.com ${brand}`,
+    `site:stackoverflow.com ${brand}`,
+    `site:dev.to ${brand}`,
+    `site:medium.com ${brand}`,
+    `site:lobste.rs ${brand}`,
+    `site:quora.com ${brand}`,
+    `site:youtube.com ${brand}`,
+    `site:linkedin.com ${brand}`,
+    `site:producthunt.com ${brand}`,
+    `site:substack.com ${brand}`,
+    `site:hashnode.dev ${brand}`,
+
+    // Opinion, in the words people use when they are not writing a review.
     `"${brand}" review`,
     `"${brand}" vs`,
     `"we use ${brand}"`,
+    `"tried ${brand}"`,
+    `"my experience with ${brand}"`,
+    `"${brand}" worth it`,
+    `"${brand}" honest`,
+
+    // Subjects that generate discussion without naming it as opinion.
+    `"${brand}" pricing`,
+    `"${brand}" tutorial OR guide`,
+    `"${brand}" alternative`,
+    `"${brand}" workflow OR setup`,
+    `"${brand}" migration OR migrated`,
+    `"${brand}" performance OR benchmark`,
+    `"${brand}" security OR privacy`,
+    `"${brand}" enterprise OR team`,
   ];
 
   // How people actually complain, in two registers, every line measured against
@@ -543,6 +627,8 @@ export async function findMentions(
     // complaint language is common enough that without the brand test it
     // matches the whole of Reddit.
     if (!namesCompany(hit, brand)) { reasons.unrelated += 1; return false; }
+    // A different thing that happens to share the name.
+    if (isWrongSubject(hit, exclude)) { reasons.unrelated += 1; return false; }
     if (isHomepage(hit.url)) { reasons.homepage += 1; return false; }
     return true;
   });
@@ -580,20 +666,22 @@ export async function findMentions(
   }
 
   const fresh = ordered.filter((hit) => hit.date && isRecent(hit.date)).length;
-  const head = ordered.slice(0, SCORE_BUDGET);
   emit(
     'info',
     `${ordered.filter(isOpinionBearing).length} of ${ordered.length} look like real discussion, `
     + `${fresh} from the last ${RECENT_MONTHS} months`,
   );
-  emit(
-    'info',
-    `${head.filter((hit) => fromComplaints.has(hit.url)).length}/${head.length} of the mentions the `
-    + `model will read contain complaint language`,
-  );
 
-  return ordered
-    .map((hit) => ({
+  // The project's own tracker, folded in with the public discussion.
+  //
+  // These are defects somebody already wrote up properly, with versions and
+  // steps. They go in as mentions rather than as ready-made issues so triage
+  // sees both halves at once and can merge them: four people grumbling about a
+  // crash plus the filed bug describing it is one issue with five pieces of
+  // evidence, and knowing a ticket already exists changes what to do about it.
+  const upstream = await upstreamMentions(company, site, emit);
+
+  const searched = ordered.map((hit) => ({
       id: randomUUID().slice(0, 8),
       venue: venueOf(hit.url),
       title: hit.title,
@@ -609,8 +697,30 @@ export async function findMentions(
       themes: [],
       discussion: isOpinionBearing(hit),
       complaint: fromComplaints.has(hit.url),
-    }))
-    .slice(0, MENTION_CAP);
+  }));
+
+  // Interleaved, not prepended.
+  //
+  // GIMP's tracker alone returned 46 open issues, which put in front would have
+  // taken 46 of the 60 slots the model can afford to read and left fourteen for
+  // everything the public said. Filed bugs are the easy half — already written
+  // up, already triaged by whoever filed them — and the product exists for the
+  // half that is not. Two of theirs to one of ours keeps both in view.
+  const corpus: Mention[] = [];
+  for (let i = 0; i < Math.max(upstream.length, searched.length); i += 1) {
+    if (i < upstream.length) corpus.push(upstream[i]!);
+    if (i * 2 < searched.length) corpus.push(searched[i * 2]!);
+    if (i * 2 + 1 < searched.length) corpus.push(searched[i * 2 + 1]!);
+  }
+
+  const head = corpus.slice(0, SCORE_BUDGET);
+  emit(
+    'info',
+    `the model will read ${head.filter((m) => m.complaint).length}/${head.length} complaint-bearing `
+    + `(${head.filter((m) => upstream.includes(m)).length} filed issues, the rest public discussion)`,
+  );
+
+  return corpus.slice(0, MENTION_CAP);
 }
 
 /* ------------------------------------------------------------------- feed */
@@ -623,7 +733,7 @@ const FEED_TARGET = Number(process.env.FEED_TARGET ?? 120);
 const FEED_CAP = Number(process.env.FEED_CAP ?? 200);
 
 export async function findFeed(
-  company: string, site: string, profiles: Profile[], emit: Emit,
+  company: string, site: string, profiles: Profile[], emit: Emit, subject?: Subject,
 ): Promise<FeedItem[]> {
   // The feed is the same deterministic search, biased to fresh things and
   // sorted newest first. YouTube gets its own queries because video is the
@@ -631,7 +741,7 @@ export async function findFeed(
   // Every one of these quotes the company name. Unquoted, `${company} news`
   // matched the word "news" against every news site's front page — which is
   // recrawled hourly and therefore always the freshest thing in any window.
-  const brand = brandToken(company, site);
+  const { brand, exclude } = searchIdentity(company, site, subject);
 
   const queries = [
     `"${brand}" news`,
@@ -690,6 +800,7 @@ export async function findFeed(
     namesCompany(hit, brand)
     && !isHomepage(hit.url)
     && !/wikipedia\.org|wikimedia\.org|fandom\.com/.test(hit.url)
+    && !isWrongSubject(hit, exclude)
     && (!feedHost || !hit.url.includes(feedHost)));
   const irrelevant = hits.length - relevant.length;
   if (irrelevant) emit('info', `feed: dropped ${irrelevant} result(s) that never name ${brand}`);
@@ -865,6 +976,7 @@ export async function scoreBuzz(
       sentiment: hit.sentiment ?? 'neutral',
       score: clamp(hit.score ?? 0),
       themes: hit.themes ?? [],
+      scored: true,
     };
   });
 
@@ -1032,14 +1144,14 @@ export async function findIssues(
 /* ------------------------------------------------------------------- abuse */
 
 export async function findAbuse(
-  company: string, site: string, mentions: Mention[], emit: Emit,
+  company: string, site: string, mentions: Mention[], emit: Emit, subject?: Subject,
 ): Promise<AbuseFinding[]> {
   // Same split as the rest of the pipeline: deterministic code goes and finds
   // the candidate pages, then the model is asked once to judge which of them
   // are actually brand abuse. Handing an agent a search tool and asking it to
   // hunt could not produce valid JSON here, and the hunting part is a fixed set
   // of queries anyway — these are the surfaces abuse shows up on.
-  const brand = brandToken(company, site);
+  const { brand } = searchIdentity(company, site, subject);
   const queries = [
     `"${brand}" scam`,
     `"${brand}" phishing`,
@@ -1134,8 +1246,23 @@ ${JSON.stringify(batch)}`,
 
 /** Bucket by month. Computed here, not asked of the model — arithmetic is not
  *  something to leave to a language model. */
+/** Was this mention actually judged?
+ *
+ *  Falls back to the old inference for scans collected before the flag existed,
+ *  where an unscored item is indistinguishable from an honestly neutral one. */
+export const wasScored = (m: Mention): boolean =>
+  m.scored ?? (m.score !== 0 || m.sentiment !== 'neutral');
+
 export function buildBuzz(mentions: Mention[]): BuzzPoint[] {
-  const dated = mentions.filter((m) => m.date);
+  // Only what was actually scored.
+  //
+  // Averaging over the whole corpus counted every unscored mention as a 0 and
+  // pulled the mean to neutral: 300 mentions with 40 judged produced a net of
+  // -0.01, which is not a reading of anything. The scoring budget means most of
+  // a corpus is deliberately unjudged, so this is the normal case rather than
+  // an edge one.
+  const judged = mentions.filter(wasScored);
+  const dated = (judged.length ? judged : mentions).filter((m) => m.date);
   if (dated.length === 0) return [];
 
   const buckets = new Map<string, Mention[]>();

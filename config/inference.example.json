@@ -7,10 +7,15 @@
     "for this app: the endpoint must honour response_format json_schema, and it must not sit",
     "behind a proxy that silently drops it. A proxy that accepts response_format, forwards the",
     "request without it and returns prose with finish_reason 'stop' is indistinguishable from",
-    "a model that ignored the schema, and cost a day to diagnose — point at the upstream.",
+    "a model that ignored the schema, and cost a day to diagnose \u2014 point at the upstream.",
     "",
-    "  default          which host below to use.",
-    "  INFERENCE_HOST   environment override, for switching without editing the file.",
+    "  default          the host used when a role has no host of its own.",
+    "  roles            which host does which kind of work:",
+    "                     general \u2014 reading text and judging it (sentiment, triage, themes)",
+    "                     coding  \u2014 reasoning about source (diagnose, write a patch)",
+    "                   A mid-sized general model is good at the first and noticeably worse",
+    "                   at the second. Omit roles entirely and everything uses `default`.",
+    "  INFERENCE_HOST   environment override, forcing every role onto one host.",
     "  ${VAR}           substituted from the environment at load time; keep real keys in .env.",
     "  contextLength    used to size batches. Set it honestly: too high truncates JSON mid-object",
     "  maxOutputTokens  and the whole batch is lost."
@@ -37,5 +42,9 @@
       "contextLength": 200000,
       "maxOutputTokens": 64000
     }
+  },
+  "roles": {
+    "general": "local",
+    "coding": "local"
   }
 }

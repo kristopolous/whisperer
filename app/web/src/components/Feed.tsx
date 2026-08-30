@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import type { FeedItem, Scan } from '../../../shared/types.ts';
+import { Filter, matches } from './Filter.tsx';
 import { fmtDate, venueOf } from '../lib.ts';
 
 /** Pull the video id out of a YouTube watch/shorts/embed URL. */
@@ -23,7 +25,9 @@ function youtubeId(url: string): string | null {
  *  Each row names its source, shows what was actually said or uploaded, links
  *  back to the original, and embeds the video when the item is a YouTube upload. */
 export function FeedView({ scan }: { scan: Scan }) {
-  const items = scan.feed ?? [];
+  const [query, setQuery] = useState('');
+  const all = scan.feed ?? [];
+  const items = all.filter((i) => matches(query, i.headline, i.snippet, i.author, i.url, i.venue));
 
   if (items.length === 0) {
     return (
@@ -37,6 +41,13 @@ export function FeedView({ scan }: { scan: Scan }) {
 
   return (
     <div className="panel feed">
+      <Filter
+        value={query}
+        onChange={setQuery}
+        placeholder="Search the feed…"
+        showing={items.length}
+        total={all.length}
+      />
       {items.map((item) => (
         <FeedRow key={item.id} item={item} />
       ))}

@@ -10,6 +10,7 @@ import { Overview } from './components/Overview.tsx';
 import { PresenceView } from './components/Presence.tsx';
 import { RunDashboard, type RunSummary } from './components/RunDashboard.tsx';
 import { AgentsPanel } from './components/AgentsPanel.tsx';
+import { OutboxPanel } from './components/OutboxPanel.tsx';
 import { SettingsPanel } from './components/SettingsPanel.tsx';
 import { StatCards, type OverviewTab } from './components/StatCards.tsx';
 import { api, cleanName, normalize, siteOf } from './lib.ts';
@@ -43,7 +44,8 @@ function hashFor(id: string, tab: Tab): string {
 
 const BLANK: Scan = {
   id: '', company: '', site: '', createdAt: '', status: 'done', stage: 'queued',
-  profiles: [], mentions: [], issues: [], abuse: [], buzz: [], topics: [], migrations: [], feed: [], log: [], timings: {},
+  profiles: [], mentions: [], issues: [], abuse: [], buzz: [], topics: [], migrations: [], reviews: [],
+  feed: [], log: [], timings: {},
   verdict: '', net: { now: 0, delta: 0 },
 };
 
@@ -72,6 +74,7 @@ export function App() {
   const [authed, setAuthed] = useState(() => sessionStorage.getItem('whisperer.auth') === '1');
   const [showSettings, setShowSettings] = useState(false);
   const [showAgents, setShowAgents] = useState(false);
+  const [showOutbox, setShowOutbox] = useState(false);
   // Elapsed clocks: runStart/stageStart are wall-clock instants (ms) each set
   // when a run or a stage kicks off; clock is the live tick repainted every
   // second so a long, silent stage still visibly moves instead of looking hung.
@@ -82,6 +85,7 @@ export function App() {
   const openSettings = useCallback(() => {
     setShowSettings(true);
     setShowAgents(false);
+    setShowOutbox(false);
     source.current?.close();
     window.location.hash = '#/';
   }, []);
@@ -91,8 +95,19 @@ export function App() {
   // The agent list is deliberately not a scan tab: it is about the machinery
   // rather than about one company's results, and it stays useful — arguably is
   // most useful — when a scan has just failed and there is nothing to show.
+  const openOutbox = useCallback(() => {
+    setShowOutbox(true);
+    setShowAgents(false);
+    setShowSettings(false);
+    source.current?.close();
+    window.location.hash = '#/';
+  }, []);
+
+  const closeOutbox = useCallback(() => setShowOutbox(false), []);
+
   const openAgents = useCallback(() => {
     setShowAgents(true);
+    setShowOutbox(false);
     setShowSettings(false);
     source.current?.close();
     window.location.hash = '#/';
@@ -265,7 +280,10 @@ useEffect(() => {
     setRunStart(Date.now());
     setStageStart(Date.now());
 
-    const { id } = await api<{ id: string }>('api/scans', { method: 'POST', body: '{}' });
+    const { id } = await api<{ id: string }>('api/scans', {
+      method: 'POST',
+      body: JSON.stringify({ company }),
+    });
     scanIdRef.current = id;
     // The new run exists server-side the moment this returns — surface it in the
     // rail right away (as running) instead of waiting for the run to finish
@@ -377,6 +395,18 @@ useEffect(() => {
     }
   }, [refresh]);
 
+  /** Which stages to run to fill a given card. Discovery drags buzz with it:
+   *  a fresh corpus that nothing has scored leaves sentiment and topics empty,
+   *  which is the state the card was complaining about in the first place. */
+  const STAGE_RERUN: Partial<Record<Stage, Stage[]>> = {
+    presence: ['presence'],
+    discovery: ['discovery', 'buzz'],
+    feed: ['feed'],
+    buzz: ['buzz'],
+    health: ['health'],
+    abuse: ['abuse'],
+  };
+
   const rerunStageFor = (tabKey: Tab): Stage[] | null => {
     switch (tabKey) {
       case 'presence': return ['presence'];
@@ -402,6 +432,7 @@ useEffect(() => {
           <span className={`lamp ${running ? 'busy' : rig ? 'live' : ''}`} />
           {rig ? `${rig.model} · ${rig.servers.length} connectors` : 'no api'}
           <button className="logout" onClick={openAgents} title="Agents and their runs">agents</button>
+          <button className="logout" onClick={openOutbox} title="Replies drafted but never sent">outbox</button>
           <button className="logout" onClick={openSettings} title="Connector API keys">settings</button>
           <button className="logout" onClick={logout} title="Sign out">sign out</button>
         </div>
@@ -417,7 +448,9 @@ useEffect(() => {
         />
 
         <main className="shell dash-main">
-          {showAgents ? (
+          {showOutbox ? (
+            <OutboxPanel onClose={closeOutbox} />
+          ) : showAgents ? (
             <AgentsPanel onClose={closeAgents} />
           ) : showSettings ? (
             <SettingsPanel onClose={closeSettings} />
@@ -551,6 +584,9 @@ useEffect(() => {
             <>
               <StatCards
                 scan={scan}
+                stage={stage}
+                running={running}
+                onRun={(which) => rerun(STAGE_RERUN[which] ?? [which])}
                 onDrill={(targetTab) => { setTab(targetTab); if (scanIdRef.current) window.location.hash = hashFor(scanIdRef.current, targetTab); }}
               />
               <nav className="tabs" role="tablist" aria-label="Scan sections">

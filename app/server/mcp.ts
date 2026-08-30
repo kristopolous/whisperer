@@ -25,6 +25,15 @@ function decode(raw: string): unknown {
   return JSON.parse(body);
 }
 
+/** The endpoint to call, with the token on it when that is how the server
+ *  wants to be authenticated. */
+function endpointFor(connector: ConnectorConfig): string {
+  if (connector.auth?.type !== 'query') return connector.url;
+  const url = new URL(connector.url);
+  url.searchParams.set(connector.auth.param, connector.auth.value);
+  return url.toString();
+}
+
 function headers(connector: ConnectorConfig): Record<string, string> {
   const base: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -37,22 +46,79 @@ function headers(connector: ConnectorConfig): Record<string, string> {
 
 let nextId = 1;
 
-async function rpc<T>(
-  connector: ConnectorConfig, method: string, params: unknown, timeoutMs: number,
-): Promise<T> {
-  const response = await fetch(connector.url, {
+/** Session ids handed out by servers that require the MCP handshake, kept per
+ *  connector for the life of the process. */
+const sessions = new Map<string, string>();
+
+const PROTOCOL_VERSION = '2024-11-05';
+
+/** One JSON-RPC round trip. Returns the parsed body and the response headers,
+ *  because the session id arrives as a header on initialize. */
+async function post(
+  connector: ConnectorConfig, body: unknown, timeoutMs: number,
+): Promise<{ status: number; text: string; sessionId: string | null }> {
+  const extra: Record<string, string> = {};
+  const session = sessions.get(connector.name);
+  if (session) extra['Mcp-Session-Id'] = session;
+
+  const response = await fetch(endpointFor(connector), {
     method: 'POST',
-    headers: headers(connector),
-    body: JSON.stringify({ jsonrpc: '2.0', id: nextId++, method, params }),
+    headers: { ...headers(connector), ...extra },
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
   });
 
-  if (!response.ok) {
-    const detail = await response.text().catch(() => '');
-    throw new Error(`${connector.name} ${response.status}: ${detail.slice(0, 200)}`);
+  return {
+    status: response.status,
+    text: await response.text(),
+    sessionId: response.headers.get('mcp-session-id'),
+  };
+}
+
+/** The MCP handshake: initialize, keep the session id, say we are initialized.
+ *
+ *  Not optional for every server. Bright Data's hosted endpoint answers
+ *  `400 Bad Request: No valid session ID provided` to a tools/call that arrives
+ *  without one — which looked like an auth problem for a long time, because the
+ *  token was ALSO wrong and returning 401 over the top of it. */
+async function handshake(connector: ConnectorConfig, timeoutMs: number): Promise<void> {
+  const { status, text, sessionId } = await post(connector, {
+    jsonrpc: '2.0',
+    id: nextId++,
+    method: 'initialize',
+    params: {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: 'whisperer', version: '1.0' },
+    },
+  }, timeoutMs);
+
+  if (status >= 400) throw new Error(`${connector.name} ${status} on initialize: ${text.slice(0, 200)}`);
+  if (sessionId) sessions.set(connector.name, sessionId);
+
+  // Fire-and-forget: a server that does not want it will ignore it, and a
+  // failure here should not sink a working session.
+  await post(connector, { jsonrpc: '2.0', method: 'notifications/initialized' }, timeoutMs).catch(() => {});
+}
+
+async function rpc<T>(
+  connector: ConnectorConfig, method: string, params: unknown, timeoutMs: number,
+): Promise<T> {
+  const send = () => post(connector, { jsonrpc: '2.0', id: nextId++, method, params }, timeoutMs);
+
+  let { status, text } = await send();
+
+  // A missing or expired session is recoverable exactly once: shake hands and
+  // try again. Retrying blindly would turn a genuine auth failure into two.
+  if (status === 400 && /session/i.test(text)) {
+    sessions.delete(connector.name);
+    await handshake(connector, timeoutMs);
+    ({ status, text } = await send());
   }
 
-  const parsed = decode(await response.text()) as { result?: T; error?: { message?: string } };
+  if (status >= 400) throw new Error(`${connector.name} ${status}: ${text.slice(0, 200)}`);
+
+  const parsed = decode(text) as { result?: T; error?: { message?: string } };
   if (parsed.error) throw new Error(`${connector.name}: ${parsed.error.message ?? 'rpc error'}`);
   if (parsed.result === undefined) throw new Error(`${connector.name}: empty rpc result`);
   return parsed.result;

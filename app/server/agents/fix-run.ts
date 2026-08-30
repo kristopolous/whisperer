@@ -33,6 +33,32 @@ export interface FixedFile {
   why: string;
 }
 
+export interface Edit {
+  path: string;
+  find: string;
+  replace: string;
+  why: string;
+}
+
+/** Apply one edit, or explain why it cannot be.
+ *
+ *  A `find` that matches nothing is a model quoting code that is not there; one
+ *  that matches twice would be applied somewhere unintended. Both are refused
+ *  rather than guessed at — the whole safety of an edit-based patch rests on
+ *  the match being unambiguous. */
+function applyEdit(root: string, edit: Edit): { ok: true; contents: string } | { ok: false; why: string } {
+  const target = path.resolve(root, edit.path);
+  if (!target.startsWith(root + path.sep)) return { ok: false, why: `path escapes the working copy: ${edit.path}` };
+  if (!existsSync(target)) return { ok: false, why: `${edit.path} does not exist` };
+
+  const before = readFileSync(target, 'utf8');
+  const occurrences = before.split(edit.find).length - 1;
+  if (occurrences === 0) return { ok: false, why: `the text to replace was not found in ${edit.path}` };
+  if (occurrences > 1) return { ok: false, why: `the text to replace appears ${occurrences} times in ${edit.path} — not unique` };
+
+  return { ok: true, contents: before.replace(edit.find, edit.replace) };
+}
+
 export interface FixAttempt {
   applied: boolean;
   summary: string;
@@ -97,7 +123,9 @@ export async function fixIssue(
   emit: (level: 'info' | 'warn', text: string) => void,
   options: { maxAttempts?: number } = {},
 ): Promise<FixAttempt> {
-  const maxAttempts = options.maxAttempts ?? 2;
+  // Three, not two: one is routinely spent on a transient empty response from
+  // the provider, which would otherwise leave a single real attempt.
+  const maxAttempts = options.maxAttempts ?? 3;
 
   const test = detectTestCommand(repo);
   if (!test) throw new Error(`cannot tell how to run tests in ${repo} — refusing to claim a fix works`);
@@ -148,7 +176,17 @@ export async function fixIssue(
   while (attempts < maxAttempts) {
     attempts += 1;
 
-    const drafted = await runAgent<{ summary: string; notes: string; files: FixedFile[] }>(fixAgent, {
+    // A failed call is a failed attempt, not a failed stage.
+    //
+    // The loop already retries when the tests fail; it did not when the model
+    // itself did, so one empty response — which this provider returns for
+    // roughly one call in eight — threw straight out and lost the work. The
+    // whole point of attempts is to absorb exactly this.
+    let drafted: { summary: string; notes: string; edits: Edit[]; newFiles: FixedFile[] };
+    try {
+      drafted = await runAgent<{
+      summary: string; notes: string; edits: Edit[]; newFiles: FixedFile[];
+    }>(fixAgent, {
       scanId: scan.id,
       note: `${issue.title.slice(0, 40)} (attempt ${attempts})`,
       prompt: `Product: "${scan.company}".
@@ -165,28 +203,65 @@ Current files:
 ${sources.map((f) => `--- ${f.path}\n${f.contents}`).join('\n\n')}
 ${failure ? `\nYour previous attempt failed the tests. Output:\n${failure}\n\nFix the cause of that failure.` : ''}
 
-Return the complete new contents of every file you change.`,
+Return targeted edits: for each change, the exact text to find in the file and what to replace it with. Copy the text to find character for character from the files above, and make sure it appears only once.`,
       items: sources.length,
       timeoutMs: 600_000,
-    });
+      });
+    } catch (error) {
+      const why = error instanceof Error ? error.message.slice(0, 140) : 'error';
+      emit('warn', `attempt ${attempts}: the model call failed — ${why}`);
+      failure = `Your previous attempt did not return a usable answer (${why}). Try again.`;
+      continue;
+    }
 
-    last = drafted;
-    if (!drafted.files?.length) {
-      emit('warn', `attempt ${attempts}: no files returned — ${drafted.notes?.slice(0, 160) ?? 'no reason given'}`);
+    const edits = drafted.edits ?? [];
+    const newFiles = drafted.newFiles ?? [];
+
+    if (edits.length === 0 && newFiles.length === 0) {
+      last = { summary: drafted.summary, notes: drafted.notes, files: [] };
+      emit('warn', `attempt ${attempts}: no changes returned — ${drafted.notes?.slice(0, 160) ?? 'no reason given'}`);
       break;
     }
 
-    for (const file of drafted.files) {
-      // Written inside the workdir only. A path that escapes it is refused
-      // rather than sanitised: there is no legitimate reason for one.
+    // Apply edits first, then new files. A rejected edit is reported back to
+    // the model on the next attempt rather than silently skipped.
+    const written = new Map<string, string>();
+    const rejected: string[] = [];
+
+    for (const edit of edits) {
+      const result = applyEdit(workdir, edit);
+      if (!result.ok) { rejected.push(result.why); continue; }
+      writeFileSync(path.resolve(workdir, edit.path), result.contents);
+      written.set(edit.path, result.contents);
+    }
+
+    for (const file of newFiles) {
       const target = path.resolve(workdir, file.path);
       if (!target.startsWith(workdir + path.sep)) {
-        throw new Error(`refusing to write outside the working copy: ${file.path}`);
+        rejected.push(`refusing to write outside the working copy: ${file.path}`);
+        continue;
       }
       mkdirSync(path.dirname(target), { recursive: true });
       writeFileSync(target, file.contents);
+      written.set(file.path, file.contents);
     }
-    emit('info', `attempt ${attempts}: wrote ${drafted.files.length} file(s) — ${drafted.files.map((f) => f.path).join(', ')}`);
+
+    last = {
+      summary: drafted.summary,
+      notes: drafted.notes,
+      files: [...written.entries()].map(([p, contents]) => ({
+        path: p,
+        contents,
+        why: edits.find((e) => e.path === p)?.why ?? newFiles.find((f) => f.path === p)?.why ?? '',
+      })),
+    };
+
+    if (rejected.length) emit('warn', `attempt ${attempts}: ${rejected.length} change(s) refused — ${rejected[0]}`);
+    if (written.size === 0) {
+      failure = `None of your edits could be applied:\n${rejected.join('\n')}\nCopy the text to replace exactly from the file, and make sure it appears only once.`;
+      continue;
+    }
+    emit('info', `attempt ${attempts}: changed ${written.size} file(s) — ${[...written.keys()].join(', ')}`);
 
     result = await runTests(workdir, test);
     emit(result.passed ? 'info' : 'warn', `attempt ${attempts}: tests ${result.passed ? 'pass' : 'FAIL'}`);

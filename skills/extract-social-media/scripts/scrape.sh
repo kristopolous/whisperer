@@ -35,11 +35,35 @@ find_lightpanda() {
   echo "$CACHE/lightpanda"
 }
 
+fetch_with_curl() {
+  curl -fsSL --max-time 60 -A 'Mozilla/5.0 (compatible; social-extractor/1.0)' "$URL"
+}
+
+# Lightpanda being *findable* is not the same as it *working*. Under a hardened
+# service unit — private /tmp, seccomp, no /dev/shm, a memory cap — a headless
+# browser that runs fine in an interactive shell exits non-zero or is killed,
+# and with `set -e` that took the whole script down. The caller then reported
+# "site scrape failed" with no cause, and presence fell back to search on a
+# machine where the plain curl path would have worked perfectly.
+#
+# So a lightpanda failure is a fallback, not an error. Curl is worse — it misses
+# links a page builds in JavaScript — but worse is not nothing.
+html=""
 if bin="$(find_lightpanda 2>/dev/null)"; then
   # --strip-mode full drops script/style/media, leaving markup with the links in it.
   # Lightpanda logs page JS exceptions to stderr; they are noise, not failures.
-  "$bin" fetch --dump html --strip-mode full --wait-until networkidle --wait-ms "$WAIT_MS" "$URL" 2>/dev/null
-else
-  echo "lightpanda unavailable, falling back to curl (JS-rendered links will be missed)" >&2
-  curl -fsSL --max-time 60 -A 'Mozilla/5.0 (compatible; social-extractor/1.0)' "$URL"
+  # `if ! cmd` swallows the real status — inside `else`, $? is the command's own.
+  if html="$("$bin" fetch --dump html --strip-mode full --wait-until networkidle --wait-ms "$WAIT_MS" "$URL" 2>/dev/null)"; then
+    :
+  else
+    echo "lightpanda failed (exit $?), falling back to curl" >&2
+    html=""
+  fi
 fi
+
+if [ -z "$html" ]; then
+  [ -n "${bin:-}" ] || echo "lightpanda unavailable, falling back to curl (JS-rendered links will be missed)" >&2
+  html="$(fetch_with_curl)"
+fi
+
+printf '%s' "$html"

@@ -1,12 +1,16 @@
+import { useState } from 'react';
 import type { Profile, Scan } from '../../../shared/types.ts';
+import { Filter, matches } from './Filter.tsx';
 
 const KIND: Record<'official' | 'unofficial', string> = { official: 'official', unofficial: 'unofficial' };
 
 /** The full footprint, split into the channels the company itself runs and the
  *  unofficial ones — communities, reviews, impersonations — that live outside it. */
 export function PresenceView({ scan }: { scan: Scan }) {
-  const official = scan.profiles.filter((p) => p.official);
-  const unofficial = scan.profiles.filter((p) => !p.official);
+  const [query, setQuery] = useState('');
+  const shown = scan.profiles.filter((p) => matches(query, p.handle, p.url, p.platform));
+  const official = shown.filter((p) => p.official);
+  const unofficial = shown.filter((p) => !p.official);
 
   if (scan.profiles.length === 0) {
     return (
@@ -24,6 +28,13 @@ export function PresenceView({ scan }: { scan: Scan }) {
 
   return (
     <div className="panel">
+      <Filter
+        value={query}
+        onChange={setQuery}
+        placeholder="Search accounts…"
+        showing={shown.length}
+        total={scan.profiles.length}
+      />
       <Section title={`Official — ${official.length}`} profiles={official} />
       <Section title={`Unofficial — ${unofficial.length}`} profiles={unofficial} />
     </div>

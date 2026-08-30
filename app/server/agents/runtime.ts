@@ -172,6 +172,7 @@ export async function runAgent<T>(agent: AgentDefinition, options: RunOptions): 
       prompt: options.prompt,
       schema: agent.schema,
       timeoutMs: options.timeoutMs,
+      role: agent.role ?? 'general',
     });
     run.status = 'ok';
     run.resultChars = JSON.stringify(result).length;

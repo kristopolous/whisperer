@@ -1,15 +1,89 @@
 import { useEffect, useState } from 'react';
-import type { AbuseFinding, Scan } from '../../../shared/types.ts';
+import type { AbuseFinding, ReviewKind, ReviewScore, Scan } from '../../../shared/types.ts';
 import { api, fmtDate } from '../lib.ts';
+import { Filter, matches } from './Filter.tsx';
 
 const STATUS_ORDER: AbuseFinding['status'][] = ['open', 'reported', 'dismissed'];
 
 /** Integrity is a docket like Health: the findings down one rail, the report in
  *  the pane. A finding is selected at all times so there is no blank frame. */
+const KIND_LABEL: Record<ReviewKind, string> = {
+  software: 'Software buyers',
+  customer: 'Customers',
+  app: 'App users',
+  employer: 'Staff',
+};
+
+const KIND_ORDER: ReviewKind[] = ['software', 'customer', 'app', 'employer'];
+
+/** The public scorecard: what this company scores on the sites people check.
+ *
+ *  Leads the tab because it is what anyone actually looks up, and because it is
+ *  almost always populated — whereas brand abuse is rare, so a tab that led
+ *  with it said "name is clean" and nothing else, forever.
+ *
+ *  Scores are grouped rather than averaged. A company can be loved by software
+ *  buyers and hated by its own staff, and one number across the two describes
+ *  nobody. */
+function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
+  if (reviews.length === 0) return null;
+
+  const groups = KIND_ORDER
+    .map((kind) => ({ kind, scores: reviews.filter((r) => r.kind === kind) }))
+    .filter((g) => g.scores.length > 0);
+
+  return (
+    <div className="panel">
+      <div className="set-head">
+        <strong>Public scores</strong>
+        <span className="tag plain">{reviews.length} sites</span>
+      </div>
+      <p className="set-desc">
+        What this company scores where buyers, customers and staff go to look. Read from search
+        results rather than scraped — these sites block that — so each one links back and carries
+        the sentence it came from.
+      </p>
+
+      {groups.map((group) => (
+        <div key={group.kind} className="score-group">
+          <span className="score-kind">{KIND_LABEL[group.kind]}</span>
+          <div className="score-row">
+            {group.scores.map((r) => {
+              const share = r.rating / r.scale;
+              return (
+                <a
+                  key={r.site + r.url}
+                  className="score"
+                  href={r.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={r.quote}
+                  data-tone={share >= 0.8 ? 'good' : share >= 0.6 ? 'mid' : 'bad'}
+                >
+                  <span className="score-site">{r.site}</span>
+                  <span className="score-value">
+                    {r.rating}<span className="score-scale">/{r.scale}</span>
+                  </span>
+                  <span className="score-meta">
+                    {r.count ? `${r.count.toLocaleString()} reviews` : 'count not stated'}
+                    {!r.firstParty && ' · quoted'}
+                  </span>
+                </a>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function Abuse({ scan, onStatus }: { scan: Scan; onStatus: (finding: AbuseFinding) => void }) {
-  const findings = [...scan.abuse].sort(
+  const [query, setQuery] = useState('');
+  const allFindings = [...scan.abuse].sort(
     (a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status),
   );
+  const findings = allFindings.filter((f) => matches(query, f.title, f.summary, f.kind, f.severity));
   const [selected, setSelected] = useState(findings[0]?.id);
   const finding = findings.find((f) => f.id === selected) ?? findings[0];
 
@@ -19,22 +93,34 @@ export function Abuse({ scan, onStatus }: { scan: Scan; onStatus: (finding: Abus
 
   if (findings.length === 0) {
     return (
-      <div className="panel">
-        <div className="empty">
-          <h3>Nothing abusing the brand</h3>
-          <p>
-            No impersonating accounts, lookalike domains, scams or fake support turned up in the
-            search. That is the result — nothing needs reporting.
-          </p>
+      <>
+        <Scorecard reviews={scan.reviews ?? []} />
+        <div className="panel">
+          <div className="empty">
+            <h3>Nothing abusing the brand</h3>
+            <p>
+              No impersonating accounts, lookalike domains, scams or fake support turned up in the
+              search. That is the result — nothing needs reporting.
+            </p>
+          </div>
         </div>
-      </div>
+      </>
     );
   }
 
   return (
+    <>
+    <Scorecard reviews={scan.reviews ?? []} />
     <div className="panel">
       <div className="docket">
         <div className="docket-list" role="listbox" aria-label="Integrity findings">
+          <Filter
+            value={query}
+            onChange={setQuery}
+            placeholder="Search findings…"
+            showing={findings.length}
+            total={allFindings.length}
+          />
           {findings.map((f) => (
             <button
               key={f.id}
@@ -56,6 +142,7 @@ export function Abuse({ scan, onStatus }: { scan: Scan; onStatus: (finding: Abus
         <Finding scanId={scan.id} finding={finding} onStatus={onStatus} />
       </div>
     </div>
+    </>
   );
 }
 

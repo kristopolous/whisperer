@@ -1,12 +1,14 @@
 import { useMemo, useState } from 'react';
 import type { Scan } from '../../../shared/types.ts';
 import { VenueBars } from '../charts/VenueBars.tsx';
+import { Filter, matches } from './Filter.tsx';
 import { VENUES, fmtDate, fmtMonth, fmtScore, venueOf } from '../lib.ts';
 
 /** Discovery is the raw material for everything else: every mention and where
  *  it lives. The ledger shows the remarks; the venue bars show the mix. */
 export function Buzz({ scan, cursor }: { scan: Scan; cursor: string | null }) {
   const [venue, setVenue] = useState<string>('all');
+  const [query, setQuery] = useState('');
 
   // Real discussion first, then newest first.
   //
@@ -24,6 +26,9 @@ export function Buzz({ scan, cursor }: { scan: Scan; cursor: string | null }) {
       .filter((m) => {
         if (cursor && (!m.date || !m.date.startsWith(cursor.slice(0, 7)))) return false;
         if (venue !== 'all' && venueOf(m.venue).key !== venue) return false;
+        // Searches what a person can see plus the themes and the URL, so
+        // "reddit crash" and "r/GIMP" both work.
+        if (!matches(query, m.title, m.excerpt, m.url, m.themes.join(' '))) return false;
         return true;
       })
       .sort((a, b) => {
@@ -41,7 +46,7 @@ export function Buzz({ scan, cursor }: { scan: Scan; cursor: string | null }) {
         if (Boolean(a.date) !== Boolean(b.date)) return a.date ? -1 : 1;
         return (b.date ?? '').localeCompare(a.date ?? '');
       }),
-    [scan.mentions, cursor, venue],
+    [scan.mentions, cursor, venue, query],
   );
 
   return (
@@ -76,6 +81,14 @@ export function Buzz({ scan, cursor }: { scan: Scan; cursor: string | null }) {
             </button>
           ))}
         </div>
+
+        <Filter
+          value={query}
+          onChange={setQuery}
+          placeholder="Search titles, quotes, themes, URLs…"
+          showing={visible.length}
+          total={scan.mentions.length}
+        />
 
         <div className="scroll wide">
           <table>

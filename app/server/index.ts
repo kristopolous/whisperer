@@ -14,8 +14,14 @@ import { askJsonDirect } from './model.ts';
 import { recordLoopStep } from './channels/github.ts';
 import { channelStates, reloadChannels } from './channels/index.ts';
 import { enabledConnectors, inferenceConfig, inferenceHost, inferenceHosts, patchConnector, patchInferenceHost, reloadConfig } from './config.ts';
+import { diagnoseIssue } from './agents/diagnose-run.ts';
+import { fixIssue } from './agents/fix-run.ts';
+import { ensureFork } from './channels/fork.ts';
+import { openPullRequest } from './channels/github.ts';
 import { discard, outbox } from './outbox.ts';
-import { secretSource, setSecrets } from './secrets.ts';
+import { ensureCheckout, reloadRepos, repoConfig } from './repos.ts';
+import { hintFor, warnAbout } from './credential-hints.ts';
+import { secretSource, setSecrets, storedSecrets } from './secrets.ts';
 import { availableConnectors, checkConnectors } from './mcp.ts';
 import { runStage, explainFailure } from './stages.ts';
 import * as store from './store.ts';
@@ -126,10 +132,20 @@ app.get('/api/credentials', (_req, res) => {
 
     // One row per credential, listing everything that wants it — several
     // connectors can share a key and asking for it twice would be silly.
-    const byName = new Map<string, { name: string; usedBy: string[]; kind: string; source: string }>();
+    const byName = new Map<string, {
+      name: string; usedBy: string[]; kind: string; source: string;
+      what: string; where: string; secret: boolean;
+    }>();
     for (const entry of [...fromConnectors, ...fromChannels]) {
+      const hint = hintFor(entry.name);
       const row = byName.get(entry.name) ?? {
-        name: entry.name, usedBy: [], kind: entry.kind, source: secretSource(entry.name),
+        name: entry.name,
+        usedBy: [] as string[],
+        kind: entry.kind,
+        source: secretSource(entry.name),
+        what: hint.what,
+        where: hint.where ?? '',
+        secret: hint.secret,
       };
       row.usedBy.push(entry.usedBy);
       byName.set(entry.name, row);
@@ -146,11 +162,16 @@ app.put('/api/credentials', async (req, res) => {
   try {
     const values = req.body as Record<string, string>;
     if (!values || typeof values !== 'object') return res.status(400).json({ error: 'expected an object' });
+    // Warn before storing, and report it back. A value pasted into the wrong
+    // row is not an error — it might be deliberate — but silently accepting one
+    // means the mistake surfaces later as an unexplained 401 in a stage that
+    // has nothing to do with typing it.
+    const warnings = warnAbout(values, storedSecrets());
     setSecrets(values);
     // Re-probe immediately: the point of typing a key is to find out whether it
     // works, and making someone press a second button to learn that is the same
     // failure as sending them to .env.
-    res.json(await checkConnectors());
+    res.json({ connectors: await checkConnectors(), warnings });
   } catch (error) {
     res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
   }
@@ -195,6 +216,9 @@ app.put('/api/inference', (req, res) => {
     if (Number.isFinite(req.body.contextLength)) changes.contextLength = Number(req.body.contextLength);
     if (Number.isFinite(req.body.maxOutputTokens)) changes.maxOutputTokens = Number(req.body.maxOutputTokens);
     if (req.body.makeDefault === true) changes.makeDefault = true;
+    if (Array.isArray(req.body.roles)) {
+      changes.roles = req.body.roles.filter((r: unknown) => r === 'general' || r === 'coding');
+    }
 
     patchInferenceHost(hostKey, changes);
     res.json(inferenceHosts());
@@ -323,11 +347,16 @@ app.get('/api/scans/:id/stream', async (req, res) => {
   const raw = String(req.query.company ?? '').trim();
   if (!raw) return res.status(400).end();
 
+  // Reuse the record the POST created, so its createdAt — and its position in
+  // the rail — does not jump when the stream opens.
+  const existing = store.get(req.params.id);
+
   const scan: Scan = {
     id: req.params.id,
+    input: existing?.input ?? raw,
     company: cleanName(raw),
     site: siteOf(raw),
-    createdAt: new Date().toISOString(),
+    createdAt: existing?.createdAt ?? new Date().toISOString(),
     status: 'running',
     stage: 'queued',
     profiles: [],
@@ -337,6 +366,7 @@ app.get('/api/scans/:id/stream', async (req, res) => {
     buzz: [],
     topics: [],
     migrations: [],
+    reviews: [],
     feed: [],
     log: [],
     timings: {},
@@ -480,7 +510,34 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
   }
 });
 
-app.post('/api/scans', (_req, res) => res.json({ id: randomUUID().slice(0, 8) }));
+/** Mint a scan and persist it immediately as queued.
+ *
+ *  It used to only return an id, and the record was created later when the
+ *  browser opened the event stream. That is a race the dashboard always lost:
+ *  it asked for the run list the moment the POST returned, the store did not
+ *  have the scan yet, and the new company did not appear in the rail until a
+ *  manual refresh. Creating it here means the row exists before anything is
+ *  streamed. */
+app.post('/api/scans', (req, res) => {
+  const raw = String(req.body?.company ?? '').trim();
+  const id = randomUUID().slice(0, 8);
+  if (!raw) return res.json({ id });
+
+  store.put({
+    id,
+    input: raw,
+    company: cleanName(raw),
+    site: siteOf(raw),
+    createdAt: new Date().toISOString(),
+    status: 'running',
+    stage: 'queued',
+    profiles: [], mentions: [], issues: [], abuse: [], buzz: [],
+    topics: [], migrations: [], reviews: [], feed: [], log: [], timings: {},
+    verdict: '',
+    net: { now: 0, delta: 0 },
+  });
+  res.json({ id });
+});
 
 /** Remove a scan, and every other attempt at the same company, since that is
  *  what one row in the sidebar stands for. Deliberately explicit about how many
@@ -616,6 +673,138 @@ app.post('/api/scans/:id/issues/:issueId/reply', async (req, res) => {
   } catch (error) {
     res.status(502).json({ error: error instanceof Error ? error.message : 'reply drafting failed' });
   }
+});
+
+/** Read the project's source and say where the defect likely lives.
+ *
+ *  Long-running by nature — a checkout may need cloning, then the model reads
+ *  several files — so the response is held rather than streamed. Progress is
+ *  already visible: every agent call lands on /api/agents/stream as it happens. */
+app.post('/api/scans/:id/issues/:issueId/diagnose', async (req, res) => {
+  const scan = store.get(req.params.id);
+  const issue = scan?.issues.find((i) => i.id === req.params.issueId);
+  if (!scan || !issue) return res.status(404).json({ error: 'no such issue' });
+
+  const trail: string[] = [];
+  const emit = (level: 'info' | 'warn', text: string) => trail.push(`[${level}] ${text}`);
+
+  try {
+    const { path: repo } = await ensureCheckout(scan.company, emit, scan.subject?.repo);
+    const result = await diagnoseIssue(scan, issue, repo, emit);
+    issue.diagnosis = { ...result, at: new Date().toISOString() };
+    store.put(scan);
+    res.json({ diagnosis: issue.diagnosis, log: trail });
+  } catch (error) {
+    res.status(502).json({
+      error: error instanceof Error ? error.message : 'diagnosis failed',
+      log: trail,
+    });
+  }
+});
+
+/** Write the patch and run the tests, in a throwaway copy.
+ *
+ *  Nothing is committed, pushed or applied to the configured checkout. The
+ *  answer is a diff plus a test result, and the caller decides what to do with
+ *  it. Requires a diagnosis first: patching without one is guessing. */
+app.post('/api/scans/:id/issues/:issueId/fix', async (req, res) => {
+  const scan = store.get(req.params.id);
+  const issue = scan?.issues.find((i) => i.id === req.params.issueId);
+  if (!scan || !issue) return res.status(404).json({ error: 'no such issue' });
+  if (!issue.diagnosis) return res.status(400).json({ error: 'diagnose this issue first' });
+
+  const trail: string[] = [];
+  const emit = (level: 'info' | 'warn', text: string) => trail.push(`[${level}] ${text}`);
+
+  try {
+    const { path: repo } = await ensureCheckout(scan.company, emit, scan.subject?.repo);
+    const result = await fixIssue(scan, issue, issue.diagnosis, repo, emit);
+    issue.fix = { ...result, at: new Date().toISOString() };
+    store.put(scan);
+    res.json({ fix: issue.fix, log: trail });
+  } catch (error) {
+    res.status(502).json({
+      error: error instanceof Error ? error.message : 'fix failed',
+      log: trail,
+    });
+  }
+});
+
+/** Fork the subject's repository, and point ticketing at the fork.
+ *
+ *  The one action that makes filing safe. Everything this pipeline writes —
+ *  tickets, comments, pull requests — goes to a fork under the authenticated
+ *  account, never to the project itself. */
+app.post('/api/scans/:id/fork', async (req, res) => {
+  const scan = store.get(req.params.id);
+  if (!scan) return res.status(404).json({ error: 'no such scan' });
+
+  const upstream = scan.subject?.repo;
+  if (!upstream) return res.status(400).json({ error: 'this scan has no repository to fork' });
+
+  const trail: string[] = [];
+  try {
+    const fork = await ensureFork(upstream, (level, text) => trail.push(`[${level}] ${text}`));
+    scan.fork = fork.fullName;
+    store.put(scan);
+    res.json({ fork, log: trail });
+  } catch (error) {
+    res.status(502).json({ error: error instanceof Error ? error.message : 'fork failed', log: trail });
+  }
+});
+
+/** Open a pull request on the fork with a verified fix. */
+app.post('/api/scans/:id/issues/:issueId/pr', async (req, res) => {
+  const scan = store.get(req.params.id);
+  const issue = scan?.issues.find((i) => i.id === req.params.issueId);
+  if (!scan || !issue) return res.status(404).json({ error: 'no such issue' });
+  if (!issue.fix?.files?.length) return res.status(400).json({ error: 'write a fix first' });
+  if (!issue.fix.tests.passed) {
+    return res.status(400).json({ error: 'the tests did not pass — not opening a pull request for it' });
+  }
+
+  const trail: string[] = [];
+  try {
+    const pr = await openPullRequest(
+      issue.fix.files.map((f) => ({ path: f.path, contents: f.contents })),
+      issue.title,
+      [
+        issue.fix.summary,
+        '',
+        `Reported publicly: ${issue.summary}`,
+        `Impact: ${issue.impact}`,
+        '',
+        `Tests: \`${issue.fix.tests.command}\` — ${issue.fix.tests.passed ? 'pass' : 'fail'}`,
+        `Regression test checked against the original code: ${issue.fix.provesTheBug.detail}`,
+        '',
+        '_Opened automatically against a fork. Not submitted to the upstream project._',
+      ].join('\n'),
+      (level, text) => trail.push(`[${level}] ${text}`),
+    );
+    issue.loop = [...(issue.loop ?? []), {
+      id: randomUUID().slice(0, 8),
+      step: 'fixed',
+      actor: 'agent',
+      at: new Date().toISOString(),
+      human: false,
+      summary: `Pull request #${pr.number} opened on the fork.`,
+      ref: { label: `#${pr.number}`, url: pr.url },
+    }];
+    store.put(scan);
+    res.json({ pr, log: trail });
+  } catch (error) {
+    res.status(502).json({ error: error instanceof Error ? error.message : 'pull request failed', log: trail });
+  }
+});
+
+/** Which companies have a repository configured, so the dashboard can offer
+ *  diagnosis only where there is source to read. */
+app.get('/api/repos', (_req, res) => {
+  reloadRepos();
+  res.json(repoConfig().value.repos.map((r) => ({
+    company: r.company,
+    source: r.path ?? r.url ?? '',
+  })));
 });
 
 /** The reporter came back and said it works.

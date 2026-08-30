@@ -24,7 +24,7 @@
  *  against a service that has to be running before this app can think.
  */
 
-import { inferenceHost } from './config.ts';
+import { inferenceHost, type ModelRole } from './config.ts';
 
 interface Endpoint {
   baseUrl: string;
@@ -43,8 +43,8 @@ interface Endpoint {
  *  503s when its own upstream is unreachable). The identical request against
  *  the upstream returns valid JSON.
  */
-export function resolveEndpoint(): Endpoint {
-  const host = inferenceHost();
+export function resolveEndpoint(role: ModelRole = 'general'): Endpoint {
+  const host = inferenceHost(role);
   if (!host.baseUrl) throw new Error(`inference host "${host.key}" has no baseUrl`);
   return {
     baseUrl: host.baseUrl.replace(/\/$/, ''),
@@ -53,6 +53,20 @@ export function resolveEndpoint(): Endpoint {
     contextLength: host.contextLength ?? 15_000,
     maxOutputTokens: host.maxOutputTokens ?? 4_096,
   };
+}
+
+/** The schema, restated as an instruction.
+ *
+ *  Deliberately blunt and repetitive about the output format, because the
+ *  failures are all the same shape: a model that answers the question correctly
+ *  in prose, a table, or a fenced block with commentary around it. */
+function schemaInstruction(schema: { name: string; schema: unknown }): string {
+  return [
+    'Respond with a single JSON object and nothing else.',
+    'No prose before or after it, no markdown, no table, no code fence, no explanation.',
+    'It must match this JSON Schema exactly:',
+    JSON.stringify(schema.schema),
+  ].join('\n');
 }
 
 /** Models wrap JSON in prose or fences often enough that this is not optional,
@@ -74,6 +88,8 @@ export interface AskOptions {
   schema: { name: string; schema: unknown };
   /** Generation budget for this one call. */
   timeoutMs?: number;
+  /** What kind of work this is, which decides which model answers it. */
+  role?: ModelRole;
 }
 
 /** Pull the assistant text out of one SSE frame, tolerating both the streaming
@@ -107,7 +123,7 @@ function frameText(payload: string): string {
  *  unstreamed and completed normally streamed.
  */
 export async function askJsonDirect<T>(options: AskOptions): Promise<T> {
-  const endpoint = resolveEndpoint();
+  const endpoint = resolveEndpoint(options.role);
 
   const response = await fetch(`${endpoint.baseUrl}/chat/completions`, {
     method: 'POST',
@@ -121,6 +137,15 @@ export async function askJsonDirect<T>(options: AskOptions): Promise<T> {
       messages: [
         { role: 'system', content: options.instructions },
         { role: 'user', content: options.prompt },
+        // The schema is stated in the prompt as well as in response_format.
+        //
+        // Not redundant: plenty of OpenAI-compatible servers accept
+        // `response_format` and quietly ignore it. One of them answered a
+        // scoring request with a markdown table of scores — a perfectly good
+        // answer that no JSON parser will ever read — and reported success.
+        // Asking in the prompt is the only part of this that works everywhere,
+        // and it costs a few hundred tokens.
+        { role: 'user', content: schemaInstruction(options.schema) },
       ],
       stream: true,
       response_format: {

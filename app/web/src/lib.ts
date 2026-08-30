@@ -18,6 +18,7 @@ export function normalize(scan: Scan): Scan {
     buzz: scan.buzz ?? [],
     topics: scan.topics ?? [],
     migrations: scan.migrations ?? [],
+    reviews: scan.reviews ?? [],
     feed: scan.feed ?? [],
     log: scan.log ?? [],
     timings: scan.timings ?? {},
@@ -72,4 +73,19 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json() as Promise<T>;
+}
+
+/** "3h ago" — how stale the thing on screen is.
+ *
+ *  A scan is a snapshot of a moving internet, and the panel gives no clue how
+ *  old its snapshot is. Without this, discovery run four days ago looks exactly
+ *  like discovery run a minute ago. */
+export function fmtAgo(iso: string | undefined | null): string | null {
+  if (!iso) return null;
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  if (ms < 90_000) return 'just now';
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h ago`;
+  return `${Math.round(ms / 86_400_000)}d ago`;
 }

@@ -1,16 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib.ts';
 
-interface RedditKeys {
-  clientId: string;
-  clientSecret: string;
-  username: string;
-  password: string;
-  userAgent: string;
-}
-
-const EMPTY: RedditKeys = { clientId: '', clientSecret: '', username: '', password: '', userAgent: '' };
-
 /** One MCP connector as the server reports it after dialling it.
  *
  *  `unconfigured` and `down` are kept apart because they are different jobs:
@@ -31,6 +21,12 @@ interface Credential {
   usedBy: string[];
   kind: 'connector' | 'channel';
   source: 'dashboard' | 'environment' | 'missing';
+  /** What it is, and where to get it. */
+  what: string;
+  where: string;
+  /** False for usernames, domains and switches — shown as plain text, because
+   *  masking a non-secret hides transpositions and protects nothing. */
+  secret: boolean;
 }
 
 interface ChannelState {
@@ -52,9 +48,17 @@ interface InferenceHost {
   maxOutputTokens?: number;
 }
 
+type ModelRole = 'general' | 'coding';
+
+const ROLE_MEANS: Record<ModelRole, string> = {
+  general: 'reading text and judging it — sentiment, triage, themes',
+  coding: 'reasoning about source — diagnosing a defect, writing a patch',
+};
+
 interface Inference {
   default: string;
   active: string;
+  roles: Partial<Record<ModelRole, string>>;
   isExample: boolean;
   hosts: InferenceHost[];
 }
@@ -98,18 +102,71 @@ const READINESS_TAG: Record<ChannelState['readiness'], string> = {
  *  are not, because they belong in .env and are named by each connector's
  *  `requires` list instead.
  */
+/** The credential inputs for one connector or channel, shown inside its own
+ *  row.
+ *
+ *  These used to live in a separate panel further down the page: a connector
+ *  said "needs BRAVE_API_KEY — add it under Credentials below" and you had to
+ *  go find a matching name in a list of identical boxes. That split is how a
+ *  GitHub token ended up in the Bright Data field. A credential belongs to the
+ *  thing that needs it, so it is entered there. */
+function CredentialFields({
+  names,
+  credentials,
+  entries,
+  onChange,
+  onClear,
+}: {
+  names: string[];
+  credentials: Credential[];
+  entries: Record<string, string>;
+  onChange: (name: string, value: string) => void;
+  onClear: (name: string) => void;
+}) {
+  if (names.length === 0) return null;
+
+  return (
+    <div className="cred-fields">
+      {names.map((name) => {
+        const cred = credentials.find((c) => c.name === name);
+        const set = cred && cred.source !== 'missing';
+        return (
+          <label key={name} className="cred-field">
+            <span className="cred-field-head">
+              <code>{name}</code>
+              {set && <span className="tag good">{cred!.source === 'dashboard' ? 'set here' : 'from .env'}</span>}
+              {set && cred!.source === 'dashboard' && (
+                <button type="button" className="ghost conn-link" onClick={() => onClear(name)}>remove</button>
+              )}
+            </span>
+            {cred?.what && <span className="cred-what">{cred.what}</span>}
+            {cred?.where && <span className="cred-where">{cred.where}</span>}
+            <input
+              type={cred?.secret === false ? 'text' : 'password'}
+              className="conn-url"
+              value={entries[name] ?? ''}
+              onChange={(e) => onChange(name, e.target.value)}
+              placeholder={set ? 'set — type to replace' : `paste ${name}`}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
 export function SettingsPanel({ onClose }: { onClose?: () => void }) {
-  const [keys, setKeys] = useState<RedditKeys>(EMPTY);
-  const [loaded, setLoaded] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [message, setMessage] = useState<{ kind: 'ok' | 'err' | 'info'; text: string } | null>(null);
 
   const [connectors, setConnectors] = useState<ConnectorStatus[] | null>(null);
   const [connError, setConnError] = useState<string | null>(null);
   const [rechecking, setRechecking] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [draftUrl, setDraftUrl] = useState('');
+  /** Which connector or channel row is expanded. One at a time — these rows
+   *  hold inputs, and several open at once is a form nobody can read. */
+  const [openRow, setOpenRow] = useState<string | null>(null);
 
   const [credentials, setCredentials] = useState<Credential[] | null>(null);
   const [entries, setEntries] = useState<Record<string, string>>({});
@@ -122,6 +179,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
   const [inference, setInference] = useState<Inference | null>(null);
   const [hostKey, setHostKey] = useState('');
   const [draft, setDraft] = useState({ baseUrl: '', modelId: '', apiKey: '', contextLength: '', maxOutputTokens: '' });
+  const [draftRoles, setDraftRoles] = useState<ModelRole[]>([]);
   const [savingHost, setSavingHost] = useState(false);
   const [probing, setProbing] = useState(false);
   const [infMessage, setInfMessage] = useState<{ kind: 'ok' | 'err' | 'info'; text: string } | null>(null);
@@ -134,6 +192,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
     const active = value.hosts.find((h) => h.key === value.active) ?? value.hosts[0];
     if (active) {
       setHostKey(active.key);
+      setDraftRoles((['general', 'coding'] as ModelRole[]).filter((r) => value.roles?.[r] === active.key));
       setDraft({
         baseUrl: active.baseUrl,
         modelId: active.modelId,
@@ -155,10 +214,6 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
   }, []);
 
   useEffect(() => {
-    api<RedditKeys>('api/settings/reddit')
-      .then((s) => setKeys({ ...EMPTY, ...s }))
-      .catch(() => setKeys(EMPTY))
-      .finally(() => setLoaded(true));
     api<Credential[]>('api/credentials').then(setCredentials).catch(() => setCredentials(null));
     api<ChannelState[]>('api/channels').then(setChannels).catch(() => setChannels(null));
     api<Health>('api/health').then(setHealth).catch(() => setHealth(null));
@@ -170,6 +225,9 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
     const host = inference?.hosts.find((h) => h.key === key);
     setHostKey(key);
     setInfMessage(null);
+    setDraftRoles(
+      (['general', 'coding'] as ModelRole[]).filter((r) => inference?.roles?.[r] === key),
+    );
     setDraft({
       baseUrl: host?.baseUrl ?? '',
       modelId: host?.modelId ?? '',
@@ -194,6 +252,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
       if (draft.apiKey.trim()) body.apiKey = draft.apiKey;
       if (draft.contextLength) body.contextLength = Number(draft.contextLength);
       if (draft.maxOutputTokens) body.maxOutputTokens = Number(draft.maxOutputTokens);
+      if (draftRoles.length) body.roles = draftRoles;
 
       applyInference(await api<Inference>('api/inference', { method: 'PUT', body: JSON.stringify(body) }));
       setInfMessage({ kind: 'ok', text: makeDefault ? 'Saved, and now the default.' : 'Saved.' });
@@ -247,20 +306,28 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
 
   /** Save every box that was typed into, then re-probe so the connector rows
    *  answer the actual question — did that key work. */
-  const saveCredentials = async () => {
-    const filled = Object.fromEntries(Object.entries(entries).filter(([, v]) => v.trim()));
+  const saveCredentials = async (only?: string[]) => {
+    const filled = Object.fromEntries(
+      Object.entries(entries)
+        .filter(([name, v]) => v.trim() && (!only || only.includes(name))),
+    );
     if (Object.keys(filled).length === 0) return;
     setSavingKeys(true);
     setKeyMessage(null);
     try {
-      setConnectors(await api<ConnectorStatus[]>('api/credentials', {
+      const saved = await api<{ connectors: ConnectorStatus[]; warnings: string[] }>('api/credentials', {
         method: 'PUT',
         body: JSON.stringify(filled),
-      }));
-      setEntries({});
+      });
+      setConnectors(saved.connectors);
+      setEntries((current) => Object.fromEntries(
+        Object.entries(current).filter(([name]) => !(name in filled)),
+      ));
       setCredentials(await api<Credential[]>('api/credentials'));
       setChannels(await api<ChannelState[]>('api/channels').catch(() => null) as ChannelState[] | null);
-      setKeyMessage({ kind: 'ok', text: `Saved ${Object.keys(filled).length} credential(s) and re-probed.` });
+      setKeyMessage(saved.warnings.length
+        ? { kind: 'err', text: `Saved, but: ${saved.warnings.join('; ')}` }
+        : { kind: 'ok', text: `Saved ${Object.keys(filled).length} credential(s) and re-probed.` });
     } catch (error) {
       setKeyMessage({ kind: 'err', text: String(error).replace(/^Error:\s*/, '') });
     } finally {
@@ -271,10 +338,11 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
   const clearCredential = async (name: string) => {
     setSavingKeys(true);
     try {
-      setConnectors(await api<ConnectorStatus[]>('api/credentials', {
+      const cleared = await api<{ connectors: ConnectorStatus[] }>('api/credentials', {
         method: 'PUT',
         body: JSON.stringify({ [name]: '' }),
-      }));
+      });
+      setConnectors(cleared.connectors);
       setCredentials(await api<Credential[]>('api/credentials'));
       setKeyMessage({ kind: 'ok', text: `${name} removed.` });
     } catch (error) {
@@ -309,46 +377,8 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
     }
   };
 
-  const set = (field: keyof RedditKeys) => (value: string) => {
-    setKeys((k) => ({ ...k, [field]: value }));
-    setMessage(null);
-  };
 
-  const save = async () => {
-    setSaving(true);
-    setMessage(null);
-    try {
-      const saved = await api<RedditKeys>('api/settings/reddit', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(keys),
-      });
-      setKeys({ ...EMPTY, ...saved });
-      setMessage({ kind: 'ok', text: 'Saved.' });
-    } catch {
-      setMessage({ kind: 'err', text: 'Could not save settings.' });
-    } finally {
-      setSaving(false);
-    }
-  };
 
-  const test = async () => {
-    setTesting(true);
-    setMessage(null);
-    try {
-      const res = await fetch('api/settings/reddit/test', { method: 'POST' });
-      const data = (await res.json()) as { ok: boolean; error?: string };
-      setMessage(
-        data.ok
-          ? { kind: 'ok', text: 'Connected to Reddit. Keys work.' }
-          : { kind: 'err', text: data.error || 'Connection failed.' },
-      );
-    } catch {
-      setMessage({ kind: 'err', text: 'Could not reach the server.' });
-    } finally {
-      setTesting(false);
-    }
-  };
 
   return (
     <section>
@@ -375,8 +405,9 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
           below is the result of an actual <code>tools/list</code> against that service. <b>ok</b> means it
           answered and mounted tools. <b>no credentials</b> means the environment variables it declares are
           missing, so it was never dialled. <b>down</b> means it was dialled and failed, with the reason.
-          Endpoint edits are written to <code>config/connectors.json</code>; credentials go in the
-          Credentials panel below and are stored on this machine.
+          Open a row to set its credentials and endpoint. Endpoints are written to{' '}
+          <code>config/connectors.json</code>; credentials are stored on this machine and never
+          shown back to you. Saving re-probes, so you find out immediately whether a key works.
         </p>
 
         {connError && <div className="set-message err" style={{ padding: '12px 16px' }}>{connError}</div>}
@@ -385,132 +416,86 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
         {connectors && (
           <div className="conn-list">
             {connectors.length === 0 && <div className="set-desc">No connectors are enabled.</div>}
-            {connectors.map((c) => (
-              <div key={c.name}>
-                <div className="conn-row">
-                  <span className="conn-dot" data-status={c.status} />
-                  <span className="conn-name">
-                    {c.name}
-                    <span className="agent-desc"> — {c.description}</span>
-                  </span>
-                  <span className={`tag ${STATUS_TAG[c.status]}`}>{STATUS_LABEL[c.status]}</span>
-                  <span className="conn-meta">
-                    {c.status === 'ok' ? `${c.tools} tools${c.ms ? ` · ${c.ms}ms` : ''}` : ''}
-                  </span>
+            {connectors.map((c) => {
+              const open = openRow === c.name;
+              // Credentials this connector declares, so they can be filled in
+              // on the row that is complaining about them.
+              const wants = (credentials ?? []).filter((cred) => cred.usedBy.includes(c.name)).map((cred) => cred.name);
 
-                  {c.missing.length > 0 && (
-                    <span className="conn-err">
-                      needs {c.missing.join(', ')} — add {c.missing.length === 1 ? 'it' : 'them'} under
-                      Credentials below
+              return (
+                <div key={c.name}>
+                  <button
+                    className="conn-row agent-row"
+                    onClick={() => { setOpenRow(open ? null : c.name); setEditing(null); }}
+                  >
+                    <span className="conn-dot" data-status={c.status} />
+                    <span className="conn-name">
+                      {c.name}
+                      <span className="agent-desc"> — {c.description}</span>
                     </span>
-                  )}
-                  {c.error && <span className="conn-err">{c.error}</span>}
+                    <span className={`tag ${STATUS_TAG[c.status]}`}>{STATUS_LABEL[c.status]}</span>
+                    <span className="conn-meta">
+                      {c.status === 'ok' ? `${c.tools} tools${c.ms ? ` · ${c.ms}ms` : ''}` : ''}
+                    </span>
+                    <span className="conn-meta">{open ? '−' : '+'}</span>
+                    {c.missing.length > 0 && (
+                      <span className="conn-err">
+                        needs {c.missing.join(', ')} — {open ? 'below' : 'open this row to add ' + (c.missing.length === 1 ? 'it' : 'them')}
+                      </span>
+                    )}
+                    {c.error && <span className="conn-err">{c.error}</span>}
+                  </button>
 
-                  <span className="conn-err conn-edit">
-                    {editing === c.name ? (
-                      <>
+                  {open && (
+                    <div className="conn-detail">
+                      <CredentialFields
+                        names={wants}
+                        credentials={credentials ?? []}
+                        entries={entries}
+                        onChange={(name, value) => setEntries({ ...entries, [name]: value })}
+                        onClear={clearCredential}
+                      />
+
+                      <label className="cred-field">
+                        <span className="cred-field-head"><code>endpoint</code></span>
+                        <span className="cred-what">Where this connector is dialled. Local containers use a loopback port.</span>
                         <input
                           className="conn-url"
-                          value={draftUrl}
-                          onChange={(e) => setDraftUrl(e.target.value)}
+                          value={editing === c.name ? draftUrl : ''}
+                          onChange={(e) => { setEditing(c.name); setDraftUrl(e.target.value); }}
+                          placeholder="leave blank to keep the current endpoint"
                           spellCheck={false}
-                          autoFocus
                         />
-                        <button className="ghost" onClick={() => patch(c.name, { url: draftUrl })}>save</button>
-                        <button className="ghost" onClick={() => setEditing(null)}>cancel</button>
-                      </>
-                    ) : (
-                      <>
+                      </label>
+
+                      <div className="set-actions">
                         <button
-                          className="ghost conn-link"
-                          onClick={() => { setEditing(c.name); setDraftUrl(''); }}
-                          title="Change this connector's endpoint"
+                          className="primary"
+                          disabled={savingKeys}
+                          onClick={async () => {
+                            if (editing === c.name && draftUrl.trim()) await patch(c.name, { url: draftUrl.trim() });
+                            if (wants.some((n) => entries[n]?.trim())) await saveCredentials(wants);
+                            else await recheck();
+                          }}
                         >
-                          edit endpoint
+                          {savingKeys ? 'Saving…' : 'Save & re-probe'}
                         </button>
-                        <button
-                          className="ghost conn-link"
-                          onClick={() => patch(c.name, { enabled: false })}
-                          title="Take this connector out of the running set"
-                        >
-                          disable
+                        <button className="ghost" onClick={() => patch(c.name, { enabled: false })}>
+                          Disable this connector
                         </button>
-                      </>
-                    )}
-                  </span>
+                        {keyMessage && <span className={`set-message ${keyMessage.kind}`}>{keyMessage.text}</span>}
+                      </div>
+                    </div>
+                  )}
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
         <p className="set-desc">
           A disabled connector stays documented in the config with the reason it was switched off, and can
           be turned back on by setting <code>"enabled": true</code> there.
         </p>
-      </div>
-
-      <div className="panel">
-        <div className="set-head">
-          <strong>Credentials</strong>
-          <span className="tag plain">stored on this machine</span>
-        </div>
-        <p className="set-desc">
-          Every key the configured connectors and channels ask for, by name. Entered here they are
-          written to <code>data/secrets.json</code> on this machine and take precedence over anything
-          exported in the environment — nothing is sent anywhere and nothing is ever read back into
-          this page. Saving re-probes the connectors, so you find out immediately whether a key works.
-        </p>
-
-        {credentials === null ? (
-          <div className="set-loading">Loading…</div>
-        ) : credentials.length === 0 ? (
-          <div className="set-desc">No connector or channel declares a credential.</div>
-        ) : (
-          <>
-            <div className="conn-list">
-              {credentials.map((cred) => (
-                <div key={cred.name} className="conn-row cred-row">
-                  <span className="conn-dot" data-status={cred.source === 'missing' ? 'unconfigured' : 'ok'} />
-                  <span className="conn-name">
-                    <code>{cred.name}</code>
-                    <span className="agent-desc"> — {cred.usedBy.join(', ')}</span>
-                  </span>
-                  <span className={`tag ${cred.source === 'missing' ? 'warning' : 'good'}`}>
-                    {cred.source === 'missing' ? 'not set' : cred.source === 'dashboard' ? 'set here' : 'from .env'}
-                  </span>
-                  <span className="conn-meta">
-                    {cred.source === 'dashboard' && (
-                      <button className="ghost conn-link" onClick={() => clearCredential(cred.name)} disabled={savingKeys}>
-                        remove
-                      </button>
-                    )}
-                  </span>
-                  <span className="conn-err cred-input">
-                    <input
-                      type="password"
-                      className="conn-url"
-                      value={entries[cred.name] ?? ''}
-                      onChange={(e) => setEntries({ ...entries, [cred.name]: e.target.value })}
-                      placeholder={cred.source === 'missing' ? `paste ${cred.name}` : 'set — type to replace'}
-                      autoComplete="off"
-                      spellCheck={false}
-                    />
-                  </span>
-                </div>
-              ))}
-            </div>
-            <div className="set-actions">
-              <button
-                className="primary"
-                onClick={saveCredentials}
-                disabled={savingKeys || Object.values(entries).every((v) => !v.trim())}
-              >
-                {savingKeys ? 'Saving…' : 'Save & re-probe'}
-              </button>
-              {keyMessage && <span className={`set-message ${keyMessage.kind}`}>{keyMessage.text}</span>}
-            </div>
-          </>
-        )}
       </div>
 
       <div className="panel">
@@ -528,20 +513,63 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
           <div className="set-loading">Loading channels…</div>
         ) : (
           <div className="conn-list">
-            {channels.map((channel) => (
-              <div key={channel.id} className="conn-row">
-                <span className="conn-dot" data-status={channel.readiness === 'ready' ? 'ok' : channel.readiness === 'needs-credentials' ? 'unconfigured' : 'planned'} />
-                <span className="conn-name">{channel.label}</span>
-                <span className={`tag ${READINESS_TAG[channel.readiness]}`}>
-                  {READINESS_LABEL[channel.readiness]}
-                </span>
-                <span className="conn-meta">{channel.kind}</span>
-                <span className="conn-err">
-                  {channel.missing.length > 0 ? `needs ${channel.missing.join(', ')} (add above) — ` : ''}
-                  {channel.notes}
-                </span>
-              </div>
-            ))}
+            {channels.map((channel) => {
+              const open = openRow === `channel:${channel.id}`;
+              const wants = (credentials ?? [])
+                .filter((cred) => cred.usedBy.includes(channel.label))
+                .map((cred) => cred.name);
+
+              return (
+                <div key={channel.id}>
+                  <button
+                    className="conn-row agent-row"
+                    onClick={() => setOpenRow(open ? null : `channel:${channel.id}`)}
+                  >
+                    <span
+                      className="conn-dot"
+                      data-status={channel.readiness === 'ready' ? 'ok' : channel.readiness === 'needs-credentials' ? 'unconfigured' : 'planned'}
+                    />
+                    <span className="conn-name">
+                      {channel.label}
+                      <span className="agent-desc"> — {channel.notes}</span>
+                    </span>
+                    <span className={`tag ${READINESS_TAG[channel.readiness]}`}>
+                      {READINESS_LABEL[channel.readiness]}
+                    </span>
+                    <span className="conn-meta">{channel.kind}</span>
+                    <span className="conn-meta">{wants.length ? (open ? '−' : '+') : ''}</span>
+                  </button>
+
+                  {open && wants.length > 0 && (
+                    <div className="conn-detail">
+                      {channel.readiness === 'planned' && (
+                        <p className="set-desc" style={{ padding: 0 }}>
+                          This channel is not built yet — filling these in will not make it send anything.
+                          They are here so the credentials are ready when it is.
+                        </p>
+                      )}
+                      <CredentialFields
+                        names={wants}
+                        credentials={credentials ?? []}
+                        entries={entries}
+                        onChange={(name, value) => setEntries({ ...entries, [name]: value })}
+                        onClear={clearCredential}
+                      />
+                      <div className="set-actions">
+                        <button
+                          className="primary"
+                          disabled={savingKeys || !wants.some((n) => entries[n]?.trim())}
+                          onClick={() => saveCredentials(wants)}
+                        >
+                          {savingKeys ? 'Saving…' : 'Save'}
+                        </button>
+                        {keyMessage && <span className={`set-message ${keyMessage.kind}`}>{keyMessage.text}</span>}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -570,15 +598,19 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
             )}
 
             <div className="set-actions">
-              {inference.hosts.map((host) => (
-                <button
-                  key={host.key}
-                  className={host.key === hostKey ? 'primary' : 'ghost'}
-                  onClick={() => selectHost(host.key)}
-                >
-                  {host.key}{host.key === inference.active ? ' ·' : ''}
-                </button>
-              ))}
+              {inference.hosts.map((host) => {
+                const holds = (['general', 'coding'] as ModelRole[]).filter((r) => inference.roles?.[r] === host.key);
+                return (
+                  <button
+                    key={host.key}
+                    className={host.key === hostKey ? 'primary' : 'ghost'}
+                    onClick={() => selectHost(host.key)}
+                    title={holds.length ? `handles: ${holds.join(', ')}` : 'handles nothing yet'}
+                  >
+                    {host.key}{holds.length ? ` · ${holds.join('+')}` : ''}
+                  </button>
+                );
+              })}
               <button className="ghost" onClick={() => selectHost('')} title="Add a new host">+ new</button>
             </div>
 
@@ -657,6 +689,29 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
               claimed larger than it is truncates the JSON mid-object and loses the whole batch.
             </p>
 
+            <div className="role-picker">
+              <span className="cred-field-head"><code>this host handles</code></span>
+              {(['general', 'coding'] as ModelRole[]).map((role) => (
+                <label key={role} className="role-option">
+                  <input
+                    type="checkbox"
+                    checked={draftRoles.includes(role)}
+                    onChange={(e) => setDraftRoles(
+                      e.target.checked
+                        ? [...draftRoles, role]
+                        : draftRoles.filter((r) => r !== role),
+                    )}
+                  />
+                  <span><b>{role}</b> — {ROLE_MEANS[role]}</span>
+                </label>
+              ))}
+              <span className="cred-where">
+                A capable general model scores sentiment as well as anything and is markedly worse at
+                patching unfamiliar code. Point <code>coding</code> at a code model when you have one;
+                leave both here and everything uses this host.
+              </span>
+            </div>
+
             <div className="set-actions">
               <button className="primary" onClick={() => saveHost(false)} disabled={savingHost || !hostKey.trim()}>
                 {savingHost ? 'Saving…' : 'Save'}
@@ -681,62 +736,6 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
         )}
       </div>
 
-      <div className="panel">
-        <div className="set-head">
-          <strong>Reddit API keys</strong>
-          <span className="tag plain">official API via PRAW</span>
-        </div>
-        <p className="set-desc">
-          Create an app at reddit.com/prefs/apps (script type) and paste the credentials below. They are
-          stored on this machine only and never shown back to you once saved. Scans do not use these —
-          Reddit pages are read through the scraping connector, because Reddit blocks unauthenticated
-          requests from this network. These are here for the Reddit write channel above, which is not
-          built yet.
-        </p>
-
-        {!loaded ? (
-          <div className="set-loading">Loading…</div>
-        ) : (
-          <>
-            <div className="set-grid">
-              <label>
-                <span>Client ID</span>
-                <input value={keys.clientId} onChange={(e) => set('clientId')(e.target.value)}
-                  placeholder="e.g. xyzABC123" autoComplete="off" spellCheck={false} />
-              </label>
-              <label>
-                <span>Client secret</span>
-                <input type="password" value={keys.clientSecret} onChange={(e) => set('clientSecret')(e.target.value)}
-                  placeholder="••••••••" autoComplete="off" spellCheck={false} />
-              </label>
-              <label>
-                <span>Username</span>
-                <input value={keys.username} onChange={(e) => set('username')(e.target.value)}
-                  placeholder="your reddit username" autoComplete="username" spellCheck={false} />
-              </label>
-              <label>
-                <span>Password</span>
-                <input type="password" value={keys.password} onChange={(e) => set('password')(e.target.value)}
-                  placeholder="••••••••" autoComplete="current-password" spellCheck={false} />
-              </label>
-              <label className="set-wide">
-                <span>User agent</span>
-                <input value={keys.userAgent} onChange={(e) => set('userAgent')(e.target.value)}
-                  placeholder="whisperer-rep-forensics/1.0 (reputation monitoring)" autoComplete="off" spellCheck={false} />
-              </label>
-            </div>
-            <div className="set-actions">
-              <button className="primary" onClick={save} disabled={saving}>
-                {saving ? 'Saving…' : 'Save'}
-              </button>
-              <button className="ghost" onClick={test} disabled={testing}>
-                {testing ? 'Testing…' : 'Test connection'}
-              </button>
-              {message && <span className={`set-message ${message.kind}`}>{message.text}</span>}
-            </div>
-          </>
-        )}
-      </div>
     </section>
   );
 }

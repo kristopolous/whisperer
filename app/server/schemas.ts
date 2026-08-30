@@ -230,23 +230,101 @@ export const fixSchema = {
   name: 'fix',
   schema: {
     type: 'object',
-    required: ['summary', 'files', 'notes'],
+    required: ['summary', 'edits', 'newFiles', 'notes'],
     properties: {
       summary: { type: 'string', description: 'What this change does, one or two sentences' },
-      files: {
+      edits: {
         type: 'array',
-        description: 'Every file to write, given in full. Include both the fix and its regression test.',
+        description: 'Targeted replacements in existing files. Prefer these over new files.',
+        items: {
+          type: 'object',
+          required: ['path', 'find', 'replace', 'why'],
+          properties: {
+            path: { type: 'string', description: 'Repo-relative path of an existing file' },
+            find: {
+              type: 'string',
+              description: 'The exact text to replace, copied character for character from the file. Must appear exactly once.',
+            },
+            replace: { type: 'string', description: 'What to put in its place' },
+            why: { type: 'string' },
+          },
+        },
+      },
+      newFiles: {
+        type: 'array',
+        description: 'Files that do not exist yet, in full. Use only when there is nowhere to edit.',
         items: {
           type: 'object',
           required: ['path', 'contents', 'why'],
           properties: {
-            path: { type: 'string', description: 'Repo-relative path. May be a new file.' },
-            contents: { type: 'string', description: 'The complete new contents of the file' },
-            why: { type: 'string', description: 'What changed in this file and why' },
+            path: { type: 'string' },
+            contents: { type: 'string' },
+            why: { type: 'string' },
           },
         },
       },
       notes: { type: 'string', description: 'Anything the reviewer should know, including what was not changed' },
+    },
+  },
+} as const;
+
+export const subjectSchema = {
+  name: 'subject',
+  schema: {
+    type: 'object',
+    required: ['name', 'searchTerm', 'aliases', 'excludeTerms', 'site', 'repo', 'kind', 'summary', 'confidence'],
+    properties: {
+      name: { type: 'string', description: 'What to call it on screen — the name its own users use' },
+      searchTerm: { type: 'string', description: 'The single best term to search the web for' },
+      aliases: {
+        type: 'array',
+        description: 'Other names the same thing is discussed under. Empty if there are none.',
+        items: { type: 'string' },
+      },
+      excludeTerms: {
+        type: 'array',
+        description: 'Unrelated things that share the name and would pollute a search — people, other products, ordinary words',
+        items: { type: 'string' },
+      },
+      site: { type: 'string', description: 'Its homepage, or empty string if unknown' },
+      repo: { type: 'string', description: 'Its source repository, or empty string if unknown' },
+      kind: {
+        type: 'string',
+        enum: ['open-source project', 'commercial product', 'company', 'service', 'unknown'],
+      },
+      summary: { type: 'string', description: 'One sentence: what it is' },
+      confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+    },
+  },
+} as const;
+
+export const crawlSchema = {
+  name: 'crawl',
+  schema: {
+    type: 'object',
+    required: ['profiles', 'visit', 'done', 'notes'],
+    properties: {
+      profiles: {
+        type: 'array',
+        description: 'Accounts and communities found on the pages seen so far',
+        items: {
+          type: 'object',
+          required: ['platform', 'handle', 'url', 'official'],
+          properties: {
+            platform: { type: 'string', description: 'reddit, x, github, discord, youtube, linkedin, mastodon, …' },
+            handle: { type: 'string' },
+            url: { type: 'string' },
+            official: { type: 'boolean', description: 'Run by the company itself rather than by a community or third party' },
+          },
+        },
+      },
+      visit: {
+        type: 'array',
+        description: 'Pages on this site worth opening next to find more, copied exactly from the links given. Empty when there is nothing left worth opening.',
+        items: { type: 'string' },
+      },
+      done: { type: 'boolean', description: 'True when opening more pages of this site would not find anything new' },
+      notes: { type: 'string', description: 'Anything odd — a bot check, a parked domain, the wrong company, an unusual place the links live' },
     },
   },
 } as const;

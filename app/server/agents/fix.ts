@@ -5,13 +5,24 @@
  *  anybody's repository — the runner works in a throwaway copy and reports the
  *  diff. Turning that into a pull request is a separate, deliberate act.
  *
- *  Files are returned WHOLE rather than as a diff. Models produce unified
- *  diffs that fail to apply — wrong line numbers, wrong context, whitespace
- *  drift — and a patch that will not apply is indistinguishable from a wrong
- *  patch until you look. A complete file either parses or does not, and the
- *  test run settles the rest. The cost is that this only suits files small
- *  enough to reproduce in full, which is also the only case where a model
- *  rewriting a file wholesale is a reasonable thing to do.
+ *  Changes come back as targeted find/replace edits, not whole files and not a
+ *  unified diff. All three were tried and the reasons are specific:
+ *
+ *   - A unified diff fails to apply. Wrong line numbers, wrong context,
+ *     whitespace drift — and a patch that will not apply is indistinguishable
+ *     from a wrong one until you look.
+ *   - A whole file has to survive being a JSON string. Asked to rewrite a
+ *     140-line Python file, a model emitted unescaped `"""` docstrings and
+ *     turned `\n` into `n`, so the response would not parse and the file would
+ *     not have run if it had. It also silently damaged an ASCII-art constant it
+ *     had no reason to touch, which the tests could not catch.
+ *   - An edit is a few lines of context and a few lines of replacement. Short
+ *     strings are far likelier to survive escaping intact, and an edit
+ *     physically cannot alter code it does not quote.
+ *
+ *  The requirement that `find` appears exactly once is what makes it safe: an
+ *  edit that matches nothing, or matches twice, is rejected rather than applied
+ *  somewhere unintended.
  */
 
 import { fixSchema } from '../schemas.ts';
@@ -29,11 +40,14 @@ What is required of the change:
 - Update anything that documents the behaviour you changed — help text, README, prompts, comments. A fix that leaves the documentation describing the old behaviour has not finished.
 
 What is required of the output:
-- \`contents\` must be the ENTIRE file, ready to write to disk. Not a fragment, not a diff, no elision markers, no "rest of file unchanged".
+- Return \`edits\`: for each change, the exact existing text to find and what to replace it with.
+- \`find\` must be copied character for character from the file you were shown — same indentation, same quotes, same spacing — and must appear EXACTLY ONCE in it. If the line you want to change is not unique, include the lines around it until it is.
+- Keep each edit as small as the change requires. An edit cannot damage code it does not quote, which is the point.
 - Preserve the file's existing style: indentation, quote style, import order, comment voice. Your change should be indistinguishable from the surrounding code.
+- Use \`newFiles\` only for a file that does not exist yet. If there is an existing test file, add your test to it with an edit instead.
 - Do not reformat, reorder or "tidy" anything you did not need to touch.
 - Do not add dependencies.
-- If you cannot fix it from what you were shown, return no files and say why in \`notes\`. That is a real answer; a plausible guess that fails the tests is not.`;
+- If you cannot fix it from what you were shown, return no edits and say why in \`notes\`. That is a real answer; a plausible guess that fails the tests is not.`;
 
 export const fixAgent: AgentDefinition = {
   name: 'whisperer-fix',
@@ -47,6 +61,7 @@ export const fixAgent: AgentDefinition = {
     + 'tests, the failure output is included — read it and fix the cause.',
   schema: fixSchema,
   connectors: [],
+  role: 'coding',
   effort: 'high',
   inPipeline: false,
 };

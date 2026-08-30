@@ -22,70 +22,95 @@
  */
 
 import { cleanText } from '../shared/html.ts';
-import { secret } from './secrets.ts';
+import { usableConnectors } from './config.ts';
+import { callTool } from './mcp.ts';
 import { cached, DAY } from './cache.ts';
 
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
 
-/** Bright Data's MCP endpoint, used only as the escape hatch for pages a plain
- *  fetch cannot read — Reddit, and anything behind a bot check.
+
+/** Whether the scraping escape hatch is usable at all. Without it, Reddit and
+ *  anything behind a bot check keep their search snippet instead of the text
+ *  somebody actually wrote. */
+export const brightDataAvailable = () =>
+  usableConnectors().some((c) => c.name === 'bright-data');
+
+/** Scrape one page through Bright Data.
  *
- *  It is a paid, metered service, so it is never the first thing tried: a
- *  direct fetch is attempted first and Bright Data is called only when that
- *  fails. TrueForge holds this credential too, but it redacts it when serving
- *  settings and exposes no endpoint for calling an MCP tool, so deterministic
- *  code needs its own copy in the environment. Without the token the pipeline
- *  degrades to search snippets for these pages rather than failing. */
-const BRIGHTDATA_MCP = process.env.BRIGHTDATA_MCP_URL ?? 'https://mcp.brightdata.com/mcp';
-const BRIGHTDATA_TOKEN = () => secret('BRIGHTDATA_API_TOKEN');
-
-export const brightDataAvailable = () => Boolean(BRIGHTDATA_TOKEN());
-
-/** One MCP tools/call over streamable-http, returning the text content. */
+ *  Delegates to the shared MCP client rather than keeping a second, subtly
+ *  different implementation here. The bespoke one this replaces authenticated
+ *  with a Bearer header (Bright Data wants the token on the URL) and never
+ *  performed the MCP handshake (it answers 400 without a session), so it failed
+ *  two different ways at once and each masked the other.
+ */
 async function brightDataScrape(url: string, timeoutMs = 60_000): Promise<string | null> {
-  const token = BRIGHTDATA_TOKEN();
-  if (!token) return null;
-
-  const call = async (body: unknown) => fetch(BRIGHTDATA_MCP, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  const connector = usableConnectors().find((c) => c.name === 'bright-data');
+  if (!connector) return null;
 
   try {
-    const response = await call({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'tools/call',
-      params: { name: 'scrape_as_markdown', arguments: { url } },
-    });
-    if (!response.ok) return null;
-
-    // The endpoint may answer as plain JSON or as an SSE frame; accept both.
-    const raw = await response.text();
-    const payload = raw.includes('data:')
-      ? raw.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('')
-      : raw;
-
-    const parsed = JSON.parse(payload) as {
-      result?: { content?: { type?: string; text?: string }[]; isError?: boolean };
-    };
-    if (parsed.result?.isError) return null;
-
-    const text = (parsed.result?.content ?? [])
-      .filter((part) => part.type === 'text' && part.text)
-      .map((part) => part.text!)
-      .join('\n')
-      .trim();
-    return text.length > 200 ? text : null;
+    const result = await callTool(connector, 'scrape_as_markdown', { url }, timeoutMs);
+    if (result.isError) return null;
+    const page = unwrapUntrusted(result.text);
+    if (isScraperError(page)) return null;
+    return page.length > 200 ? page : null;
   } catch {
+    // A scrape that cannot be done is a page we fall back to a snippet for, not
+    // a reason to fail the stage.
     return null;
   }
+}
+
+/** Bright Data reporting its own failure, in the body, with a 200.
+ *
+ *  These come back as ordinary content: a scrape of Trustpilot returns
+ *  "Residential Failed (bad_endpoint): Requested site is not available for
+ *  immediate residential (no KYC) access mode…" and nothing about the response
+ *  says it is an error. Left alone it is stored as the page, scored for
+ *  sentiment, and quoted to a model as what somebody wrote — so a site we
+ *  cannot read looks like a site with 253 characters of strange opinion on it.
+ *
+ *  Matched on the specific shapes rather than by length, because a genuinely
+ *  short page is not an error. */
+const SCRAPER_ERRORS = [
+  /^Residential Failed/i,
+  /^Requested site is not available/i,
+  /\bbad_endpoint\b/i,
+  /^Error: (?:socket hang up|tunneling socket)/i,
+  /^Unexpected server response/i,
+  /^Access to this (?:page|site) (?:has been )?denied/i,
+];
+
+export const isScraperError = (text: string): boolean =>
+  SCRAPER_ERRORS.some((pattern) => pattern.test(text.trim()));
+
+/** Take the page out of Bright Data's provenance envelope.
+ *
+ *  Every scrape comes back wrapped in a "SECURITY NOTICE ... the content
+ *  between the markers below was fetched from an external, untrusted web
+ *  source" preamble, followed by =====UNTRUSTED_<id>_BEGIN===== and END
+ *  markers around the actual page.
+ *
+ *  Leaving it in was quietly ruinous. The scoring stage trims each item to 900
+ *  characters of text, and the preamble alone is around 600 — so for a short
+ *  thread the model was reading a security notice and a marker, scoring the
+ *  sentiment of a boilerplate warning, and the person's actual words never
+ *  reached it.
+ *
+ *  The warning's substance still holds and is handled where it belongs: this
+ *  text is data, never instructions. It is fed to a classifier that is asked
+ *  what it says, and nothing in the pipeline acts on its contents. Stripping
+ *  the envelope removes the label, not the discipline.
+ */
+export function unwrapUntrusted(text: string): string {
+  const marked = text.match(/=====UNTRUSTED_[0-9a-f]+_BEGIN=====([\s\S]*?)=====UNTRUSTED_[0-9a-f]+_END=====/);
+  if (marked) return marked[1]!.trim();
+
+  // Truncation can cut the closing marker off. Take everything after the
+  // opening one rather than returning a page that is all preamble.
+  const opened = text.match(/=====UNTRUSTED_[0-9a-f]+_BEGIN=====([\s\S]*)$/);
+  if (opened) return opened[1]!.trim();
+
+  return text.trim();
 }
 
 /** Strip a fetched HTML document to readable text.

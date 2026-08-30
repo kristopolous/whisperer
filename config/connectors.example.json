@@ -21,8 +21,9 @@
         "BRIGHTDATA_API_TOKEN"
       ],
       "auth": {
-        "type": "bearer",
-        "token": "${BRIGHTDATA_API_TOKEN}"
+        "type": "query",
+        "param": "token",
+        "value": "${BRIGHTDATA_API_TOKEN}"
       }
     },
     {
