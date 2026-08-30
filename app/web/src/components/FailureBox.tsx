@@ -43,7 +43,7 @@ export function FailureBox({
     setChecking(true);
     try {
       const data = await api<ConnectorStatus[]>(
-        reconnect ? '/api/connectors/reconnect' : '/api/connectors',
+        reconnect ? 'api/connectors/reconnect' : 'api/connectors',
         reconnect ? { method: 'POST' } : undefined,
       );
       setConnectors(data);

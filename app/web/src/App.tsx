@@ -101,10 +101,10 @@ export function App() {
   const scanIdRef = useRef<string>('');
 
   const refresh = useCallback(() => {
-    api<RunSummary[]>('/api/scans').then(setRuns).catch(() => setRuns([]));
+    api<RunSummary[]>('api/scans').then(setRuns).catch(() => setRuns([]));
   }, []);
 useEffect(() => {
-    api<typeof rig>('/api/health').then(setRig).catch(() => setRig(null));
+    api<typeof rig>('api/health').then(setRig).catch(() => setRig(null));
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { consoleRef.current?.scrollTo({ top: 1e6 }); }, [log]);
@@ -123,7 +123,7 @@ useEffect(() => {
     // rerun / tab action taken in the load window targets THIS scan, not the
     // one that was on screen a moment ago.
     scanIdRef.current = id;
-    const previous = await api<Scan>(`/api/scans/${id}`);
+    const previous = await api<Scan>(`api/scans/${id}`);
     setScan(normalize({ ...previous, id }));
     setStage(previous.stage);
     setLog(previous.log ?? []);
@@ -172,7 +172,7 @@ useEffect(() => {
 
   const attachStream = useCallback((id: string, company?: string) => {
     source.current?.close();
-    const stream = new EventSource(`/api/scans/${id}/stream${company ? `?company=${encodeURIComponent(company)}` : ''}`);
+    const stream = new EventSource(`api/scans/${id}/stream${company ? `?company=${encodeURIComponent(company)}` : ''}`);
     source.current = stream;
 
     stream.onmessage = (message) => {
@@ -228,7 +228,7 @@ useEffect(() => {
     setRunStart(Date.now());
     setStageStart(Date.now());
 
-    const { id } = await api<{ id: string }>('/api/scans', { method: 'POST', body: '{}' });
+    const { id } = await api<{ id: string }>('api/scans', { method: 'POST', body: '{}' });
     scanIdRef.current = id;
     // The new run exists server-side the moment this returns — surface it in the
     // rail right away (as running) instead of waiting for the run to finish
@@ -264,7 +264,7 @@ useEffect(() => {
     const runOne = (stage: Stage, reset: boolean) =>
       new Promise<void>((resolve, reject) => {
         let settled = false;
-        const stream = new EventSource(`/api/scans/${target}/stages/${stage}/stream${reset ? '?reset=1' : ''}`);
+        const stream = new EventSource(`api/scans/${target}/stages/${stage}/stream${reset ? '?reset=1' : ''}`);
         source.current = stream;
         stream.onopen = () => {
           setLog((l) => [

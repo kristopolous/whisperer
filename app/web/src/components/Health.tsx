@@ -72,11 +72,27 @@ export function Health({ scan, onChange }: { scan: Scan; onChange: (issue: Issue
   );
 }
 
+interface Payload { tracker: Tracker; title: string; body: string; labels: string[]; endpoint: string }
+
 function Report({ scan, issue, onChange }: { scan: Scan; issue: Issue; onChange: (issue: Issue) => void }) {
-  const [payload, setPayload] = useState<{ tracker: Tracker; title: string; body: string; labels: string[]; endpoint: string } | null>(null);
+  const [payload, setPayload] = useState<Payload | null>(null);
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => setPayload(null), [issue.id]);
+  /* Hydrate the preview as soon as an issue is selected. Building a payload is
+   * local and sends nothing anywhere, so making someone click a tracker just to
+   * see what would be filed is a click for nothing — prefill it with whatever
+   * tracker the issue already went to, or the clipboard default. A failure here
+   * is not worth an error state: the tracker buttons still fetch on demand. */
+  useEffect(() => {
+    let live = true;
+    setPayload(null);
+    api<Payload>(`api/scans/${scan.id}/issues/${issue.id}/payload`, {
+      method: 'POST', body: JSON.stringify({ tracker: issue.filedTo?.tracker ?? 'clipboard' }),
+    })
+      .then((p) => { if (live) setPayload(p); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [scan.id, issue.id]);
 
   const evidence = issue.evidence
     .map((id) => scan.mentions.find((m) => m.id === id))
@@ -85,7 +101,7 @@ function Report({ scan, issue, onChange }: { scan: Scan; issue: Issue; onChange:
   const preview = async (tracker: Tracker) => {
     setBusy(true);
     try {
-      setPayload(await api(`/api/scans/${scan.id}/issues/${issue.id}/payload`, {
+      setPayload(await api<Payload>(`api/scans/${scan.id}/issues/${issue.id}/payload`, {
         method: 'POST', body: JSON.stringify({ tracker }),
       }));
     } finally { setBusy(false); }
@@ -98,7 +114,7 @@ function Report({ scan, issue, onChange }: { scan: Scan; issue: Issue; onChange:
       if (payload.tracker === 'clipboard') {
         await navigator.clipboard.writeText(`${payload.title}\n\n${payload.body}`);
       }
-      onChange(await api(`/api/scans/${scan.id}/issues/${issue.id}/file`, {
+      onChange(await api(`api/scans/${scan.id}/issues/${issue.id}/file`, {
         method: 'POST', body: JSON.stringify({ tracker: payload.tracker }),
       }));
     } finally { setBusy(false); }

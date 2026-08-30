@@ -67,7 +67,7 @@ function Finding({
   const setStatus = async (status: AbuseFinding['status']) => {
     setBusy(true);
     try {
-      onStatus(await api(`/api/scans/${scanId}/abuse/${finding.id}/status`, {
+      onStatus(await api(`api/scans/${scanId}/abuse/${finding.id}/status`, {
         method: 'POST',
         body: JSON.stringify({ status }),
       }));

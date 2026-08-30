@@ -46,7 +46,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
   const [reconnecting, setReconnecting] = useState(false);
 
   useEffect(() => {
-    api<RedditKeys>('/api/settings/reddit')
+    api<RedditKeys>('api/settings/reddit')
       .then((s) => setKeys({ ...EMPTY, ...s }))
       .catch(() => setKeys(EMPTY))
       .finally(() => setLoaded(true));
@@ -55,7 +55,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   function refreshConnectors() {
     setConnError(null);
-    api<ConnectorStatus[]>('/api/connectors')
+    api<ConnectorStatus[]>('api/connectors')
       .then(setConnectors)
       .catch(() => { setConnectors(null); setConnError('Could not reach TrueForge to check connectors.'); });
   }
@@ -63,7 +63,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
     setReconnecting(true);
     setConnError(null);
     try {
-      setConnectors(await api<ConnectorStatus[]>('/api/connectors/reconnect', { method: 'POST' }));
+      setConnectors(await api<ConnectorStatus[]>('api/connectors/reconnect', { method: 'POST' }));
     } catch {
       setConnError('Reconnect failed.');
     } finally {
@@ -80,7 +80,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
     setSaving(true);
     setMessage(null);
     try {
-      const saved = await api<RedditKeys>('/api/settings/reddit', {
+      const saved = await api<RedditKeys>('api/settings/reddit', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(keys),
@@ -98,7 +98,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
     setTesting(true);
     setMessage(null);
     try {
-      const res = await fetch('/api/settings/reddit/test', { method: 'POST' });
+      const res = await fetch('api/settings/reddit/test', { method: 'POST' });
       const data = (await res.json()) as { ok: boolean; error?: string };
       setMessage(
         data.ok
