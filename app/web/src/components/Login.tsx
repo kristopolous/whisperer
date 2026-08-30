@@ -25,6 +25,12 @@ export function Login({ onLogin }: { onLogin: () => void }) {
         <div className="wordmark login-mark">Whis<span>·</span>perer</div>
         <p className="login-sub">reputation forensics — sign in to continue</p>
 
+        {/* The credential is fixed and local, so hiding it only leaves people
+          * guessing at a demo. Say it on the page. */}
+        <p className="login-hint">
+          Demo sign-in: username <code>demo</code>, password <code>demo</code>.
+        </p>
+
         <label className="login-label" htmlFor="login-user">Email or username</label>
         <input
           ref={inputRef}

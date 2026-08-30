@@ -202,7 +202,7 @@ button:active:not(:disabled) { transform: translateY(1px); }
 button:disabled { opacity: 0.45; cursor: default; }
 
 button.primary {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--signal) 108%, white) 0%, var(--signal) 100%);
+  background: linear-gradient(180deg, color-mix(in srgb, white 10%, var(--signal)) 0%, var(--signal) 100%);
   border-color: var(--signal);
   color: var(--paper);
   font-weight: 600;
@@ -262,6 +262,16 @@ button.primary:hover:not(:disabled) { filter: brightness(1.08); box-shadow: var(
 }
 .login-mark { font-size: 26px; margin-bottom: 2px; }
 .login-sub { margin: 0 0 18px; font-size: 13px; color: var(--ink-3); }
+.login-hint {
+  margin: -10px 0 16px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  background: color-mix(in srgb, var(--ink-3) 8%, transparent);
+  border: 1px dashed var(--hair);
+  border-radius: 4px;
+  padding: 7px 9px;
+}
+.login-hint code { font: 500 12px var(--mono); color: var(--ink); }
 .login-label { font: 500 10.5px var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); }
 .login-input {
   font-size: 15px;
@@ -846,7 +856,7 @@ td .quote { color: var(--ink-2); font-size: 12.5px; margin-top: 3px; }
   display: flex; align-items: center; justify-content: center; gap: 8px;
   width: 100%;
   padding: 11px 12px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--signal) 108%, white) 0%, var(--signal) 100%);
+  background: linear-gradient(180deg, color-mix(in srgb, white 10%, var(--signal)) 0%, var(--signal) 100%);
   border: 1px solid var(--signal);
   border-radius: var(--r);
   color: var(--paper);
