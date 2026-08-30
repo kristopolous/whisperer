@@ -44,7 +44,7 @@ export function strictify<T>(schema: T): T {
 
 const venue = {
   type: 'string',
-  enum: ['reddit', 'hackernews', 'x', 'github', 'youtube', 'blog', 'forum', 'review', 'other'],
+  enum: ['reddit', 'hackernews', 'x', 'github', 'youtube', 'telegram', 'signal', 'whatsapp', 'blog', 'forum', 'review', 'other'],
 } as const;
 
 export const mentionsSchema = {
@@ -73,6 +73,60 @@ export const mentionsSchema = {
   },
 };
 
+/** The latest things to surface about a company, newest first — a live feed of
+ *  new videos, comments and posts pulled straight from the search connectors. */
+export const feedSchema = {
+  name: 'feed',
+  schema: {
+    type: 'object',
+    required: ['items'],
+    properties: {
+      items: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['venue', 'kind', 'headline', 'url', 'snippet'],
+          properties: {
+            venue,
+            kind: { type: 'string', enum: ['video', 'comment', 'post'], description: 'A video upload, a comment on a thread/video, or a post' },
+            headline: { type: 'string', description: 'Video title, or the post/thread title' },
+            url: { type: 'string', description: 'Direct link back to the video, comment or post' },
+            date: { type: ['string', 'null'], description: 'ISO 8601 date of the upload, post or comment' },
+            author: { type: ['string', 'null'], description: 'Channel name, username, or commenter' },
+            snippet: { type: 'string', description: 'The actual comment text when kind is comment (verbatim); otherwise the excerpt shown' },
+            engagement: { type: ['number', 'null'], description: 'Views, likes, upvotes or comment count' },
+          },
+        },
+      },
+    },
+  },
+};
+
+/** A company's footprint: every official and third-party channel the sweep found
+ *  (subreddits, messaging groups, review pages, social accounts). */
+export const profilesSchema = {
+  name: 'profiles',
+  schema: {
+    type: 'object',
+    required: ['profiles'],
+    properties: {
+      profiles: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['platform', 'handle', 'url', 'official'],
+          properties: {
+            platform: { type: 'string', description: 'reddit, telegram, signal, whatsapp, trustpilot, google-reviews, yelp, facebook, instagram, tiktok, snapchat, x, youtube, github, discord, blog, forum, or other' },
+            handle: { type: 'string', description: 'The @handle, subreddit name, group name, or page title' },
+            url: { type: 'string' },
+            official: { type: 'boolean', description: 'True when the company itself runs it; false for fan/community/review/third-party channels' },
+          },
+        },
+      },
+    },
+  },
+};
+
 export const buzzSchema = {
   name: 'buzz',
   schema: {
@@ -87,7 +141,15 @@ export const buzzSchema = {
           properties: {
             url: { type: 'string' },
             sentiment: { type: 'string', enum: ['positive', 'mixed', 'neutral', 'negative'] },
-            score: { type: 'number', minimum: -1, maximum: 1 },
+            score: {
+              type: 'number',
+              // strictify() strips `minimum`/`maximum` (OpenAI strict mode
+              // rejects them), so the description is the only place the range
+              // survives into the request. Local models in particular will
+              // happily return 7 on a -1..1 scale without it — and a 7 clamps
+              // to +1, turning a neutral mention into a delighted one.
+              description: 'Sentiment from -1.0 (hostile) to 1.0 (delighted), a decimal in that range. Never a 0-10 or percentage score.',
+            },
             themes: { type: 'array', items: { type: 'string' } },
           },
         },
@@ -133,6 +195,18 @@ export const healthSchema = {
           },
         },
       },
+    },
+  },
+};
+
+/** Resolve a company name to a homepage URL. */
+export const siteSchema = {
+  name: 'site',
+  schema: {
+    type: 'object',
+    required: ['url'],
+    properties: {
+      url: { type: 'string', description: 'The company homepage URL, https://' },
     },
   },
 };

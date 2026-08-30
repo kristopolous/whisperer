@@ -3,6 +3,7 @@
 
 export type Venue =
   | 'reddit' | 'hackernews' | 'x' | 'github' | 'youtube'
+  | 'telegram' | 'signal' | 'whatsapp'
   | 'blog' | 'forum' | 'review' | 'other';
 
 export type Sentiment = 'positive' | 'mixed' | 'neutral' | 'negative';
@@ -11,6 +12,9 @@ export interface Profile {
   platform: string;
   handle: string;
   url: string;
+  /** True when the account/group/channel is run by the company itself; false
+   *  for third-party, fan, community, review or impostor channels. */
+  official: boolean;
   confidence: 'high' | 'low';
 }
 
@@ -86,6 +90,25 @@ export interface BuzzPoint {
   byVenue: Partial<Record<Venue, number>>;
 }
 
+/** One entry in the live feed: the latest thing that surfaced about a company
+ *  — a new YouTube video, a comment, a post — with what and when. */
+export interface FeedItem {
+  id: string;
+  venue: Venue;
+  /** What kind of thing surfaced — a video upload, a comment, or a post. */
+  kind: 'video' | 'comment' | 'post';
+  /** For a video this is the title; for a comment, the comment text or headline. */
+  headline: string;
+  url: string;
+  /** ISO date of the post, comment or upload. Null when unknown. */
+  date: string | null;
+  author: string | null;
+  /** The actual comment text (verbatim for comments), or the excerpt shown. */
+  snippet: string;
+  /** Just enough engagement to show it matters. */
+  engagement: number | null;
+}
+
 export interface Scan {
   id: string;
   company: string;
@@ -99,11 +122,15 @@ export interface Scan {
   errorDetail?: string;
   /** The pipeline stage that failed, when known. */
   failedStage?: Stage;
+  /** What class of failure this is, so the UI can offer the right remedy. */
+  errorKind?: 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'other';
   profiles: Profile[];
   mentions: Mention[];
   issues: Issue[];
   abuse: AbuseFinding[];
   buzz: BuzzPoint[];
+  /** Newest-first stream of the latest comments, videos and posts. */
+  feed: FeedItem[];
   /** Everything the run printed, kept with the scan so a finished run can still
    *  be audited. */
   log: LogLine[];
@@ -116,7 +143,7 @@ export interface Scan {
   sessionId?: string;
 }
 
-export type Stage = 'queued' | 'presence' | 'discovery' | 'buzz' | 'health' | 'abuse' | 'done';
+export type Stage = 'queued' | 'presence' | 'discovery' | 'feed' | 'buzz' | 'health' | 'abuse' | 'done';
 
 export type LogLevel = 'info' | 'tool' | 'warn' | 'error' | 'stage';
 
@@ -130,6 +157,7 @@ export interface LogLine {
 export const STAGES: { key: Stage; label: string; blurb: string }[] = [
   { key: 'presence',  label: 'Presence',  blurb: 'Reading the site for accounts' },
   { key: 'discovery', label: 'Discovery', blurb: 'Searching for what people said' },
+  { key: 'feed',      label: 'Feed',      blurb: 'Streaming the latest videos and comments' },
   { key: 'buzz',      label: 'Buzz',      blurb: 'Scoring sentiment over time' },
   { key: 'health',    label: 'Health',    blurb: 'Cataloguing real problems' },
   { key: 'abuse',     label: 'Integrity', blurb: 'Looking for scams and impersonation' },
@@ -148,4 +176,6 @@ export type ScanEvent =
       stage?: Stage;
       /** The full raw error text, for the details toggle. */
       detail?: string;
+      /** What class of failure this is, so the UI can offer the right remedy. */
+      kind?: 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'other';
     };

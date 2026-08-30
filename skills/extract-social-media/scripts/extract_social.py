@@ -45,6 +45,7 @@ PLATFORMS = [
     dict(name="mastodon",   hosts=("mastodon.social", "fosstodon.org", "hachyderm.io"), path=r"^/(@[\w.-]+)"),
     dict(name="telegram",   hosts=("t.me", "telegram.me"),        path=r"^/([\w+-]+)", host="t.me"),
     dict(name="whatsapp",   hosts=("wa.me", "chat.whatsapp.com"), path=r"^/([\w+-]+)"),
+    dict(name="signal",     hosts=("signal.me", "signal.group"),  path=r"^/(@?[\w.-]+)"),
     dict(name="twitch",     hosts=("twitch.tv",),                 path=r"^/([\w-]+)", host="www.twitch.tv"),
     dict(name="medium",     hosts=("medium.com",),                path=r"^/(@?[\w.-]+)", vanity=True),
     dict(name="substack",   hosts=("substack.com",),              path=r"^/(\w[\w.-]*)?", vanity=True),
@@ -211,7 +212,7 @@ def main():
         owned = handle.lstrip("@").lower().replace("-", "") in {t.replace("-", "") for t in tokens}
         entry = found.setdefault(canonical, {
             "platform": platform, "handle": handle, "url": canonical,
-            "confidence": "low", "hits": 0,
+            "official": True, "confidence": "low", "hits": 0,
         })
         entry["hits"] += 1
         if strong or owned:

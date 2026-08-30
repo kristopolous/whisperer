@@ -21,25 +21,51 @@ export const mcpServers: TrueForgeApi.McpServerManifest[] = [
   },
   {
     type: 'remote',
-    name: 'reddit',
-    url: process.env.REDDIT_MCP_URL ?? 'http://localhost:3000/mcp',
-    description:
-      'Read and write Reddit: fetch posts and comments, browse and search subreddits, look up users, and create or edit posts and replies.',
-  },
-  {
-    type: 'remote',
     name: 'hn',
     url: process.env.HN_MCP_URL ?? 'http://localhost:8086/mcp',
     description:
       'Hacker News: top/new/Ask HN/Show HN stories, full comment threads, story search, and user profiles.',
   },
-  {
-    type: 'remote',
-    name: 'linkedin',
-    url: process.env.LINKEDIN_MCP_URL ?? 'http://localhost:8087/mcp',
+  // YouTube needs only an API key (Google Cloud Console → YouTube Data API v3),
+  // not a personal account, so it's grouped with the always-on connectors above
+  // rather than the when()-gated ones below.
+  ...when(process.env.YOUTUBE_API_KEY, {
+    type: 'remote' as const,
+    name: 'youtube',
+    url: process.env.YOUTUBE_MCP_URL ?? 'http://localhost:8091/mcp',
     description:
-      'LinkedIn via an authenticated browser session: person and company profiles, company posts and employees, people/company/job/post search, and inbox messaging.',
-  },
+      'Search YouTube videos, channels and playlists by keyword, with view/like/comment counts and publish dates — for finding video reviews, tutorials and community reaction to a product.',
+  }),
+
+  // Instagram manages the company's own Business account through the Graph
+  // API (posts, DMs, insights), not a general search — needs the app to have
+  // an Instagram Business account connected to a Facebook Page.
+  ...when(process.env.INSTAGRAM_ACCESS_TOKEN, {
+    type: 'remote' as const,
+    name: 'instagram',
+    url: process.env.INSTAGRAM_MCP_URL ?? 'http://localhost:8092/mcp',
+    description:
+      "Manage the company's own Instagram Business account: profile info, recent posts and their engagement insights, connected Facebook pages, and DM conversations.",
+  }),
+  ...when(process.env.TIKNEURON_MCP_API_KEY, {
+    type: 'remote' as const,
+    name: 'tiktok',
+    url: process.env.TIKTOK_MCP_URL ?? 'http://localhost:8093/mcp',
+    description:
+      'Search TikTok videos by keyword, and fetch a video\'s full metadata (creator, engagement, hashtags, duration) plus its captions/transcript — for finding video reaction and community discussion of a product.',
+  }),
+
+  // Brave Search — general web search, kept alongside Exa as a second
+  // independent path so hitting one connector's rate limit doesn't stall
+  // every search-shaped stage.
+  ...when(process.env.BRAVE_API_KEY, {
+    type: 'remote' as const,
+    name: 'brave',
+    url: process.env.BRAVE_MCP_URL ?? 'http://localhost:8094/mcp',
+    description:
+      'Brave web, news, video and image search, plus local business/place search and an AI summarizer — a general search connector independent of Exa.',
+  }),
+
   // The rest carry a personal account rather than an API key, so each is
   // registered only once its credential is present. Registering one before it
   // can connect just puts a dead connector in front of every agent.

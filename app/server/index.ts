@@ -3,10 +3,14 @@ import cors from 'cors';
 import express from 'express';
 import type { Scan, ScanEvent, Stage, Tracker } from '../shared/types.ts';
 import { STAGES } from '../shared/types.ts';
+import { cleanName, siteOf } from '../shared/name.ts';
 import { availableServers, type Log } from './pipeline.ts';
+import { checkConnectors, reconnectConnectors } from './connectors.ts';
 import { runStage, explainFailure } from './stages.ts';
 import * as store from './store.ts';
 import { buildPayload } from './trackers.ts';
+import * as settings from './settings.ts';
+import { testReddit } from './reddit.ts';
 
 const app = express();
 app.use(cors());
@@ -18,6 +22,50 @@ app.get('/api/health', async (_req, res) => {
 });
 
 app.get('/api/scans', (_req, res) => res.json(store.list()));
+
+/** Health of the currently-registered search connectors, for the failure UI. */
+app.get('/api/connectors', async (_req, res) => {
+  try {
+    res.json(await checkConnectors());
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Re-apply the connector manifests and re-probe. This is the corrective path
+ *  for a connector that went stale or lost its credentials. */
+app.post('/api/connectors/reconnect', async (_req, res) => {
+  try {
+    res.json(await reconnectConnectors());
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** The API keys the user pastes in the Settings tab. Secrets are masked so they
+ *  never round-trip to the browser. */
+app.get('/api/settings/reddit', (_req, res) => {
+  res.json(settings.redditPublic());
+});
+
+app.put('/api/settings/reddit', (req, res) => {
+  const body = req.body ?? {};
+  const next = {
+    clientId: String(body.clientId ?? ''),
+    clientSecret: String(body.clientSecret ?? ''),
+    username: String(body.username ?? ''),
+    password: String(body.password ?? ''),
+    userAgent: String(body.userAgent ?? ''),
+  };
+  res.json(settings.setReddit(next));
+});
+
+/** A single authenticated Reddit round-trip; used by the Settings panel's
+ *  "Test connection" button to confirm the pasted keys work. */
+app.post('/api/settings/reddit/test', async (_req, res) => {
+  const result = await testReddit();
+  res.status(result.ok ? 200 : 400).json(result);
+});
 
 app.get('/api/scans/:id', (req, res) => {
   const scan = store.get(req.params.id);
@@ -45,13 +93,13 @@ function openStream(res: import('express').Response, onEvent: (event: ScanEvent)
  * event stream rather than holding a request open with nothing to show.
  */
 app.get('/api/scans/:id/stream', async (req, res) => {
-  const company = String(req.query.company ?? '').trim();
-  if (!company) return res.status(400).end();
+  const raw = String(req.query.company ?? '').trim();
+  if (!raw) return res.status(400).end();
 
   const scan: Scan = {
     id: req.params.id,
-    company,
-    site: '',
+    company: cleanName(raw),
+    site: siteOf(raw),
     createdAt: new Date().toISOString(),
     status: 'running',
     stage: 'queued',
@@ -60,6 +108,7 @@ app.get('/api/scans/:id/stream', async (req, res) => {
     issues: [],
     abuse: [],
     buzz: [],
+    feed: [],
     log: [],
     timings: {},
     verdict: '',
@@ -84,18 +133,50 @@ app.get('/api/scans/:id/stream', async (req, res) => {
         await runStage({ scan, servers, log, send }, next);
       } catch (error) {
         const raw = error instanceof Error ? error.message : String(error);
-        const { message, detail } = explainFailure(next, raw);
+        const { message, detail, kind } = explainFailure(next, raw);
         log('error', `failed at ${next}: ${raw}`);
         scan.status = 'error';
         scan.stage = next;
         scan.failedStage = next;
         scan.error = message;
         scan.errorDetail = detail;
+        scan.errorKind = kind;
         store.put(scan);
-        send({ type: 'error', message, stage: next, detail });
+        send({ type: 'error', message, stage: next, detail, kind });
         res.end();
         return;
       }
+    }
+
+    // A stage that fails is logged and stepped over (see runStage) so one dead
+    // connector cannot throw away five good stages. That resilience used to end
+    // in a lie: the loop finished, status was set to 'done' unconditionally, and
+    // a scan where every single stage had failed was presented as a completed
+    // scan with six empty panels. Whether the run produced anything is decided
+    // here, from what is actually in the scan.
+    const produced =
+      scan.profiles.length + scan.mentions.length + scan.feed.length +
+      scan.issues.length + scan.abuse.length;
+
+    if (produced === 0) {
+      const reason = scan.error
+        ? `Every stage failed — the last error was: ${scan.error}`
+        : 'Every stage ran without erroring but returned nothing at all.';
+      scan.status = 'error';
+      scan.stage = scan.failedStage ?? 'presence';
+      scan.error = `The scan finished with no data. ${reason}`;
+      scan.errorKind = scan.errorKind ?? 'other';
+      log('error', 'scan produced no data at all');
+      store.put(scan);
+      send({ type: 'error', message: scan.error, stage: scan.stage, detail: scan.errorDetail ?? '', kind: scan.errorKind });
+      return;
+    }
+
+    if (scan.failedStage) {
+      // Partial result: real data, but the user must be told which parts of the
+      // dashboard are empty because a stage broke rather than because there was
+      // nothing to find.
+      log('warn', `finished with ${scan.failedStage} failed — that section is incomplete`);
     }
 
     scan.status = 'done';
@@ -114,12 +195,25 @@ app.get('/api/scans/:id/stream', async (req, res) => {
 });
 
 /** Re-run a single stage on an existing scan, streamed. Each stage runs against
- *  whatever the scan already holds, and patches just its own slice of data. */
+ *  whatever the scan already holds, and patches just its own slice of data.
+ *
+ *  `?reset=1` (sent by the rerun-all flow) starts the console over: the previous
+ *  run's log lines and any stale error state are dropped first, so the stream
+ *  reflects exactly the run the user just asked for. */
 app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
   const scan = store.get(req.params.id);
   const next = req.params.stage as Stage;
   if (!scan) return res.status(404).json({ error: 'no such scan' });
   if (!(STAGE_KEYS as string[]).includes(next)) return res.status(400).json({ error: 'no such stage' });
+
+  if (req.query.reset === '1') {
+    scan.log = [];
+    scan.error = undefined;
+    scan.errorDetail = undefined;
+    scan.failedStage = undefined;
+    scan.errorKind = undefined;
+    store.put(scan);
+  }
 
   const send = openStream(res, () => {});
   const log: Log = (level, text) => {
@@ -140,7 +234,7 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
     send({ type: 'done', scan });
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error);
-    const { message, detail } = explainFailure(next, raw);
+    const { message, detail, kind } = explainFailure(next, raw);
     log('error', `failed at ${next}: ${raw}`);
     store.put({
       ...scan,
@@ -149,8 +243,9 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
       failedStage: next,
       error: message,
       errorDetail: detail,
+      errorKind: kind,
     });
-    send({ type: 'error', message, stage: next, detail });
+    send({ type: 'error', message, stage: next, detail, kind });
   } finally {
     res.end();
   }

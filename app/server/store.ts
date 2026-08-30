@@ -21,10 +21,52 @@ function flush() {
   writeFileSync(FILE, JSON.stringify(scans, null, 2));
 }
 
+const TLD = /\.(com|co\.uk|co|org|net|io|dev|app|ai|me|us|xyz|site|news|blog|company|social)$/i;
+const SECOND_LEVEL = /\.(co\.uk|com\.au|co\.nz|co\.in|com\.br|co\.jp|com\.mx|org\.uk|gov\.uk)$/i;
+
+/** A canonical grouping key for a scan's subject, so "supabase", "supabase.com"
+ *  and "https://www.supabase.com/" all collapse to the same company. Keyed off
+ *  the resolved site when we have one, else the raw company string. */
+function companyKey(scan: Scan): string {
+  const source = (scan.site || scan.company || '').replace(/^https?:\/\//i, '').replace(/^www\./i, '').split(/[/?#]/)[0].trim().toLowerCase();
+  if (!source) return '';
+  let host = source;
+  if (SECOND_LEVEL.test(host)) host = host.replace(SECOND_LEVEL, '');
+  else if (TLD.test(host)) host = host.replace(TLD, '');
+  else host = host.split('.')[0];
+  return host;
+}
+
 /** The runs index. Bodies are stripped — the sidebar only needs the headline
- *  numbers, and a scan carries hundreds of excerpts. */
-export const list = () =>
-  scans.map(({ mentions, issues, abuse, log, ...rest }) => ({
+ *  numbers, and a scan carries hundreds of excerpts.
+ *
+ *  Collapses to one entry per company: a company is frequently re-scanned (or a
+ *  scan crashes and is retried), so the dashboard should show the single, most
+ *  recent useful run rather than a row per attempt. "supabase.com", "supabase"
+ *  and a pasted URL all count as the same company. */
+export const list = () => {
+  const newest = [...scans].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const seen = new Set<string>();
+  const out: ReturnType<typeof summarize>[] = [];
+  for (const scan of newest) {
+    const key = companyKey(scan);
+    if (!key || seen.has(key)) continue;
+    if (scan.status === 'running') {
+      // Don't surface a stuck or in-progress run as the company's entry when a
+      // settled (done/error) scan for the same company already exists.
+      const settled = newest.some((s) => companyKey(s) === key && s.status !== 'running');
+      if (settled) continue;
+    }
+    seen.add(key);
+    out.push(summarize(scan));
+  }
+  return out;
+};
+
+/** The headline numbers for one scan, with the chatty bodies stripped. */
+function summarize({ mentions, issues, abuse, log, ...rest }: Scan) {
+  void log;
+  return {
     ...rest,
     mentions: [],
     issues: [],
@@ -37,7 +79,8 @@ export const list = () =>
       critical: (issues ?? []).filter((i) => i.severity === 'critical').length
         + (abuse ?? []).filter((a) => a.severity === 'critical').length,
     },
-  }));
+  };
+}
 
 export const get = (id: string) => scans.find((s) => s.id === id);
 

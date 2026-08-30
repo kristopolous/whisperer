@@ -134,6 +134,22 @@ the shared Exa MCP endpoint rate-limits (`429`) under sustained use, so it's kep
 only as a fallback, never as the primary. A transient failure (429, a dropped
 transport, a 5xx) gets one retry per stage before it's allowed to fail the run.
 
+### Reddit via the official API
+
+The Reddit MCP connector is unreliable, so discovery also talks straight to
+Reddit's official API with **PRAW** when you give it keys. Paste a script-type
+Reddit app's credentials in **Settings** (the masthead → *settings*), and they're
+stored on this machine only (`data/settings.json`, mode 0600) and never shown
+back or sent to a model. With keys configured, discovery pulls real Reddit
+threads through the API and folds them into the results alongside the agent's
+own search:
+
+```
+pip install praw        # required once (see skills/reddit-search/requirements.txt)
+```
+
+Without keys, discovery falls back to whatever search connectors are attached.
+
 ## How a scan works
 
 Five agent turns, each held to a JSON schema (`app/server/schemas.ts`, run

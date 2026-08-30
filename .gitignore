@@ -16,3 +16,10 @@ data/
 # Logs
 *.log
 npm-debug.log*
+
+# Vendored TrueForge checkout (1.2GB, upstream repo — not ours to track)
+trueforge/
+
+# Python bytecode
+__pycache__/
+*.pyc

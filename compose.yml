@@ -15,9 +15,19 @@ services:
     environment:
       # "http" exposes one shared MCP endpoint instead of stdio-per-session.
       SPRING_PROFILES_ACTIVE: http
+      # The process exits immediately (System.exit(1)) if this is empty — see
+      # the bot-setup steps in .env.example before starting this service.
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
-      # discord-mcp exits without a valid DISCORD_TOKEN — set it in .env first.
       DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+    healthcheck:
+      # The image's own documented health check — lets `docker compose ps` and
+      # `docker inspect` show real status instead of "running" with a server
+      # that exited seconds ago because DISCORD_TOKEN was empty or rejected.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8085/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   reddit-mcp:
     image: ghcr.io/jordanburke/reddit-mcp-server:latest
@@ -51,10 +61,24 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      # Holds the browser profile and session cookie. Run the interactive login
-      # once before this is useful:
-      #   docker run -it --rm -v ~/.linkedin-mcp:/home/pwuser/.linkedin-mcp \
-      #     stickerdaniel/linkedin-mcp-server:latest --login
+      # Holds the browser profile and session cookie. This container has no
+      # display, so plain --login fails ("no valid session"); use
+      # --login-viewer, which serves the login browser at a token-protected
+      # URL on :6080 for you to open — it prints the exact URL to visit. Stays
+      # open through 2FA/captcha if LinkedIn asks for it. Run once:
+      #   docker run -it --rm --network host \
+      #     -v ~/.linkedin-mcp:/home/pwuser/.linkedin-mcp \
+      #     stickerdaniel/linkedin-mcp-server:latest --login --login-viewer
+      # --network host is required here, not just for the long-running service
+      # below: the default bridge network has no outbound route on this
+      # machine (its FORWARD chain is missing Docker's own rules), so a
+      # bridged container's browser can't reach linkedin.com at all and the
+      # login times out. With --network host, --login-viewer's port 6080
+      # binds straight to the host, so drop the -p flag too.
+      # `docker stop linkedin-mcp` first if the service below is already
+      # running — both share the host network namespace on --network host, so
+      # two containers each starting their own virtual X display collide
+      # ("server already running"). Start it back up once login is done.
       - ${HOME}/.linkedin-mcp:/home/pwuser/.linkedin-mcp
     # On the host network it can bind loopback directly, which is what its own
     # docs recommend outside Docker.
@@ -105,6 +129,58 @@ services:
     network_mode: host
     volumes:
       - whatsapp-store:/app/whatsapp-bridge/store
+
+  youtube-mcp:
+    build:
+      context: ./docker
+      dockerfile: youtube-mcp.Dockerfile
+      network: host
+    image: local/youtube-mcp:latest
+    container_name: youtube-mcp
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MCP_PORT: "8091"
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY:-}
+
+  instagram-mcp:
+    build:
+      context: ./docker
+      dockerfile: instagram-mcp.Dockerfile
+      network: host
+    image: local/instagram-mcp:latest
+    container_name: instagram-mcp
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      INSTAGRAM_ACCESS_TOKEN: ${INSTAGRAM_ACCESS_TOKEN:-}
+      FACEBOOK_APP_ID: ${FACEBOOK_APP_ID:-}
+      FACEBOOK_APP_SECRET: ${FACEBOOK_APP_SECRET:-}
+      INSTAGRAM_BUSINESS_ACCOUNT_ID: ${INSTAGRAM_BUSINESS_ACCOUNT_ID:-}
+
+  tiktok-mcp:
+    build:
+      context: ./docker
+      dockerfile: tiktok-mcp.Dockerfile
+      network: host
+    image: local/tiktok-mcp:latest
+    container_name: tiktok-mcp
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TIKNEURON_MCP_API_KEY: ${TIKNEURON_MCP_API_KEY:-}
+
+  brave-mcp:
+    build:
+      context: ./docker
+      dockerfile: brave-mcp.Dockerfile
+      network: host
+    image: local/brave-mcp:latest
+    container_name: brave-mcp
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
 
 volumes:
   whatsapp-store:

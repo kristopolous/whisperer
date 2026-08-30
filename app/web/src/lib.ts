@@ -1,4 +1,26 @@
-import type { Mention, Venue } from '../../shared/types.ts';
+import type { Mention, Scan, Venue } from '../../shared/types.ts';
+import { cleanName, hostOf, looksLikeHost, siteOf } from '../../shared/name.ts';
+
+export { cleanName, hostOf, looksLikeHost, siteOf };
+
+/** Older stored scans (and a fresh blank) may lack the newer collection/object
+ *  fields. Fill them so every tab can read `.length` / `.map` without a guard. */
+export function normalize(scan: Scan): Scan {
+  return {
+    ...scan,
+    company: looksLikeHost(scan.company) ? cleanName(scan.company) : scan.company,
+    profiles: (scan.profiles ?? []).map((p) => ({ ...p, official: p.official ?? true, confidence: p.confidence ?? 'low' })),
+    mentions: scan.mentions ?? [],
+    issues: scan.issues ?? [],
+    abuse: scan.abuse ?? [],
+    buzz: scan.buzz ?? [],
+    feed: scan.feed ?? [],
+    log: scan.log ?? [],
+    timings: scan.timings ?? {},
+    net: scan.net ?? { now: 0, delta: 0 },
+  };
+}
+
 
 /** Venue → categorical slot. Fixed order, never cycled: a venue keeps its colour
  *  whatever else is on screen, and the 7th folds into "other" rather than
@@ -7,7 +29,11 @@ export const VENUES: { key: Venue; label: string; slot: string }[] = [
   { key: 'reddit',     label: 'Reddit',       slot: 'var(--s-1)' },
   { key: 'hackernews', label: 'Hacker News',  slot: 'var(--s-2)' },
   { key: 'x',          label: 'X',            slot: 'var(--s-3)' },
+  { key: 'youtube',    label: 'YouTube',      slot: 'var(--s-10)' },
   { key: 'github',     label: 'GitHub',       slot: 'var(--s-4)' },
+  { key: 'telegram',   label: 'Telegram',     slot: 'var(--s-7)' },
+  { key: 'signal',     label: 'Signal',       slot: 'var(--s-8)' },
+  { key: 'whatsapp',   label: 'WhatsApp',     slot: 'var(--s-9)' },
   { key: 'blog',       label: 'Blogs',        slot: 'var(--s-5)' },
   { key: 'forum',      label: 'Forums',       slot: 'var(--s-6)' },
 ];
@@ -31,40 +57,6 @@ export function counts(mentions: Mention[]) {
     map.set(key, (map.get(key) ?? 0) + 1);
   }
   return [...map.entries()].sort((a, b) => b[1] - a[1]);
-}
-
-const TLD = /\.(com|co\.uk|co|org|net|io|dev|app|ai|me|us|gov|edu|xyz|site|news|blog|company|social)$/i;
-/** Two-part country TLDs that are not the brand: example.co.uk → example. */
-const SECOND_LEVEL = /\.(co\.uk|com\.au|co\.nz|co\.in|com\.br|co\.jp|com\.mx|org\.uk|gov\.uk)$/i;
-
-/** Strip protocol + www + trailing slash so a raw URL reads as a bare host,
- *  e.g. https://www.example.co.uk/ → example.co.uk. */
-export function hostOf(raw: string): string {
-  return raw
-    .replace(/^https?:\/\//i, '')
-    .replace(/^www\./i, '')
-    .split(/[/?#]/)[0]
-    .trim();
-}
-
-/** Derive a clean human title from whatever was typed in, so the subject is
- *  never just a URL. "https://www.example.co.uk/" → "Example". A plain phrase
- *  ("Acme Inc") is passed through unchanged. */
-export function cleanName(raw: string): string {
-  const value = raw.trim();
-  // A plain multi-word phrase (or anything without a dot) is already a name.
-  if (!/^https?:\/\//i.test(value) && !/^[\w-]+(\.[\w-]+)+(\.|\/|$)/.test(value)) return value;
-
-  const host = hostOf(value);
-  let cleaned = host;
-  if (SECOND_LEVEL.test(host)) cleaned = host.replace(SECOND_LEVEL, '');
-  else if (TLD.test(host)) cleaned = host.replace(TLD, '');
-  else cleaned = host.split('.')[0];
-
-  return cleaned
-    .split(/[-_]/)
-    .map((part) => part ? part[0].toUpperCase() + part.slice(1) : part)
-    .join(' ');
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
