@@ -42,6 +42,23 @@ let cached: Endpoint | null = null;
 export async function resolveEndpoint(): Promise<Endpoint> {
   if (cached) return cached;
 
+  // Standalone mode: give both the URL and the model id and TrueForge is not
+  // consulted at all. Reading the endpoint out of TrueForge is convenient on a
+  // workstation where it is already running and holds the credential, but it
+  // makes TrueForge a hard dependency of the three reasoning stages — on a
+  // deployment with a perfectly good model endpoint and no TrueForge, they
+  // would fail for want of a lookup. These two variables are the whole config.
+  if (process.env.LLM_BASE_URL && process.env.LLM_MODEL_ID) {
+    cached = {
+      baseUrl: process.env.LLM_BASE_URL.replace(/\/$/, ''),
+      modelId: process.env.LLM_MODEL_ID,
+      apiKey: process.env.LLM_API_KEY,
+      contextLength: Number(process.env.LLM_CONTEXT_LENGTH ?? 15_000),
+      maxOutputTokens: Number(process.env.LLM_MAX_OUTPUT_TOKENS ?? 4_096),
+    };
+    return cached;
+  }
+
   const wanted = process.env.TRUEFORGE_MODEL ?? '';
   const [providerName, ...rest] = wanted.split('/');
   const modelName = rest.join('/');
