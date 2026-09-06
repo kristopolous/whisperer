@@ -392,7 +392,7 @@ useEffect(() => {
    *  The target scan id is read from the selection ref rather than the state
    *  closure: the ref is set synchronously the instant a site is picked in the
    *  rail, so a rerun can never hit a different site than the one highlighted. */
-  const rerun = useCallback(async (stages: Stage[], options?: { depth?: 'deep' | 'normal'; languages?: string[] }) => {
+  const rerun = useCallback(async (stages: Stage[], options?: { depth?: 'deep' | 'normal'; languages?: string[]; dig?: string }) => {
     const target = scanIdRef.current;
     if (!target || stages.length === 0) return;
     source.current?.close();
@@ -417,6 +417,7 @@ useEffect(() => {
         if (reset) params.set('reset', '1');
         if (options?.depth) params.set('depth', options.depth);
         if (options?.languages) params.set('languages', options.languages.join(','));
+        if (options?.dig) params.set('dig', options.dig);
         const query = params.toString();
         const stream = new EventSource(apiUrl(`api/scans/${target}/stages/${stage}/stream${query ? `?${query}` : ''}`));
         source.current = stream;
@@ -811,7 +812,11 @@ useEffect(() => {
                           which is why it is a button and not the default. */}
 
                     </div>
-                    <Buzz scan={scan} cursor={cursor} />
+                    <Buzz
+                      scan={scan}
+                      cursor={cursor}
+                      onDig={(venue) => rerun(['discovery', 'buzz'], { dig: venue })}
+                    />
                   </section>
                 )}
 

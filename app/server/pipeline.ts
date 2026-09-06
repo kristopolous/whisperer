@@ -14,7 +14,7 @@ import { searchReddit } from './reddit.ts';
 import { crawlSite } from './agents/crawl-run.ts';
 import { fetchAll } from './content.ts';
 import { runAgent } from './agents/runtime.ts';
-import { isDeep, runLanguages } from './run-context.ts';
+import { digging, isDeep, runLanguages } from './run-context.ts';
 import { resolveReporter } from './reporter.ts';
 import { enabledLanguages, queriesFor } from './languages.ts';
 import { abuseAgent } from './agents/abuse.ts';
@@ -263,6 +263,44 @@ export async function resolveSite(company: string, emit: Emit): Promise<string> 
 }
 
 /* --------------------------------------------------------------- discovery */
+
+/** The sites that make up a venue, for the venues with no reader of their own.
+ *
+ *  What "search blogs harder" means in practice: the same complaint vocabulary,
+ *  aimed at the handful of hosts where that kind of writing lives, rather than
+ *  hoping a general web sweep surfaces them.
+ *
+ *  `forum` is derived rather than listed, because a product's forum is its own:
+ *  it is whatever the footprint found, which is why editing Sources feeds
+ *  straight back into what a dig can reach. */
+function venueHosts(venue: string, profiles: Profile[]): string[] {
+  const listed: Record<string, string[]> = {
+    blog: ['medium.com', 'dev.to', 'substack.com', 'hashnode.dev', 'blogspot.com', 'wordpress.com'],
+    review: ['trustpilot.com', 'g2.com', 'capterra.com', 'producthunt.com', 'sitejabber.com'],
+    x: ['x.com'],
+    youtube: ['youtube.com'],
+    linkedin: ['linkedin.com'],
+    stackoverflow: ['stackoverflow.com', 'stackexchange.com', 'superuser.com'],
+    discord: ['discord.com'],
+    telegram: ['t.me'],
+  };
+  if (listed[venue]) return listed[venue]!;
+
+  if (venue === 'forum') {
+    const hosts = profiles
+      .filter((profile) => /forum|discourse|community|support/i.test(`${profile.platform} ${profile.url}`))
+      .map((profile) => {
+        try {
+          return new URL(profile.url).hostname.replace(/^www\./, '');
+        } catch {
+          return '';
+        }
+      })
+      .filter(Boolean);
+    return [...new Set(hosts)];
+  }
+  return [];
+}
 
 /** The term to search for, and what it must not be confused with.
  *
@@ -871,6 +909,30 @@ export async function findMentions(
   // all.
   const onError = (query: string, message: string) => emit('warn', `search "${query}" failed — ${message}`);
 
+  const dig = digging();
+
+  // Digging into one venue.
+  //
+  // Two shapes, because the venues are two kinds of thing. Reddit, Hacker News
+  // and GitHub have readers of their own whose limits get lifted above. Every
+  // other venue arrives through general web search, where "search it harder"
+  // means aiming queries at the sites that make up that venue and taking them
+  // unwindowed — which is a real lever, and leaving those rows unclickable was
+  // an artefact of how the code was organised rather than an answer.
+  if (dig) {
+    const hosts = venueHosts(dig, profiles);
+    if (hosts.length) {
+      const aimed = hosts.flatMap((host) => [
+        `site:${host} ${brand}`,
+        `site:${host} ${brand} problem OR broken OR "doesn't work"`,
+      ]);
+      complaintQueries.push(...aimed);
+      emit('info', `digging into ${dig} — ${aimed.length} queries across ${hosts.join(', ')}`);
+    } else {
+      emit('info', `digging into ${dig} — its own limits lifted for this run`);
+    }
+  }
+
   // Other languages, when the scan asks for them.
   //
   // These go in with the complaint queries rather than the general ones,
@@ -878,6 +940,7 @@ export async function findMentions(
   // where that argument happens. That also puts them in the unwindowed pass,
   // which is right for the same reason it is right in English: a complaint
   // does not stop being true because it was written last year.
+
   const packs = enabledLanguages(runLanguages());
   if (packs.length) {
     const foreign = [...new Set(packs.flatMap((pack) => queriesFor(pack, brand, isDeep())))];
@@ -1038,8 +1101,20 @@ export async function findMentions(
     // Algolia pages at 1,000 and charges nothing, so this is two requests for
     // everything HN has said in a year. The classifier downstream is a regex,
     // so a wider pool costs seconds of fetching and no judgement at all.
-    searchHackerNews(brand, emit, { days: 365 }).catch(() => []),
-    searchGithubIssues(brand, emit, { ownRepo: ownRepoOf(subject), limit: 40 }).catch(() => []),
+    // Deepened one source at a time, when the coverage grid asked.
+    //
+    // The gaps that grid shows are per-source and have different causes: Hacker
+    // News is bounded by a 365-day window, GitHub by taking only the newest
+    // forty issues — which on an active project is a couple of months, and is
+    // why its row crams into the last two columns with nothing behind it. Both
+    // limits are right for a nightly run and wrong the moment somebody points
+    // at the hole and asks for the history.
+    searchHackerNews(brand, emit, dig === 'hackernews'
+      ? { days: null, limit: 3_000 }
+      : { days: 365 }).catch(() => []),
+    searchGithubIssues(brand, emit, dig === 'github'
+      ? { ownRepo: ownRepoOf(subject), limit: 400 }
+      : { ownRepo: ownRepoOf(subject), limit: 40 }).catch(() => []),
     findAppReviews(brand, site, emit, 60).catch(() => []),
     // Reddit through its own API rather than through `site:reddit.com`. Null
     // when there are no credentials, which is not an error — the search path

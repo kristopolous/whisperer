@@ -7,7 +7,12 @@ import { VENUES, fmtDate, fmtMonth, fmtScore, venueOf } from '../lib.ts';
 
 /** Discovery is the raw material for everything else: every mention and where
  *  it lives. The ledger shows the remarks; the venue bars show the mix. */
-export function Buzz({ scan, cursor }: { scan: Scan; cursor: string | null }) {
+export function Buzz({ scan, cursor, onDig }: {
+  scan: Scan;
+  cursor: string | null;
+  /** Search one source harder — the coverage grid's row click. */
+  onDig?: (venue: string) => void;
+}) {
   const [venue, setVenue] = useState<string>('all');
   const [query, setQuery] = useState('');
 
@@ -51,9 +56,17 @@ export function Buzz({ scan, cursor }: { scan: Scan; cursor: string | null }) {
   );
 
   return (
-    <div className="split">
+    // One column, not two.
+    //
+    // The narrow right-hand column held a venue bar chart, and the coverage
+    // grid now says the same thing with a time axis on it — so the split was
+    // paying a third of the width to repeat, in less detail, what the wide
+    // panel already showed. The grid is the widest thing on the page and wants
+    // every pixel: each extra column is another month of history legible at a
+    // glance.
+    <div className="stack">
       <div className="panel">
-        <Coverage scan={scan} />
+        <Coverage scan={scan} onDig={onDig} />
         <header>
           <h3>Ledger</h3>
           <span style={{ font: '400 11px var(--mono)', color: 'var(--ink-3)' }}>

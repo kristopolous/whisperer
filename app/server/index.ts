@@ -827,6 +827,12 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
     scan.depth = req.query.depth;
     store.patch(req.params.id, { depth: scan.depth });
   }
+  // Which source to go deep on, when the coverage grid asked for one. Checked
+  // against the venues we know rather than passed through, so a stray value
+  // cannot quietly mean "no source" and look like a normal run.
+  const DIGGABLE = new Set(['hackernews', 'github', 'reddit']);
+  const dig = DIGGABLE.has(String(req.query.dig)) ? String(req.query.dig) : undefined;
+
   const asked = parseLanguages(req.query.languages);
   if (asked) {
     scan.languages = asked;
@@ -855,7 +861,7 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
     scan.status = 'running';
     scan.stage = next;
     store.put(scan);
-    await runStage({ scan, log, send, signal }, next);
+    await runStage({ scan, log, send, signal, dig }, next);
     scan.status = 'done';
     scan.stage = 'done';
     store.put(scan);

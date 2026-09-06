@@ -17,6 +17,8 @@ export interface StageCtx {
   send: (event: ScanEvent) => void;
   /** Fires when the run is cancelled, so the slow work inside can stop. */
   signal?: AbortSignal;
+  /** One source to go deep on for this run — see RunContext.dig. */
+  dig?: string;
   /** False when the subject must be resolved from scratch rather than reused.
    *  Set when somebody reruns the subject stage deliberately — the only reason
    *  to do that is that the stored answer is wrong. */
@@ -125,7 +127,10 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
   // Depth rides on the scan rather than on the call, so a stage rerun digs
   // exactly as hard as the run it belongs to without the caller restating it.
   return withRunContext(
-    { scanId: scan.id, stage: next, depth: scan.depth, languages: scan.languages, signal: ctx.signal },
+    {
+      scanId: scan.id, stage: next, depth: scan.depth,
+      languages: scan.languages, dig: ctx.dig, signal: ctx.signal,
+    },
     async () => {
     try {
       // Before the stage does anything. Cancelling between stages is the cheap

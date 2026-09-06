@@ -33,6 +33,13 @@ export interface RunContext {
   depth?: Depth;
   /** Language codes this run searches in, beyond English. */
   languages?: string[];
+  /** One source to go deep on, when the coverage grid asked for it.
+   *
+   *  Per-source rather than a blanket depth increase, because the gaps are
+   *  per-source: Hacker News is capped by a 365-day window and GitHub by taking
+   *  only the 60 newest issues, and lifting both on every run would re-fetch
+   *  years of history nightly to find the handful of rows that changed. */
+  dig?: string;
   /** Aborted when someone cancels this scan. */
   signal?: AbortSignal;
 }
@@ -49,6 +56,9 @@ export const isDeep = (): boolean => context.getStore()?.depth === 'deep';
 
 /** Which languages this run searches in, beyond English. */
 export const runLanguages = (): string[] => context.getStore()?.languages ?? [];
+
+/** The source this run was asked to dig into, if any. */
+export const digging = (): string | undefined => context.getStore()?.dig;
 
 /** Thrown at a checkpoint so a cancelled run unwinds like any other failure,
  *  then is recognised and reported as a cancellation rather than an error. */
