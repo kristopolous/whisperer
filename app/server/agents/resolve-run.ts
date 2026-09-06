@@ -9,7 +9,7 @@
 
 import type { Subject } from '../../shared/types.ts';
 import { braveSearch } from '../search.ts';
-import { cleanName, hostOf, looksLikeHost } from '../../shared/name.ts';
+import { absoluteUrl, cleanName, hostOf, looksLikeHost } from '../../shared/name.ts';
 import { resolveAgent } from './resolve.ts';
 import { runAgent } from './runtime.ts';
 
@@ -41,6 +41,31 @@ async function repoFacts(input: string): Promise<Record<string, unknown> | null>
   } catch {
     return null;
   }
+}
+
+/** Strip exclusions that would filter out the subject itself. */
+function dropSelfExclusions(
+  subject: Subject,
+  emit: (level: 'info' | 'warn', text: string) => void,
+): string[] {
+  const words = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const names = [subject.name, subject.searchTerm, ...(subject.aliases ?? [])]
+    .map(words)
+    .filter(Boolean);
+
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  for (const term of subject.excludeTerms ?? []) {
+    const needle = words(term);
+    if (!needle) continue;
+    const swallows = names.some((name) => name.includes(needle) || needle.includes(name));
+    (swallows ? dropped : kept).push(term);
+  }
+
+  if (dropped.length) {
+    emit('warn', `ignoring exclusion(s) that would filter out the subject itself: ${dropped.join(', ')}`);
+  }
+  return kept;
 }
 
 /** What the input is, settled once so nothing downstream has to guess. */
@@ -88,7 +113,58 @@ export async function resolveSubject(
       timeoutMs: 120_000,
     });
 
+    // Facts win over judgement about the same field.
+    //
+    // The homepage and the clone URL are stated by the host's API, and were
+    // already in the evidence above — but they were being handed to the model
+    // and then read back out of its answer, so a model that simply omitted one
+    // lost it. That is what happened to crawl4ai: GitHub says
+    // `homepage: https://crawl4ai.com`, the resolver returned `site: ''`, and
+    // every stage downstream ran without a site. This file's own opening
+    // paragraph says the host should be trusted for this; now it is.
+    //
+    // Only blanks are filled, not disagreements. A `homepage` pointing at a
+    // docs host when the model named the product site is a judgement worth
+    // keeping — but an empty answer is never better than a stated fact.
     const resolved: Subject = { ...subject, input: raw };
+    // A bare host is not a URL, and everything downstream treats this as one.
+    resolved.site = absoluteUrl(resolved.site);
+
+    // An exclusion must not swallow the subject.
+    //
+    // Resolving bolt.new produced `searchTerm: "Bolt.new"` with
+    // `excludeTerms: ["bolt"]` — meaning "not the Chevrolet, not the fastener",
+    // which is a reasonable thought and a ruinous instruction. Every downstream
+    // filter drops a mention whose title contains an excluded word, so "Bolt
+    // keeps burning credits" was thrown away for naming the product. The scan
+    // came back with 614 mentions where its peers found 1000.
+    //
+    // The test is containment either way: a term is unusable if the brand
+    // contains it or it contains the brand. "chevrolet" is a fine exclusion for
+    // Bolt; "bolt" is not.
+    resolved.excludeTerms = dropSelfExclusions(resolved, emit);
+    if (facts) {
+      const homepage = String(facts.homepage ?? facts.web_url ?? '').trim();
+      const clone = String(facts.clone_url ?? facts.http_url_to_repo ?? raw).trim();
+      if (homepage) {
+        if (!resolved.site) {
+          resolved.site = homepage;
+          emit('info', `site taken from the repository's own metadata: ${homepage}`);
+        }
+      } else if (resolved.site) {
+        // The host was asked and said there is no homepage. That is an answer,
+        // and it beats a guess: resolving `hangman-test-1` produced
+        // `https://yourhomework.net`, a real and entirely unrelated site, which
+        // the crawler then dutifully read for the company's social accounts.
+        // A repository with no homepage has no homepage.
+        emit('warn', `ignoring "${resolved.site}" — the repository lists no homepage, so there is nothing to crawl`);
+        resolved.site = '';
+      }
+      if (!resolved.repo && clone) resolved.repo = clone;
+      if (resolved.site && homepage && resolved.site !== homepage) {
+        emit('info', `note: the repository lists ${homepage} as its homepage, resolved as ${resolved.site}`);
+      }
+    }
     emit(
       'info',
       `resolved "${raw}" to ${resolved.name} (${resolved.kind}, ${resolved.confidence} confidence)`
@@ -101,14 +177,24 @@ export async function resolveSubject(
     // the old way — which is what every scan did before this agent existed.
     emit('warn', `could not resolve the subject — ${error instanceof Error ? error.message.slice(0, 100) : 'error'}`);
     const fallbackName = facts ? String(facts.name ?? cleanName(raw)) : cleanName(raw);
+    // A repository URL is a repository URL whether or not anything answered.
+    //
+    // This used to be `facts ? clone_url : ''`, so when both the model and the
+    // host's API had a bad minute, a scan of an unmistakable GitHub URL came
+    // back with no repository at all — and everything that needs one silently
+    // did nothing: no tracker issues ingested, nothing to diagnose, nothing to
+    // fork. The string was right there the whole time.
+    const looksLikeRepo = /(^|\/\/)(www\.)?(github\.com|gitlab\.[a-z0-9.-]+|bitbucket\.org)\/[^/]+\/[^/]+/i.test(raw);
     return {
       input: raw,
       name: fallbackName,
       searchTerm: fallbackName,
       aliases: [],
       excludeTerms: [],
-      site: facts ? String(facts.homepage ?? '') : looksLikeHost(raw) ? raw : '',
-      repo: facts ? String(facts.clone_url ?? facts.http_url_to_repo ?? raw) : '',
+      site: absoluteUrl(facts ? String(facts.homepage ?? '') : looksLikeHost(raw) && !looksLikeRepo ? raw : ''),
+      repo: facts
+        ? String(facts.clone_url ?? facts.http_url_to_repo ?? raw)
+        : looksLikeRepo ? raw : '',
       kind: 'unknown',
       summary: '',
       confidence: 'low',

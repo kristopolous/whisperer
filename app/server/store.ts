@@ -3,17 +3,42 @@ import path from 'node:path';
 import type { Scan } from '../shared/types.ts';
 
 /** Scans are kept as one JSON file. The dashboard needs history across restarts,
- *  and at this volume a database would be ceremony. */
-const FILE = path.resolve(import.meta.dirname, '../../data/scans.json');
+ *  and at this volume a database would be ceremony.
+ *
+ *  Overridable so the tests can exercise the real module against a throwaway
+ *  file. Testing a copy of this code would test the copy. */
+const FILE = process.env.WHISPERER_SCANS
+  ? path.resolve(process.env.WHISPERER_SCANS)
+  : path.resolve(import.meta.dirname, '../../data/scans.json');
 
 let scans: Scan[] = load();
 
 function load(): Scan[] {
+  let stored: Scan[];
   try {
-    return JSON.parse(readFileSync(FILE, 'utf8')) as Scan[];
+    stored = JSON.parse(readFileSync(FILE, 'utf8')) as Scan[];
   } catch {
     return [];
   }
+
+  // Nothing is running at process start, whatever the file says. A scan is
+  // marked `running` for as long as its stream is open, so a restart mid-run —
+  // a crash, a file watcher, someone closing the terminal — leaves a record
+  // that claims to be in progress forever. It then sits at the top of the rail
+  // with a spinner on it, and the stage rerun offers to resume a stream that
+  // has been dead since last week.
+  //
+  // So say what actually happened: it was interrupted. The collected data is
+  // kept, because a run that got through four stages is still worth reading.
+  for (const scan of stored) {
+    if (scan.status === 'running') {
+      scan.status = 'error';
+      scan.error ??= 'Interrupted — the server stopped while this run was in progress.';
+      scan.errorKind ??= 'interrupted';
+      scan.failedStage ??= scan.stage;
+    }
+  }
+  return stored;
 }
 
 function flush() {
@@ -27,7 +52,7 @@ const SECOND_LEVEL = /\.(co\.uk|com\.au|co\.nz|co\.in|com\.br|co\.jp|com\.mx|org
 /** A canonical grouping key for a scan's subject, so "supabase", "supabase.com"
  *  and "https://www.supabase.com/" all collapse to the same company. Keyed off
  *  the resolved site when we have one, else the raw company string. */
-function companyKey(scan: Scan): string {
+export function companyKey(scan: Scan): string {
   // A fixture is its own company, whatever it is named after. It carries the
   // real company's name and site by design — it is built on top of a real
   // scan — so keying it normally makes it collide with that company, and its
@@ -126,6 +151,22 @@ function summarize({ mentions, issues, abuse, log, ...rest }: Scan) {
 
 export const get = (id: string) => scans.find((s) => s.id === id);
 
+/** Every run of the same company, oldest first.
+ *
+ *  The rail collapses a company's runs to one row, which is right for choosing
+ *  what to look at and wrong for everything else: the earlier runs are still
+ *  there, and they are the only reason the current one means anything. This is
+ *  how the series gets at them. */
+export function history(id: string): Scan[] {
+  const target = get(id);
+  if (!target) return [];
+  const key = companyKey(target);
+  if (!key) return [target];
+  return scans
+    .filter((scan) => companyKey(scan) === key)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
 /* --------------------------------------------------------- one writer ---
  *
  *  A scan is written by whoever is running it, and a stage takes minutes. Two
@@ -165,6 +206,12 @@ export function release(id: string, what: string) {
 /** How long the current holder has had it, for the message the loser gets. */
 export const heldFor = (held: Claim) => Math.round((Date.now() - held.since) / 1000);
 
+/** Write a whole scan record.
+ *
+ *  For creating a record, and for a run persisting the object it is building.
+ *  To change a few fields on an existing scan, use `patch` — see the note
+ *  there, because putting a snapshot you have been holding is how updates get
+ *  lost. */
 export function put(scan: Scan) {
   const index = scans.findIndex((s) => s.id === scan.id);
   if (index === -1) scans.unshift(scan);
@@ -197,8 +244,30 @@ export function remove(id: string): string[] {
   return [...ids];
 }
 
+/** Change some fields on a scan, in place.
+ *
+ *  In place, and this is the whole point of the function. There is one object
+ *  per scan in memory and `get` hands it out, so a stage that has been running
+ *  for four minutes is mutating the same object a request handler just read.
+ *  That shared identity is what keeps them from clobbering each other, and
+ *  spreading into a copy breaks it: the copy replaces the array slot, the long
+ *  run keeps writing to the object it still holds, and the next `put(scan)` it
+ *  does puts the pre-patch record back. The change disappears with no error
+ *  anywhere — which is precisely the bug this used to have, since it was
+ *  written as `put({ ...scan, ...changes })`.
+ *
+ *  So: assign onto the stored object and flush. Everyone holding it sees the
+ *  change, and nobody's later write reverts it.
+ *
+ *  This is not a substitute for the write lock above. Two runs on one scan
+ *  still must not overlap — field-level merging cannot fix a stale snapshot,
+ *  because a stale snapshot has stale values for every field it touches. This
+ *  fixes the smaller, commoner case: a short handler changing one thing while
+ *  something long is in flight. */
 export function patch(id: string, changes: Partial<Scan>) {
   const scan = get(id);
   if (!scan) return undefined;
-  return put({ ...scan, ...changes });
+  Object.assign(scan, changes);
+  flush();
+  return scan;
 }

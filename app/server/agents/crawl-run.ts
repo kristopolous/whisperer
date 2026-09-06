@@ -14,6 +14,7 @@
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { absoluteUrl } from '../../shared/name.ts';
 import type { Profile } from '../../shared/types.ts';
 import { cleanText } from '../../shared/html.ts';
 import { crawlAgent } from './crawl.ts';
@@ -87,8 +88,15 @@ export async function crawlSite(
   site: string,
   emit: (level: 'info' | 'warn', text: string) => void,
 ): Promise<{ profiles: Profile[]; notes: string; pagesRead: number }> {
-  const origin = originOf(site);
-  const queue = [canonical(site)];
+  // Belt and braces with the resolver, which now normalises this. A bare host
+  // reaching `new URL` here threw ERR_INVALID_URL and cost a scan its entire
+  // read of the company's own website — the kind of failure that is invisible
+  // because the fallback to search still returns something.
+  const url0 = absoluteUrl(site);
+  if (!url0) throw new Error(`not a site to crawl: ${JSON.stringify(site)}`);
+
+  const origin = originOf(url0);
+  const queue = [canonical(url0)];
   const visited = new Set<string>();
   const found = new Map<string, Profile>();
   let notes = '';

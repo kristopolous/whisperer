@@ -28,5 +28,6 @@ Only report things you actually retrieved from a connector result — no invente
   schema: feedSchema,
   connectors: ['youtube', 'bright-data', 'x', 'exa', 'tiktok', 'brave'],
   effort: 'high',
+  needsTools: true,
   inPipeline: false,
 };

@@ -1,7 +1,7 @@
 import type { Scan, Stage } from '../../../shared/types.ts';
 import { counts, fmtAgo, fmtScore } from '../lib.ts';
 
-export type OverviewTab = 'presence' | 'discovery' | 'health' | 'integrity';
+export type OverviewTab = 'presence' | 'discovery' | 'defects' | 'integrity';
 
 /** The headline figures for a whole scan — presence, discussion, issues,
  *  integrity and sentiment. Kept above the tabs so the summary is always on
@@ -32,7 +32,7 @@ export function StatCards({
   /** Run the stage that would fill an empty card. */
   onRun: (which: Stage) => void;
 }) {
-  const profiles = scan.profiles ?? [];
+  // Presence is no longer a card here; the tab and the header indicator carry it.
   const mentions = scan.mentions ?? [];
   const issues = scan.issues ?? [];
   const abuse = scan.abuse ?? [];
@@ -86,16 +86,12 @@ export function StatCards({
     /** Whether there is a real answer to show. */
     ready: boolean;
   }[] = [
-    {
-      key: 'presence',
-      label: 'Presence',
-      value: String(profiles.length),
-      unit: profiles.length === 1 ? 'channel' : 'channels',
-      line: `${profiles.filter((p) => p.official).length} official · ${profiles.filter((p) => !p.official).length} unofficial`,
-      tone: 'mid',
-      from: 'presence',
-      ready: profiles.length > 0,
-    },
+    /* Presence used to lead this row and does not belong there. It is not a
+       result — nobody watches a company to learn that it has nine channels —
+       it is the list of places to go and look, and it changes about as often
+       as the company's own website does. The count still shows in the header
+       indicator and the tab itself; what it stopped doing is occupying the
+       first of four cards that are meant to say how things are going. */
     {
       key: 'discovery',
       label: 'Discussion',
@@ -134,12 +130,13 @@ export function StatCards({
       ready: classified,
     },
     {
-      key: 'health',
+      key: 'defects',
       label: 'Issues',
       value: String(issues.length),
       unit: issues.length === 1 ? 'issue' : 'issues',
       line: critical ? `${critical} critical — ready to file` : 'nothing critical',
       tone: critical ? 'neg' : 'mid',
+      // The stage is still called `health`; only the tab was renamed.
       from: 'health',
       ready: done('health'),
     },
@@ -238,7 +235,8 @@ export function StatCards({
  *  so the card and the console agree about what is happening. */
 const WAITING_ON: Record<Stage, string> = {
   queued: 'the queue',
-  presence: 'finding accounts',
+  subject: 'working out what was typed',
+  presence: 'finding where to look',
   discovery: 'searching for discussion',
   feed: 'the feed',
   buzz: 'scoring sentiment',

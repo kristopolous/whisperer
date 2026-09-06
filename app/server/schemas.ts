@@ -137,9 +137,18 @@ export const buzzSchema = {
         type: 'array',
         items: {
           type: 'object',
-          required: ['url', 'sentiment', 'score'],
+          // Keyed by index, not by URL.
+          //
+          // Copying a URL back is the single most expensive thing this schema
+          // can ask for and buys nothing: a Reddit permalink is ninety
+          // characters of transcription per item, in both the prompt and the
+          // reply, and one mistyped character silently loses that item's score.
+          // The topics schema learned this already; buzz did not, and it is why
+          // batches of eight were overflowing the output cap while batches of
+          // four barely fit.
+          required: ['index', 'sentiment', 'score'],
           properties: {
-            url: { type: 'string' },
+            index: { type: 'integer', description: 'The index number the item was given' },
             sentiment: { type: 'string', enum: ['positive', 'mixed', 'neutral', 'negative'] },
             score: {
               type: 'number',
@@ -219,6 +228,75 @@ export const migrationsSchema = {
             quote: { type: 'string', description: "The author's own sentence establishing the move, copied exactly" },
             reason: { type: 'string', description: 'Why they moved, in a few words. Empty string if unstated.' },
             confidence: { type: 'string', enum: ['high', 'low'] },
+          },
+        },
+      },
+    },
+  },
+} as const;
+
+/** Whether each item reports a fault. Index-keyed for the same reason the
+ *  topics schema is: copying text back is slow and the copy is never exact. */
+export const subjectMatchSchema = {
+  name: 'subject_match',
+  schema: {
+    type: 'object',
+    required: ['verdict'],
+    properties: {
+      verdict: {
+        type: 'array',
+        items: {
+          type: 'object',
+          // Order is the point, again. `topic` is required before `same` so the
+          // model says what the item is about on its own terms BEFORE it is
+          // asked to compare that with the subject. Asked the other way round
+          // it has been handed the conclusion and goes looking for a way to
+          // agree — which is how a Helldivers thread about the Bolt Pistol
+          // becomes a bolt.new complaint.
+          required: ['index', 'topic', 'same'],
+          properties: {
+            index: { type: 'integer', description: 'The index of the item being judged' },
+            topic: {
+              type: 'string',
+              description:
+                'What this item is about, in a few words, described without reference to the '
+                + 'subject you were given. Name the actual thing being discussed.',
+            },
+            same: {
+              type: 'boolean',
+              description: 'True when the topic you just described is the same thing as the subject',
+            },
+          },
+        },
+      },
+    },
+  },
+} as const;
+
+export const complaintsSchema = {
+  name: 'complaints',
+  schema: {
+    type: 'object',
+    required: ['verdict'],
+    properties: {
+      verdict: {
+        type: 'array',
+        items: {
+          type: 'object',
+          // Order is the point. `evidence` is required before `isProblem` so
+          // the quote is generated before the judgement rather than after it —
+          // a verdict produced first is a guess the model then rationalises,
+          // which is how a release announcement gets called a complaint.
+          required: ['index', 'evidence', 'isProblem'],
+          properties: {
+            index: { type: 'integer', description: 'The index of the item being judged' },
+            evidence: {
+              type: 'string',
+              description:
+                'The words from the item, copied exactly, that show something is wrong. '
+                + 'Empty string when there are none.',
+            },
+            isProblem: { type: 'boolean', description: 'True when it reports something wrong with the software' },
           },
         },
       },
@@ -402,8 +480,15 @@ export const healthSchema = {
             impact: { type: 'string', description: 'What the user hits, in their words' },
             evidence: {
               type: 'array',
-              items: { type: 'string' },
-              description: 'URLs of the mentions that back this up',
+              items: { type: 'integer' },
+              // Index numbers, not URLs. Asking a model to copy a URL back is
+              // asking it to transcribe ninety characters of Reddit permalink
+              // exactly, and a single altered character produces an id that
+              // resolves to nothing — so the issue renders with no readable
+              // source and looks unsupported. An index is one token, and a
+              // wrong one is out of range and can be discarded loudly instead
+              // of quietly mis-attributing somebody's complaint.
+              description: 'Index numbers of the items that back this up',
             },
             draftReply: {
               type: 'string',

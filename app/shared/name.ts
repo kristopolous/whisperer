@@ -23,11 +23,46 @@ export function looksLikeHost(raw: string): boolean {
   return /^https?:\/\//i.test(value) || /^[\w-]+(\.[\w-]+)+(\.|\/|$)/.test(value);
 }
 
+/** Code-hosting sites, where the useful name is in the path rather than the
+ *  host. Every repository on GitHub shares one hostname. */
+const CODE_HOSTS = /(^|\.)(github\.com|gitlab\.[a-z0-9.-]+|bitbucket\.org|codeberg\.org|git\.sr\.ht|gitea\.[a-z0-9.-]+)$/i;
+
+/** "https://github.com/ggml-org/llama.cpp" → "llama.cpp".
+ *
+ *  A repository URL names its project in the path, and reducing it to the host
+ *  gives "Github" — which is what every repository pasted into the box was
+ *  called until the resolver got round to it, and what the run was still called
+ *  in the runs rail afterwards. The path is right immediately and for free, so
+ *  there is no reason to show a wrong name while waiting on a model.
+ *
+ *  Returned verbatim, not title-cased: a repository name is written the way its
+ *  author wrote it, and "Llama.cpp" is not that. */
+export function repoName(raw: string): string | null {
+  const value = raw.trim();
+  if (!looksLikeHost(value)) return null;
+  if (!CODE_HOSTS.test(hostOf(value))) return null;
+
+  const path = value
+    .replace(/^https?:\/\//i, '')
+    .split(/[?#]/)[0]!
+    .split('/')
+    .slice(1)
+    .filter(Boolean);
+
+  // owner/repo. One segment is a user or organisation page, which names a
+  // person rather than a project.
+  if (path.length < 2) return null;
+  return path[1]!.replace(/\.git$/i, '') || null;
+}
+
 /** "https://www.example.co.uk/" → "Example". A plain phrase ("Acme Inc") is
  *  passed through unchanged. */
 export function cleanName(raw: string): string {
   const value = raw.trim();
   if (!looksLikeHost(value)) return value;
+
+  const repo = repoName(value);
+  if (repo) return repo;
 
   const host = hostOf(value);
   let cleaned = host;
@@ -39,6 +74,21 @@ export function cleanName(raw: string): string {
     .split(/[-_]/)
     .map((part) => part ? part[0].toUpperCase() + part.slice(1) : part)
     .join(' ');
+}
+
+/** A host with a scheme on the front, so it can be given to `new URL`.
+ *
+ *  The resolver returns whatever the model wrote, and for replit it wrote
+ *  `replit.com` where for gimp and bolt it wrote full URLs. The crawl agent
+ *  called `new URL('replit.com')`, which throws — so that scan silently fell
+ *  back to search and read none of the company's own site, over a missing
+ *  eight characters. Empty stays empty: nothing is not a URL. */
+export function absoluteUrl(raw: string): string {
+  const value = (raw ?? '').trim();
+  if (!value) return '';
+  if (/^https?:\/\//i.test(value)) return value;
+  if (!looksLikeHost(value)) return '';
+  return `https://${value.replace(/^\/+/, '')}`;
 }
 
 /** The raw input kept as the clickable site, if it looks like a host. */

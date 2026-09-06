@@ -21,5 +21,6 @@ export const siteAgent: AgentDefinition = {
   schema: siteSchema,
   connectors: ['bright-data', 'brave'],
   effort: 'low',
+  needsTools: true,
   inPipeline: false,
 };

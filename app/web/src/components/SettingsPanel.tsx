@@ -118,7 +118,32 @@ const READINESS_TAG: Record<ChannelState['readiness'], string> = {
  *  thing that needs it, so it is entered there. */
 type ConnectorRole = 'search' | 'scrape' | 'contact' | 'ticket' | 'exec';
 
-interface RoleInfo { id: ConnectorRole; label: string; uses: string; wired: boolean }
+interface ChainEntry {
+  id: string;
+  label: string;
+  kind: 'built-in' | 'mcp';
+  usable: boolean;
+  problem?: string;
+  hosts?: string[];
+}
+
+interface RoleInfo {
+  id: ConnectorRole;
+  label: string;
+  uses: string;
+  wired: boolean;
+  chain: ChainEntry[];
+}
+
+interface ProviderInfo {
+  id: string;
+  label: string;
+  description: string;
+  kind: 'built-in' | 'mcp';
+  likely: ConnectorRole[];
+  missing: string[];
+  bound: ConnectorRole[];
+}
 
 interface Inspection {
   reachable: boolean;
@@ -199,6 +224,221 @@ function CredentialFields({
   );
 }
 
+interface CreditRow {
+  provider: string;
+  unit: 'dollars' | 'requests';
+  granted?: number;
+  spent: number;
+  remaining: number | null;
+}
+
+/** What is left of each provider's free allowance.
+ *
+ *  Retrieval is what this product costs, and while it is being demoed the
+ *  introductory grants are the entire budget. Four vendor consoles is where
+ *  that number lived; this is it on one screen, next to the chain that decides
+ *  which of them gets asked first.
+ *
+ *  An allowance nobody has entered reads as unknown, not as zero — the chain
+ *  treats it as unlimited, because refusing to search on the strength of a
+ *  number nobody supplied would be the tool inventing a limit. */
+function Credits() {
+  const [rows, setRows] = useState<CreditRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api<CreditRow[]>('api/credits').then(setRows).catch((e) => setError(String(e)));
+  }, []);
+
+  const save = async (provider: string, changes: Record<string, unknown>) => {
+    try {
+      const data = await api<{ credits: CreditRow[] }>(`api/credits/${provider}`, {
+        method: 'PUT', body: JSON.stringify(changes),
+      });
+      setRows(data.credits);
+      setError(null);
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, ''));
+    }
+  };
+
+  const money = (row: CreditRow, n: number) =>
+    (row.unit === 'dollars' ? `$${n.toFixed(2)}` : n.toLocaleString());
+
+  return (
+    <div className="panel">
+      <div className="set-head">
+        <strong>Credit</strong>
+        <span className="tag plain">what the searching costs</span>
+      </div>
+      <p className="set-desc">
+        Every paid request is counted here as it happens, and a provider with nothing left is
+        skipped rather than asked — an exhausted account answers with a refusal that still costs a
+        round trip. Correct a figure by typing what the provider&apos;s own console says; the tally
+        drifts whenever a response is lost.
+      </p>
+
+      {error && <div className="set-message err" style={{ padding: '0 16px 10px' }}>{error}</div>}
+
+      <div className="conn-list">
+        {rows?.map((row) => {
+          const out = row.remaining !== null && row.remaining <= 0;
+          const low = row.remaining !== null && row.granted ? row.remaining / row.granted < 0.15 : false;
+          return (
+            <div className="conn-row" key={row.provider}>
+              <span className="conn-dot" data-run={out ? 'failed' : low ? 'running' : 'ok'} />
+              <span className="conn-name">{row.provider}</span>
+              <span className="conn-meta">
+                {row.granted === undefined
+                  ? `${money(row, row.spent)} used · no allowance recorded`
+                  : `${money(row, row.remaining ?? 0)} left of ${money(row, row.granted)}`}
+              </span>
+              <label className="conn-meta">
+                allowance{' '}
+                <input
+                  type="number"
+                  defaultValue={row.granted ?? ''}
+                  style={{ width: 84 }}
+                  onBlur={(e) => save(row.provider, {
+                    granted: e.target.value === '' ? null : Number(e.target.value),
+                  })}
+                />
+              </label>
+              <label className="conn-meta">
+                used{' '}
+                <input
+                  type="number"
+                  defaultValue={row.spent}
+                  style={{ width: 84 }}
+                  onBlur={(e) => save(row.provider, { spent: Number(e.target.value) })}
+                />
+              </label>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+interface ScheduleEntry {
+  id: string;
+  input: string;
+  cadence: 'daily' | 'weekly';
+  hour: number;
+  enabled: boolean;
+  deep?: boolean;
+  lastRunAt?: string;
+  lastScanId?: string;
+  lastOutcome?: 'done' | 'error' | 'cancelled';
+  lastError?: string;
+  lastFound?: { mentions: number; issues: number };
+  nextRunAt: string | null;
+}
+
+/** What runs on its own, and what happened last time it did.
+ *
+ *  The last column is the point. A schedule that only says when it will fire
+ *  next cannot tell you it has been firing into a wall all week, and an
+ *  automation nobody can see failing is worse than no automation. */
+function Schedule() {
+  const [entries, setEntries] = useState<ScheduleEntry[] | null>(null);
+  const [input, setInput] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    api<{ entries: ScheduleEntry[] }>('api/schedule')
+      .then((data) => setEntries(data.entries))
+      .catch((e) => setError(String(e)));
+  }, []);
+  useEffect(load, [load]);
+
+  const save = async (body: Record<string, unknown>) => {
+    try {
+      const data = await api<{ entries: ScheduleEntry[] }>('api/schedule', {
+        method: 'PUT', body: JSON.stringify(body),
+      });
+      setEntries(data.entries);
+      setError(null);
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, ''));
+    }
+  };
+
+  const drop = async (id: string) => {
+    const data = await api<{ entries: ScheduleEntry[] }>(`api/schedule/${id}`, { method: 'DELETE' });
+    setEntries(data.entries);
+  };
+
+  const when = (iso?: string | null) =>
+    (iso ? new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—');
+
+  return (
+    <div className="panel">
+      <div className="set-head">
+        <strong>Schedule</strong>
+        <span className="tag plain">runs while this server is up</span>
+      </div>
+      <p className="set-desc">
+        Reputation is a series, and a series needs observations taken without somebody remembering
+        to take them. Each run here is a new record rather than an overwrite, so the defects panel
+        can say what is new since yesterday. It runs inside this process — stop the server and
+        nothing fires.
+      </p>
+
+      {error && <div className="set-message err" style={{ padding: '0 16px 10px' }}>{error}</div>}
+
+      <div className="conn-list">
+        {entries?.map((entry) => (
+          <div className="conn-row" key={entry.id}>
+            <span className="conn-dot" data-run={entry.lastOutcome === 'error' ? 'failed' : entry.enabled ? 'ok' : 'idle'} />
+            <span className="conn-name">{entry.input}</span>
+            <select
+              value={entry.cadence}
+              onChange={(e) => save({ ...entry, cadence: e.target.value })}
+            >
+              <option value="daily">daily</option>
+              <option value="weekly">weekly</option>
+            </select>
+            <select value={entry.hour} onChange={(e) => save({ ...entry, hour: Number(e.target.value) })}>
+              {Array.from({ length: 24 }, (_, h) => (
+                <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+              ))}
+            </select>
+            <label className="conn-meta">
+              <input type="checkbox" checked={Boolean(entry.deep)} onChange={(e) => save({ ...entry, deep: e.target.checked })} />
+              {' '}deep
+            </label>
+            <label className="conn-meta">
+              <input type="checkbox" checked={entry.enabled} onChange={(e) => save({ ...entry, enabled: e.target.checked })} />
+              {' '}on
+            </label>
+            <span className="conn-meta">
+              next {when(entry.nextRunAt)} · last {when(entry.lastRunAt)}
+              {entry.lastFound && ` — ${entry.lastFound.mentions} mentions, ${entry.lastFound.issues} defects`}
+              {entry.lastOutcome === 'error' && ` — failed: ${(entry.lastError ?? '').slice(0, 80)}`}
+            </span>
+            <button className="ghost" onClick={() => drop(entry.id)}>remove</button>
+          </div>
+        ))}
+        {entries?.length === 0 && <div className="conn-row"><span className="q">Nothing is scheduled.</span></div>}
+      </div>
+
+      <div className="actions" style={{ padding: '10px 16px 14px' }}>
+        <input
+          value={input}
+          placeholder="bolt.new"
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && input.trim()) { save({ input: input.trim() }); setInput(''); } }}
+        />
+        <button className="ghost" disabled={!input.trim()} onClick={() => { save({ input: input.trim() }); setInput(''); }}>
+          Watch this
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function SettingsPanel({ onClose }: { onClose?: () => void }) {
 
   const [connectors, setConnectors] = useState<ConnectorStatus[] | null>(null);
@@ -218,9 +458,37 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
   const [channels, setChannels] = useState<ChannelState[] | null>(null);
   const [sources, setSources] = useState<SourceState[] | null>(null);
   const [roleInfo, setRoleInfo] = useState<RoleInfo[]>([]);
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [roleMessage, setRoleMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+
+  const loadRoles = useCallback(async () => {
+    try {
+      const data = await api<{ roles: RoleInfo[]; providers: ProviderInfo[] }>('api/roles');
+      setRoleInfo(data.roles);
+      setProviders(data.providers);
+    } catch {
+      setRoleInfo([]);
+      setProviders([]);
+    }
+  }, []);
+
+  /** Write a role's chain back. The array is the whole membership in priority
+   *  order, so this is both "reorder" and "add/remove". */
+  const saveChain = useCallback(async (role: ConnectorRole, chain: string[]) => {
+    setRoleMessage(null);
+    try {
+      const data = await api<{ roles: RoleInfo[]; providers: ProviderInfo[] }>(`api/roles/${role}`, {
+        method: 'PUT', body: JSON.stringify({ chain }),
+      });
+      setRoleInfo(data.roles);
+      setProviders(data.providers);
+      setRoleMessage({ kind: 'ok', text: 'Saved — it takes effect on the next request.' });
+    } catch (error) {
+      setRoleMessage({ kind: 'err', text: String(error).replace(/^Error:\s*/, '').slice(0, 240) });
+    }
+  }, []);
   /** Tool list for the row being bound, keyed by connector name. */
   const [inspection, setInspection] = useState<Record<string, Inspection>>({});
-  const [draftRolesFor, setDraftRolesFor] = useState<Record<string, ConnectorRole[]>>({});
   const [draftBindings, setDraftBindings] = useState<Record<string, Partial<Record<ConnectorRole, { tool: string; arg: string }>>>>({});
   const [addOpen, setAddOpen] = useState(false);
   const [newServer, setNewServer] = useState({ name: '', url: '', description: '' });
@@ -242,14 +510,10 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
 
   const saveRoles = async (name: string) => {
     try {
-      const roles = draftRolesFor[name] ?? [];
-      const bindings = Object.fromEntries(
-        Object.entries(draftBindings[name] ?? {}).filter(([role]) => roles.includes(role as ConnectorRole)),
-      );
       setConnectors(await api<ConnectorStatus[]>(`api/connectors/${encodeURIComponent(name)}`, {
-        method: 'PUT', body: JSON.stringify({ roles, bindings }),
+        method: 'PUT', body: JSON.stringify({ bindings: draftBindings[name] ?? {} }),
       }));
-      setKeyMessage({ kind: 'ok', text: 'Roles saved — they take effect on the next scan.' });
+      setKeyMessage({ kind: 'ok', text: 'Bindings saved — they take effect on the next request.' });
     } catch (error) {
       setKeyMessage({ kind: 'err', text: String(error).replace(/^Error:\s*/, '').slice(0, 240) });
     }
@@ -342,11 +606,11 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
     api<Credential[]>('api/credentials').then(setCredentials).catch(() => setCredentials(null));
     api<ChannelState[]>('api/channels').then(setChannels).catch(() => setChannels(null));
     api<SourceState[]>('api/sources').then(setSources).catch(() => setSources(null));
-    api<RoleInfo[]>('api/roles').then(setRoleInfo).catch(() => setRoleInfo([]));
+    void loadRoles();
     api<Health>('api/health').then(setHealth).catch(() => setHealth(null));
     api<Inference>('api/inference').then(applyInference).catch(() => setInference(null));
     refreshConnectors();
-  }, [refreshConnectors, applyInference]);
+  }, [refreshConnectors, applyInference, loadRoles]);
 
   const selectHost = (key: string) => {
     const host = inference?.hosts.find((h) => h.key === key);
@@ -521,6 +785,35 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
         <p>The connectors this instance reads from, the channels it can write to, and where inference runs.</p>
       </div>
 
+      <Credits />
+      <Schedule />
+
+      <div className="panel">
+        <div className="set-head">
+          <strong>Role chains</strong>
+          <span className="tag plain">who does what, in what order</span>
+        </div>
+        <p className="set-desc">
+          Each role is a list of providers tried in order, first choice first — drag to reorder. This
+          is where priority lives: when the provider at the top runs out of credits or goes down, the
+          next one answers. A provider can be first choice for one role and third for another, and
+          anything can go in any role.
+        </p>
+        {roleMessage && (
+          <div className={`set-message ${roleMessage.kind}`} style={{ padding: '0 16px 10px' }}>{roleMessage.text}</div>
+        )}
+        <div className="chain-list-wrap">
+          {roleInfo.map((role) => (
+            <RoleChain
+              key={role.id}
+              role={role}
+              providers={providers}
+              onChange={(chain) => void saveChain(role.id, chain)}
+            />
+          ))}
+        </div>
+      </div>
+
       <div className="panel">
         <div className="set-head">
           <strong>MCP connectors</strong>
@@ -669,9 +962,7 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
                         roleInfo={roleInfo}
                         inspection={inspection[c.name]}
                         onInspect={() => inspect(c.name)}
-                        roles={draftRolesFor[c.name] ?? c.roles ?? []}
                         bindings={draftBindings[c.name] ?? {}}
-                        setRoles={(next) => setDraftRolesFor((cur) => ({ ...cur, [c.name]: next }))}
                         setBindings={(next) => setDraftBindings((cur) => ({ ...cur, [c.name]: next }))}
                         onSave={() => saveRoles(c.name)}
                         onRemove={() => removeServer(c.name)}
@@ -1077,61 +1368,48 @@ export function SettingsPanel({ onClose }: { onClose?: () => void }) {
   );
 }
 
-/** Give a server a job, and say which of its tools does it.
+/** Say which of a server's tools does each job it has been given.
  *
- *  Two steps rather than one because they fail differently. Choosing a role is
- *  a statement of intent and cannot really be wrong. Binding a tool can be, and
- *  wrongly — a query passed in the wrong argument is answered by most servers
- *  with something plausible and empty, which looks like "nobody is talking
- *  about this product" rather than like a misconfiguration. So the tool and the
- *  argument are both shown, both editable, and both taken from what the server
- *  actually declared rather than typed from memory.
+ *  Only the binding now. Which roles a server is *in*, and in what order, is
+ *  decided on the role chains above — a set of checkboxes scattered across
+ *  collapsed connector rows could express membership but never priority, and
+ *  priority is the whole reason to have more than one provider for a job.
+ *
+ *  Binding stays here because it is a fact about this server rather than about
+ *  the ordering: which tool, and what its argument is called. Both are shown
+ *  and both are editable, because a tool bound to the wrong role fails loudly
+ *  while a query passed in the wrong argument does not — most servers answer
+ *  that with something plausible and empty.
  */
 function RoleEditor({
-  connector, roleInfo, inspection, onInspect, roles, bindings, setRoles, setBindings, onSave, onRemove,
+  connector, roleInfo, inspection, onInspect, bindings, setBindings, onSave, onRemove,
 }: {
   connector: ConnectorStatus;
   roleInfo: RoleInfo[];
   inspection?: Inspection;
   onInspect: () => void;
-  roles: ConnectorRole[];
   bindings: Partial<Record<ConnectorRole, { tool: string; arg: string }>>;
-  setRoles: (next: ConnectorRole[]) => void;
   setBindings: (next: Partial<Record<ConnectorRole, { tool: string; arg: string }>>) => void;
   onSave: () => void;
   onRemove: () => void;
 }) {
-  const toggle = (role: ConnectorRole) => {
-    const next = roles.includes(role) ? roles.filter((r) => r !== role) : [...roles, role];
-    setRoles(next);
-    // Fetching the tool list is what makes binding possible, and wanting to
-    // bind is exactly what ticking a role means.
-    if (!inspection && !roles.includes(role)) onInspect();
-    if (!roles.includes(role) && inspection?.suggested[role] && !bindings[role]) {
-      setBindings({ ...bindings, [role]: inspection.suggested[role]! });
-    }
-  };
+  const roles = connector.roles ?? [];
 
   return (
     <div style={{ marginBottom: 14 }}>
-      <span className="cred-field-head"><code>roles</code></span>
-      <p className="cred-what">
-        What this server is for. A role is what the pipeline dispatches on, so ticking one is the
-        whole of putting this server to work — nothing else has to be changed.
-      </p>
+      <span className="cred-field-head"><code>tool bindings</code></span>
 
-      <div className="actions" style={{ flexWrap: 'wrap' }}>
-        {(roleInfo.length ? roleInfo : []).map((info) => (
-          <button
-            key={info.id}
-            className={roles.includes(info.id) ? 'primary' : ''}
-            title={info.uses}
-            onClick={() => toggle(info.id)}
-          >
-            {info.label}{info.wired ? '' : ' (nothing reads this yet)'}
-          </button>
-        ))}
-      </div>
+      {roles.length === 0 ? (
+        <p className="cred-what">
+          This server is not in any role chain, so nothing calls it. Put it in one under{' '}
+          <b>Role chains</b> above, then come back to say which of its tools does the job.
+        </p>
+      ) : (
+        <p className="cred-what">
+          In {roles.map((r) => roleInfo.find((i) => i.id === r)?.label ?? r).join(' and ')}. Bind the
+          tool that does each job — a member with nothing bound is skipped, however high it sits.
+        </p>
+      )}
 
       {roles.length > 0 && (
         <>
@@ -1141,10 +1419,7 @@ function RoleEditor({
             </div>
           )}
           {inspection && !inspection.reachable && (
-            <p className="conn-err">
-              Could not read its tools: {inspection.error}. The roles can still be saved; bind the
-              tools once it answers.
-            </p>
+            <p className="conn-err">Could not read its tools: {inspection.error}</p>
           )}
           {inspection?.reachable && (
             <div className="set-grid">
@@ -1196,11 +1471,122 @@ function RoleEditor({
       )}
 
       <div className="set-actions">
-        <button className="primary" onClick={onSave}>Save roles</button>
+        {roles.length > 0 && <button className="primary" onClick={onSave}>Save bindings</button>}
         <button className="ghost" onClick={onRemove} title={`Remove ${connector.name} from the config`}>
           Remove this server
         </button>
       </div>
+    </div>
+  );
+}
+
+/** One role's providers, in the order they are tried.
+ *
+ *  An ordered list rather than a set of checkboxes, because the ordering is the
+ *  setting that matters. "Who can search" was never the interesting question;
+ *  "who is asked first when the first choice is out of credits" is, and a set
+ *  cannot express it. Position one is the whole chain most days.
+ *
+ *  Drag to reorder, with arrows beside it. The arrows are not a fallback for
+ *  browsers without drag — they are for anyone using a keyboard, and for the
+ *  ordinary case of nudging one row past another, which is fiddlier to drag
+ *  than to click.
+ */
+function RoleChain({
+  role, providers, onChange,
+}: {
+  role: RoleInfo;
+  providers: ProviderInfo[];
+  onChange: (chain: string[]) => void;
+}) {
+  const [dragging, setDragging] = useState<string | null>(null);
+  const [over, setOver] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+
+  const ids = role.chain.map((e) => e.id);
+  const absent = providers.filter((p) => !ids.includes(p.id));
+
+  const drop = (onto: string) => {
+    if (!dragging || dragging === onto) return;
+    const next = ids.filter((id) => id !== dragging);
+    next.splice(next.indexOf(onto), 0, dragging);
+    onChange(next);
+    setDragging(null);
+    setOver(null);
+  };
+
+  return (
+    <div className="chain">
+      <div className="chain-head">
+        {/* Name and action on their own line, description under it. Sharing one
+            row put a sentence beside a heading and made both hard to scan —
+            the eye wants the role names as a column it can run down. */}
+        <div className="chain-title">
+          <strong>{role.label}</strong>
+          <span className="chain-count">
+            {role.chain.length === 0 ? 'nobody' : role.chain.length === 1 ? '1 provider' : `${role.chain.length} providers`}
+          </span>
+          <button className="ghost" onClick={() => setAdding(!adding)} disabled={absent.length === 0}>
+            {adding ? 'Cancel' : '+ Add'}
+          </button>
+        </div>
+        <p className="chain-uses">{role.uses}</p>
+      </div>
+
+      {role.chain.length === 0 ? (
+        <p className="chain-empty">
+          Nothing serves this role, so the pipeline skips it entirely.
+        </p>
+      ) : (
+        <div className="chain-list">
+          {role.chain.map((entry, index) => (
+            <div
+              key={entry.id}
+              className={`chain-row${dragging === entry.id ? ' dragging' : ''}${over === entry.id ? ' over' : ''}`}
+              draggable
+              onDragStart={() => setDragging(entry.id)}
+              onDragEnd={() => { setDragging(null); setOver(null); }}
+              onDragOver={(e) => { e.preventDefault(); setOver(entry.id); }}
+              onDrop={(e) => { e.preventDefault(); drop(entry.id); }}
+            >
+              <span className="chain-rank">{index + 1}</span>
+              <span className="chain-grip" aria-hidden>⠿</span>
+              <span className="chain-name">
+                {entry.label}
+                <span className="tag plain">{entry.kind}</span>
+                {/* A provider at the front of the chain that cannot run is the
+                    single most misleading state here: the list says it goes
+                    first and it is silently skipped. */}
+                {entry.hosts && (
+                  <span className="conn-meta">{entry.hosts.join(', ')} only</span>
+                )}
+                {!entry.usable && <span className="conn-err"> {entry.problem}</span>}
+              </span>
+              <button className="chain-remove ghost" title={`Take ${entry.label} out of ${role.label}`}
+                onClick={() => onChange(ids.filter((id) => id !== entry.id))}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Names only. This was a bulleted list with a description, a "looks
+          right" badge and a missing-credentials badge per row — an explanation
+          of every provider, restated inside every role, when the connector list
+          below already says what each one is. The question being asked here is
+          just "which one", so it is a row of names. */}
+      {adding && (
+        <div className="chain-add">
+          {absent.map((p) => (
+            <button
+              key={p.id}
+              className="ghost"
+              onClick={() => { onChange([...ids, p.id]); setAdding(false); }}
+            >
+              {p.id}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

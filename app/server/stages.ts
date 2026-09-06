@@ -1,4 +1,4 @@
-import type { Scan, ScanEvent, Stage } from '../shared/types.ts';
+import type { ErrorKind, Scan, ScanEvent, Stage } from '../shared/types.ts';
 import {
   buildBuzz, findAbuse, findFeed, findIssues, findMentions, findMigrations, findPresence,
   groupTopics, netSentiment, resolveSite, scoreBuzz, type Log,
@@ -9,6 +9,7 @@ import { resolveSubject } from './agents/resolve-run.ts';
 import { findReviewScores } from './reviews.ts';
 import { brandToken } from '../shared/name.ts';
 import * as store from './store.ts';
+import { applyOverrides } from './presence-overrides.ts';
 
 export interface StageCtx {
   scan: Scan;
@@ -16,11 +17,16 @@ export interface StageCtx {
   send: (event: ScanEvent) => void;
   /** Fires when the run is cancelled, so the slow work inside can stop. */
   signal?: AbortSignal;
+  /** False when the subject must be resolved from scratch rather than reused.
+   *  Set when somebody reruns the subject stage deliberately — the only reason
+   *  to do that is that the stored answer is wrong. */
+  reuseSubject?: boolean;
 }
 
 export const STAGE_LABELS: Record<Stage, string> = {
   queued: 'queued',
-  presence: 'finding accounts',
+  subject: 'working out what was typed',
+  presence: 'finding where to look',
   discovery: 'searching for discussion',
   feed: 'streaming the latest videos and comments',
   buzz: 'scoring sentiment',
@@ -35,7 +41,7 @@ export const STAGE_LABELS: Record<Stage, string> = {
 export function explainFailure(
   stage: Stage,
   raw: string,
-): { message: string; detail: string; kind: 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'other' } {
+): { message: string; detail: string; kind: ErrorKind } {
   const detail = raw;
   const lower = raw.toLowerCase();
 
@@ -116,22 +122,63 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
   // Everything below runs inside this context, so an agent fired anywhere down
   // the call tree is attributed to this scan and stage without the stage
   // functions having to carry the ids around in their signatures.
-  return withRunContext({ scanId: scan.id, stage: next, signal: ctx.signal }, async () => {
+  // Depth rides on the scan rather than on the call, so a stage rerun digs
+  // exactly as hard as the run it belongs to without the caller restating it.
+  return withRunContext(
+    { scanId: scan.id, stage: next, depth: scan.depth, languages: scan.languages, signal: ctx.signal },
+    async () => {
     try {
       // Before the stage does anything. Cancelling between stages is the cheap
       // case: nothing is half-written and whatever the previous stages produced
       // is already persisted.
       throwIfCancelled();
       switch (next) {
-      case 'presence': {
+      case 'subject': {
         // Settle what the input actually is, before thirty searches quote it.
-        const subject = await resolveSubject(scan.input || scan.subject?.input || scan.company, log);
+        //
+        // Reused when it is already known and the input has not changed. This
+        // is a model call and a search to answer a question whose answer does
+        // not move — "bolt.new" resolved to Bolt.new yesterday and resolves to
+        // Bolt.new today — and a daily run should not pay for it. Rerunning
+        // this stage on its own forces a fresh resolution, which is the escape
+        // hatch for when the first one was wrong.
+        const asked = scan.input || scan.subject?.input || scan.company;
+        const reusable = ctx.reuseSubject !== false
+          && scan.subject
+          && scan.subject.input === asked
+          && scan.subject.confidence !== 'low';
+        const subject = reusable
+          ? scan.subject!
+          : await resolveSubject(asked, log);
+        if (reusable) {
+          log('info', `reusing the resolved subject: ${subject.name} (${subject.kind})`);
+        }
         scan.subject = subject;
         if (subject.name) scan.company = subject.name;
-        scan.site = subject.site || await resolveSite(subject.searchTerm || scan.company, log);
+        // A repository with no homepage is not a website to go looking for.
+        //
+        // This used to fall through to a web search for any subject without a
+        // site, which for `hangman-test-1` returned yourhomework.net — a real,
+        // entirely unrelated site that the crawler then read for the company's
+        // social accounts. The repository host was asked and said there is no
+        // homepage; searching anyway is overriding an answer with a guess.
+        scan.site = subject.site
+          || (subject.repo ? '' : await resolveSite(subject.searchTerm || scan.company, log));
         send({ type: 'patch', scan: { subject, company: scan.company, site: scan.site } });
+        break;
+      }
+      case 'presence': {
         log('info', `mapping ${scan.company}'s footprint (site + web sweep)`);
-        scan.profiles = await findPresence(scan.company, scan.site, log);
+        const crawled = await findPresence(scan.company, scan.site, log);
+        // Corrections last, so a channel somebody removed stays removed and one
+        // they added survives a re-crawl. The footprint decides where discovery
+        // looks, so this is editing an input rather than an output.
+        scan.profiles = applyOverrides(store.companyKey(scan), crawled);
+        const removed = crawled.length - scan.profiles.filter((p) => crawled.some((c) => c.url === p.url)).length;
+        const added = scan.profiles.length - (crawled.length - removed);
+        if (removed || added) {
+          log('info', `footprint corrections: ${removed} blocked, ${added} added by hand`);
+        }
         log('info', `footprint: ${scan.profiles.length} channels (${scan.profiles.filter((p) => p.official).length} official, ${scan.profiles.filter((p) => !p.official).length} unofficial)`);
         send({ type: 'patch', scan: { profiles: scan.profiles } });
         break;

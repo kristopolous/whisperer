@@ -54,6 +54,71 @@ export async function assertWritable(owner: string, repo: string): Promise<void>
       + `Fork it first, or point ticketing.github at ${me}/${repo}.`,
     );
   }
+
+  // The name matching is not enough on its own, because a repository path is
+  // not a stable identity. GitHub answers a transferred repository's OLD path
+  // with 301 Moved Permanently, and `fetch` follows redirects by default — so
+  // after somebody moves `me/thing` into an organisation, `me/thing` still
+  // resolves, to a repository that is no longer theirs. Every check above would
+  // pass and every write would land on the organisation's copy.
+  //
+  // So ask what the path actually resolves to, and compare the owner GitHub
+  // reports rather than the one we were handed.
+  const token = secret('GITHUB_TOKEN');
+  if (!token) throw new Error('no GITHUB_TOKEN — set it in Settings before writing anything');
+
+  const response = await fetch(`${API}/repos/${owner}/${repo}`, {
+    headers: headers(token),
+    // Do not follow. A redirect here is the whole thing being guarded against.
+    redirect: 'manual',
+    signal: AbortSignal.timeout(20_000),
+  });
+
+  if (response.status >= 300 && response.status < 400) {
+    throw new Error(
+      `refusing to write to ${owner}/${repo}: that path redirects somewhere else, `
+      + 'which means the repository was moved or renamed. Point at its current path.',
+    );
+  }
+  if (!response.ok) throw new Error(`cannot read ${owner}/${repo} (${response.status})`);
+
+  const actual = ((await response.json()) as { owner?: { login?: string } }).owner?.login ?? '';
+  if (actual.toLowerCase() !== me.toLowerCase()) {
+    throw new Error(
+      `refusing to write to ${owner}/${repo}: GitHub says it belongs to ${actual}, not ${me}.`,
+    );
+  }
+}
+
+/** Turn the fork's issue tracker on.
+ *
+ *  A fork is created with Issues DISABLED — GitHub's default, on the reasoning
+ *  that bugs belong on the upstream project. That is usually right and is
+ *  exactly wrong here: the fork's tracker is where this writes its record of
+ *  what it read, what it tried and what the tests said, precisely so that none
+ *  of it lands on somebody else's project. Without this the whole investigation
+ *  completes and then fails at the last step with
+ *  `410: Issues has been disabled in this repository`.
+ *
+ *  Never throws. A fork we cannot enable issues on is still a fork we can push
+ *  a branch to, and losing the patch because the ledger had nowhere to go would
+ *  be the wrong trade. */
+async function enableIssues(
+  fullName: string, token: string, emit: (level: 'info' | 'warn', text: string) => void,
+): Promise<void> {
+  try {
+    const response = await fetch(`${API}/repos/${fullName}`, {
+      method: 'PATCH',
+      headers: { ...headers(token), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ has_issues: true }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) {
+      emit('warn', `could not enable issues on ${fullName} (${response.status}) — the record will have nowhere to go`);
+    }
+  } catch {
+    emit('warn', `could not enable issues on ${fullName} — the record will have nowhere to go`);
+  }
 }
 
 export interface Fork {
@@ -97,8 +162,16 @@ export async function ensureFork(
 
   // Already ours? Nothing to do — and if the upstream IS ours, that is the
   // repository, not something to fork.
-  const existing = await fetch(`${API}/repos/${fullName}`, { headers: headers(token), signal: AbortSignal.timeout(20_000) });
+  const existing = await fetch(`${API}/repos/${fullName}`, {
+    headers: headers(token),
+    // Same reason as assertWritable: a moved repository's old path still
+    // answers, and following that redirect would report somebody else's
+    // repository as our existing fork.
+    redirect: 'manual',
+    signal: AbortSignal.timeout(20_000),
+  });
   if (existing.ok) {
+    await enableIssues(fullName, token, emit);
     emit('info', `using existing fork ${fullName}`);
     return { owner: me, repo: source.repo, fullName, url: `https://github.com/${fullName}`, upstream: `${source.owner}/${source.repo}`, createdNow: false };
   }
@@ -119,6 +192,7 @@ export async function ensureFork(
     await new Promise((r) => setTimeout(r, 2_000));
     const check = await fetch(`${API}/repos/${fullName}`, { headers: headers(token), signal: AbortSignal.timeout(20_000) });
     if (check.ok) {
+      await enableIssues(fullName, token, emit);
       emit('info', `fork ready at ${fullName}`);
       return { owner: me, repo: source.repo, fullName, url: `https://github.com/${fullName}`, upstream: `${source.owner}/${source.repo}`, createdNow: true };
     }

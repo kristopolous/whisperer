@@ -37,6 +37,51 @@ const startsWith = (prefix: string, label: string) => (value: string) =>
   value.startsWith(prefix) ? `this looks like ${label}` : null;
 
 export const CREDENTIAL_HINTS: Record<string, CredentialHint> = {
+  PERPLEXITY_API_KEY: {
+    what: 'Perplexity search API key. Fifty results per request and a recency filter, so a scan needs far fewer requests than a twenty-per-page engine.',
+    url: 'https://www.perplexity.ai/account/api/keys',
+    billingUrl: 'https://www.perplexity.ai/account/api/billing',
+    where: 'perplexity.ai → Settings → API',
+    secret: true,
+    looksWrong: (v) => (v.startsWith('pplx-') ? null : 'a Perplexity key normally starts with pplx-'),
+  },
+  JULES_API_KEY: {
+    what: 'Google Jules API key. Hands a diagnosed defect to Jules, which reads the repository and opens a pull request on your fork. Free tier is 15 tasks a day.',
+    url: 'https://jules.google.com/settings',
+    billingUrl: 'https://jules.google.com/settings',
+    where: 'jules.google.com → Settings → API keys',
+    secret: true,
+  },
+  DAYTONA_API_KEY: {
+    what: 'Daytona API key. Runs patched checkouts and their test suites in a disposable cloud sandbox rather than on this machine.',
+    url: 'https://app.daytona.io/dashboard/keys',
+    billingUrl: 'https://app.daytona.io/dashboard/billing',
+    where: 'app.daytona.io → Keys',
+    secret: true,
+  },
+  PARALLEL_API_KEY: {
+    what: 'Parallel Search API key. Ranks against a natural-language objective rather than keywords, and dates most of what it returns.',
+    url: 'https://platform.parallel.ai',
+    billingUrl: 'https://platform.parallel.ai',
+    where: 'platform.parallel.ai → API keys',
+    secret: true,
+  },
+  ANDI_API_KEY: {
+    what: 'Andi Search API key. Up to a hundred results per request, date ranges and domain filters as real parameters, and a per-query cost reported on every response.',
+    url: 'https://console.andiai.com/signup',
+    billingUrl: 'https://console.andiai.com',
+    where: 'console.andiai.com → API keys',
+    secret: true,
+    looksWrong: (v) => (v.startsWith('ak-') ? null : 'an Andi key normally starts with ak-'),
+  },
+  YDC_API_KEY: {
+    what: 'you.com Search API key. Web and news results in one request, with a recency filter and real pagination. A new account starts with $100 of credit.',
+    url: 'https://you.com/platform',
+    billingUrl: 'https://you.com/platform',
+    where: 'you.com → Platform → API keys',
+    secret: true,
+    looksWrong: (v) => (v.startsWith('ydc-') ? null : 'a you.com key normally starts with ydc-'),
+  },
   BRAVE_API_KEY: {
     what: 'Brave Search API subscription token. The only credential general search needs.',
     url: 'https://api-dashboard.search.brave.com/app/keys',

@@ -15,11 +15,14 @@
  *  works against github.com and Enterprise alike with one fine-grained token.
  */
 
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { Issue, LoopEvent, Scan } from '../../shared/types.ts';
 import { assertWritable } from './fork.ts';
 import { channelsConfig } from './index.ts';
 
 const ACCEPT = 'application/vnd.github+json';
+const run = promisify(execFile);
 
 export class GithubNotConfigured extends Error {}
 
@@ -207,6 +210,90 @@ export interface OpenedPr {
   number: number;
   url: string;
   branch: string;
+}
+
+/** Push a working copy's changes to the fork as a branch, then open the pull
+ *  request from it.
+ *
+ *  The alternative — and what this replaces — was committing file by file
+ *  through the Contents API, which the old comment justified by noting that the
+ *  work copy was a clone of UPSTREAM with no remote of ours. Now that the copy
+ *  is a clone of the fork, that reason is gone, and the API walk's limits are
+ *  not worth keeping: it cannot express a deletion or a rename, it re-uploads
+ *  whole files for a one-line change, and it needs a round trip per file.
+ *
+ *  The token is put on the remote for the length of the push and taken off
+ *  again. It is never written to the repository's config, so it cannot leak
+ *  into a later `git remote -v` or a stray commit.
+ */
+export async function pushBranch(
+  scan: Scan,
+  workdir: string,
+  branch: string,
+  message: string,
+  emit: (level: 'info' | 'warn', text: string) => void,
+): Promise<void> {
+  const target = github(scan);
+  await assertWritable(target.owner, target.repo);
+  if (!target.token) throw new GithubNotConfigured('no GitHub token to push with');
+
+  const git = (...args: string[]) => run('git', ['-C', workdir, ...args], { timeout: 300_000 });
+
+  await git('checkout', '-B', branch);
+  await git('add', '-A');
+  // `-c` rather than global config: the identity is for this commit, not for
+  // the machine.
+  await git('-c', 'user.name=whisperer', '-c', 'user.email=whisperer@localhost',
+    'commit', '-m', message, '--allow-empty');
+
+  const authed = `https://x-access-token:${target.token}@github.com/${target.owner}/${target.repo}.git`;
+  try {
+    await run('git', ['-C', workdir, 'push', '--force', authed, `HEAD:refs/heads/${branch}`], {
+      timeout: 300_000,
+    });
+  } catch (error) {
+    // Never let the token reach a log line or an error the dashboard renders.
+    const why = error instanceof Error ? error.message.replaceAll(target.token, '***') : 'push failed';
+    throw new Error(`could not push to ${target.owner}/${target.repo}: ${why.slice(0, 200)}`);
+  }
+  emit('info', `pushed ${branch} to ${target.owner}/${target.repo}`);
+}
+
+/** Open a pull request from a branch that is already on the fork.
+ *
+ *  Separate from pushing it. The branch gets there by `git push` now — see
+ *  pushBranch — so this is only the API call that turns it into a pull request,
+ *  and it is idempotent: a second run on the same branch finds the open one
+ *  rather than failing on a duplicate. */
+export async function createPullRequest(
+  scan: Scan,
+  branch: string,
+  title: string,
+  body: string,
+  emit: (level: 'info' | 'warn', text: string) => void,
+): Promise<OpenedPr> {
+  const target = github(scan);
+  await assertWritable(target.owner, target.repo);
+
+  const repo = await call<{ default_branch: string }>(target, '');
+  const base = repo.default_branch;
+
+  const open = await call<{ number: number; html_url: string }[]>(
+    target, `/pulls?head=${target.owner}:${branch}&state=open`,
+  );
+  if (open.length) {
+    emit('info', `pull request #${open[0]!.number} already open for ${branch}`);
+    return { number: open[0]!.number, url: open[0]!.html_url, branch };
+  }
+
+  // Against the FORK's own default branch, never the upstream's. A pull
+  // request that notified the real maintainers is the one thing this whole
+  // arrangement exists to prevent.
+  const pr = await call<{ number: number; html_url: string }>(target, '/pulls', {
+    title, body, head: branch, base,
+  });
+  emit('info', `pull request #${pr.number} opened on ${target.owner}/${target.repo}`);
+  return { number: pr.number, url: pr.html_url, branch };
 }
 
 export async function openPullRequest(

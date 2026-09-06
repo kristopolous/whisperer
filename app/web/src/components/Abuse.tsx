@@ -28,9 +28,15 @@ const KIND_ORDER: ReviewKind[] = ['software', 'customer', 'app', 'employer'];
 function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
   if (reviews.length === 0) return null;
 
-  const groups = KIND_ORDER
-    .map((kind) => ({ kind, scores: reviews.filter((r) => r.kind === kind) }))
-    .filter((g) => g.scores.length > 0);
+  // One grid, ordered by audience rather than split into a section per
+  // audience.
+  //
+  // A section each meant the layout depended on how the scores happened to
+  // divide: Lovable has three, one per audience, so every "row" held a single
+  // card and the three-column grid did nothing. The audience still matters —
+  // a company can be loved by software buyers and hated by its own staff —
+  // but it belongs on the card, not in the page structure.
+  const ordered = KIND_ORDER.flatMap((kind) => reviews.filter((r) => r.kind === kind));
 
   return (
     <div className="panel">
@@ -44,36 +50,32 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
         the sentence it came from.
       </p>
 
-      {groups.map((group) => (
-        <div key={group.kind} className="score-group">
-          <span className="score-kind">{KIND_LABEL[group.kind]}</span>
-          <div className="score-row">
-            {group.scores.map((r) => {
-              const share = r.rating / r.scale;
-              return (
-                <a
-                  key={r.site + r.url}
-                  className="score"
-                  href={r.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  title={r.quote}
-                  data-tone={share >= 0.8 ? 'good' : share >= 0.6 ? 'mid' : 'bad'}
-                >
-                  <span className="score-site">{r.site}</span>
-                  <span className="score-value">
-                    {r.rating}<span className="score-scale">/{r.scale}</span>
-                  </span>
-                  <span className="score-meta">
-                    {r.count ? `${r.count.toLocaleString()} reviews` : 'count not stated'}
-                    {!r.firstParty && ' · quoted'}
-                  </span>
-                </a>
-              );
-            })}
-          </div>
-        </div>
-      ))}
+      <div className="score-row">
+        {ordered.map((r) => {
+          const share = r.rating / r.scale;
+          return (
+            <a
+              key={r.site + r.url}
+              className="score"
+              href={r.url}
+              target="_blank"
+              rel="noreferrer"
+              title={r.quote}
+              data-tone={share >= 0.8 ? 'good' : share >= 0.6 ? 'mid' : 'bad'}
+            >
+              <span className="score-kind">{KIND_LABEL[r.kind]}</span>
+              <span className="score-site">{r.site}</span>
+              <span className="score-value">
+                {r.rating}<span className="score-scale">/{r.scale}</span>
+              </span>
+              <span className="score-meta">
+                {r.count ? `${r.count.toLocaleString()} reviews` : 'count not stated'}
+                {!r.firstParty && ' · quoted'}
+              </span>
+            </a>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -91,7 +93,9 @@ export function Abuse({ scan, onStatus }: { scan: Scan; onStatus: (finding: Abus
     if (findings.length && !findings.some((f) => f.id === selected)) setSelected(findings[0].id);
   }, [scan.id, findings.length]);
 
-  if (findings.length === 0) {
+  // See the note in Health: this must test the unfiltered list, or a query
+  // that matches nothing takes the filter away with the rows.
+  if (allFindings.length === 0) {
     return (
       <>
         <Scorecard reviews={scan.reviews ?? []} />
@@ -121,6 +125,7 @@ export function Abuse({ scan, onStatus }: { scan: Scan; onStatus: (finding: Abus
             showing={findings.length}
             total={allFindings.length}
           />
+          {findings.length === 0 && <div className="dash-empty">Nothing matches “{query}”.</div>}
           {findings.map((f) => (
             <button
               key={f.id}

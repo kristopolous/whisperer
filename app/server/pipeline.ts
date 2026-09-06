@@ -5,7 +5,7 @@ import type {
   Stage, Subject, TopicPoint, Venue,
 } from '../shared/types.ts';
 import { brandToken } from '../shared/name.ts';
-import { repoFor } from './repos.ts';
+import { projectFor } from './repos.ts';
 import { fetchUpstreamIssues } from './upstream.ts';
 import { searchHackerNews } from './sources/hackernews.ts';
 import { searchGithubIssues } from './sources/github-issues.ts';
@@ -14,9 +14,14 @@ import { searchReddit } from './reddit.ts';
 import { crawlSite } from './agents/crawl-run.ts';
 import { fetchAll } from './content.ts';
 import { runAgent } from './agents/runtime.ts';
+import { isDeep, runLanguages } from './run-context.ts';
+import { resolveReporter } from './reporter.ts';
+import { enabledLanguages, queriesFor } from './languages.ts';
 import { abuseAgent } from './agents/abuse.ts';
 import { buzzAgent } from './agents/buzz.ts';
 import { healthAgent } from './agents/health.ts';
+import { complaintsAgent } from './agents/complaints.ts';
+import { subjectMatchAgent } from './agents/subject-match.ts';
 import { migrationsAgent } from './agents/migrations.ts';
 import { topicsAgent } from './agents/topics.ts';
 import { verdictAgent } from './agents/verdict.ts';
@@ -308,6 +313,18 @@ const RECENT_MONTHS = 12;
  *  minute more, and going wider is a plan question, not a code one. */
 const SEARCH_PAGES = Number(process.env.SEARCH_PAGES ?? 6);
 
+/** What a deep run multiplies the volume caps by.
+ *
+ *  Deliberately applied to the caps and not to the page count. Paging deeper is
+ *  the lever that does not work: measured here, going from three pages to six
+ *  raised the raw count by about a sixth, because the same thirty queries were
+ *  competing for the same results. What actually limits the corpus is that the
+ *  recency ladder stops the moment it has enough — on Bolt.new it settled on
+ *  "last month" with 426 results and never looked further back — and that the
+ *  finished list is then cut to a cap. Deep lifts both. */
+const DEEP_FACTOR = Number(process.env.DEEP_FACTOR ?? 4);
+const deeper = (n: number) => (isDeep() ? n * DEEP_FACTOR : n);
+
 /** How many results discovery wants before it stops widening its window. */
 const DISCOVERY_TARGET = Number(process.env.DISCOVERY_TARGET ?? 400);
 
@@ -360,9 +377,16 @@ function rankByDiscussionThenRecency(a: SearchHit, b: SearchHit): number {
  *
  *  Silent and empty when there is no repository for this company — most scans
  *  are of products whose source nobody here has. */
-async function upstreamMentions(company: string, site: string, emit: Emit): Promise<Mention[]> {
-  const repo = repoFor(company);
-  const source = repo?.tracker ?? repo?.url;
+async function upstreamMentions(
+  company: string, site: string, emit: Emit, subject?: Subject,
+): Promise<Mention[]> {
+  // What a person specified wins; what the resolver found is the fallback.
+  //
+  // This used to read config/repos.json and nothing else, so a scan that had
+  // successfully worked out a company's repository still ingested no tracker
+  // issues unless somebody had also written it into a config file by hand —
+  // discovery answered the question and the answer went unused.
+  const source = projectFor(company, { repo: subject?.repo }).effective.tracker;
   if (!source) return [];
 
   try {
@@ -371,6 +395,276 @@ async function upstreamMentions(company: string, site: string, emit: Emit): Prom
     emit('warn', `tracker lookup failed — ${error instanceof Error ? error.message.slice(0, 100) : 'error'}`);
     return [];
   }
+}
+
+/** Read the items the complaint vocabulary could not place, and flag the ones
+ *  that report a real fault.
+ *
+ *  Runs only when it can change something. The flag exists to guarantee
+ *  complaint-shaped items a share of the model's reading budget, so once that
+ *  share is already full, finding more candidates changes nothing and costs
+ *  minutes. Measured on r/GIMP: the widened vocabulary flagged 49 of 159 and
+ *  this pass added 9 — worth having when a corpus looks quiet, never worth
+ *  running first.
+ */
+/** A third of the reading budget. Below this the pass is worth its minutes;
+ *  above it, more candidates than slots is not a problem worth paying to have. */
+const complaintShare = () => Math.floor(SCORE_BUDGET / 3);
+
+/** Did this come from the product's own subreddit, where the topic is settled? */
+const fromOwnCommunity = (m: Mention) => (m.themes ?? []).some((t) => t.startsWith('r/'));
+const TRIAGE_BATCH = 30;
+/** How many unplaced items to read at most. Each batch is about twenty seconds
+ *  of local model time, so this is the ceiling on what the pass can cost. */
+const TRIAGE_CAP = Number(process.env.COMPLAINT_TRIAGE_CAP ?? 90);
+
+/* ------------------------------------------------- subject disambiguation --*/
+
+const SUBJECT_BATCH = 30;
+
+/** How many ambiguous items to read at most.
+ *
+ *  Tied to the scoring budget rather than picked, because that is the slice
+ *  that gets used: everything past it is collected and listed but never read,
+ *  so a wrong-subject item sitting in the tail costs a row in Discovery and
+ *  nothing else. The corpus is already ranked, and the ambiguous list keeps
+ *  that order, so this reads the ambiguous items that are actually going to be
+ *  scored and triaged.
+ *
+ *  It matters more than it looks. On GIMP, 84% of a thousand mentions carry
+ *  only the bare name — "gimp" is a search for motorbike parts as often as an
+ *  image editor — so a fixed cap of a hundred would have left most of the
+ *  scored slice unchecked. A function, not a const, because SCORE_BUDGET is
+ *  declared further down the file. */
+const subjectCap = () => Number(process.env.SUBJECT_MATCH_CAP ?? SCORE_BUDGET);
+
+/** Tokens whose presence settles the topic without asking anybody.
+ *
+ *  A name with a dot or a space in it is not hit by accident — "bolt.new",
+ *  "truefoundry.com" and "Bright Data" do not turn up in a thread about
+ *  fasteners. A bare word like "bolt", "gimp" or "lovable" does, constantly.
+ *  So the unambiguous forms decide the easy cases for nothing and the model is
+ *  paid only for the genuinely ambiguous remainder — the same division of
+ *  labour as the complaint vocabulary and its triage pass. */
+export function settlingTokens(company: string, site: string, subject?: Subject): string[] {
+  const host = site.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split('/')[0];
+  const names = [subject?.searchTerm ?? '', subject?.name ?? '', company, ...(subject?.aliases ?? [])];
+  return [...new Set([host, ...names])]
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t.length > 3 && (t.includes('.') || t.includes(' ')));
+}
+
+const compact = (text: string) => text.toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+/** The same names with the punctuation taken out, for matching against a URL.
+ *
+ *  Because a community names itself after the product without the punctuation.
+ *  138 of the 150 "ambiguous" Bolt.new mentions were from r/boltnewbuilders —
+ *  posts like "I need to cancel my subscription" that are unmistakably about
+ *  the product and never once write its name, so every literal test misses them
+ *  and the model would have been paid to read a question it cannot answer from
+ *  the text either. Compacted, the URL says `boltnewbuilders` and the subject
+ *  says `boltnew`, and the answer is free.
+ *
+ *  Six characters, not four, and that is the whole safety margin: `gimp`
+ *  inside a URL would take r/gimpsuits with it, which is the exact collision
+ *  this pass exists to catch. Short bare names stay ambiguous and go to the
+ *  model, where they belong. */
+export function compactTokens(company: string, site: string, subject?: Subject): string[] {
+  const host = site.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split('/')[0];
+  const names = [subject?.searchTerm ?? '', subject?.name ?? '', company, host, ...(subject?.aliases ?? [])];
+  return [...new Set(names.map(compact))].filter((t) => t.length >= 6);
+}
+
+/** Drop mentions that are about something else with the same name.
+ *
+ *  Returns the corpus with the impostors removed. Never throws: a failed batch
+ *  leaves those items in, which is where they already were, and losing a whole
+ *  discovery run over a disambiguation pass would be a bad trade. */
+async function dropWrongSubject(
+  company: string, site: string, mentions: Mention[], emit: Emit, subject?: Subject,
+): Promise<Mention[]> {
+  const settling = settlingTokens(company, site, subject);
+  const compacted = compactTokens(company, site, subject);
+
+  const ambiguous = mentions.filter((m) => {
+    // Its own community already answers the topic question — everything in
+    // r/GIMP is about GIMP — so it is never worth paying to ask again.
+    if (fromOwnCommunity(m)) return false;
+    const text = `${m.title} ${m.excerpt} ${m.url}`.toLowerCase();
+    if (settling.some((token) => text.includes(token))) return false;
+    // The URL only, compacted. Running this over the body text would match
+    // across word boundaries and quietly settle things it should not.
+    const url = compact(m.url);
+    return !compacted.some((token) => url.includes(token));
+  });
+
+  if (ambiguous.length === 0) {
+    emit('info', `subject check: every mention names ${subject?.searchTerm ?? company} unambiguously`);
+    return mentions;
+  }
+
+  const reading = ambiguous.slice(0, subjectCap());
+  emit(
+    'info',
+    `subject check: ${mentions.length - ambiguous.length} name it outright, reading ${reading.length}`
+    + `${ambiguous.length > reading.length ? ` of ${ambiguous.length}` : ''} that could be something else`,
+  );
+
+  // What the model compares against. Assembled from the resolve step rather
+  // than from the raw input, because "what it is" is the half of the question
+  // a name cannot answer.
+  const described = [
+    `Subject: ${subject?.name || company}`,
+    subject?.kind && subject.kind !== 'unknown' ? `What it is: ${subject.kind}` : '',
+    subject?.summary ? `Description: ${subject.summary}` : '',
+    site ? `Its website: ${site}` : '',
+    subject?.aliases?.length ? `Also called: ${subject.aliases.join(', ')}` : '',
+    subject?.excludeTerms?.length
+      ? `Known to be confused with: ${subject.excludeTerms.join(', ')}` : '',
+  ].filter(Boolean).join('\n');
+
+  const wrong = new Set<Mention>();
+  for (let start = 0; start < reading.length; start += SUBJECT_BATCH) {
+    const batch = reading.slice(start, start + SUBJECT_BATCH);
+    try {
+      const result = await runAgent<{ verdict: { index: number; topic?: string; same: boolean }[] }>(subjectMatchAgent, {
+        prompt: `${described}\n\nItems:\n`
+          + batch.map((m, index) =>
+            // The URL included: a host and a slug say what a page is more
+            // reliably than a ranker's summary of it, and cost nothing.
+            `${index}: ${m.url}\n${`${m.title} ${m.excerpt}`.slice(0, 300).replace(/\s+/g, ' ')}`).join('\n'),
+        items: batch.length,
+        note: `ambiguous ${start + 1}–${start + batch.length}`,
+        timeoutMs: 180_000,
+      });
+      for (const verdict of result.verdict ?? []) {
+        const mention = batch[verdict.index];
+        if (!mention || verdict.same !== false) continue;
+        wrong.add(mention);
+        // Said out loud, with the topic the model gave it. A silent filter that
+        // removes a third of the corpus is indistinguishable from a search that
+        // found nothing, and this is the log line that tells them apart.
+        emit('info', `not this subject — "${mention.title.slice(0, 70)}" reads as ${verdict.topic || 'something else'}`);
+      }
+    } catch (error) {
+      emit('warn', `subject check batch failed — ${error instanceof Error ? error.message.slice(0, 100) : 'error'}`);
+    }
+  }
+
+  if (wrong.size === 0) {
+    emit('info', 'subject check: everything read was about this subject');
+    return mentions;
+  }
+  emit('warn', `subject check: dropped ${wrong.size} mention(s) about something else with the same name`);
+  return mentions.filter((m) => !wrong.has(m));
+}
+
+async function triageUnflagged(company: string, mentions: Mention[], emit: Emit): Promise<number> {
+  const flagged = mentions.filter((m) => m.complaint).length;
+  if (flagged >= complaintShare()) {
+    emit('info', `complaint triage skipped — ${flagged} already flagged, which fills the reading share`);
+    return 0;
+  }
+
+  // Only what the pattern could not place, and only things somebody wrote.
+  //
+  // The product's own subreddit goes first. Its topic is established — every
+  // post in r/GIMP is about GIMP — so the model is left with one question
+  // instead of two, and a budget spent there buys a judgement rather than a
+  // topicality check it would have had to make anyway.
+  const unplaced = mentions
+    .filter((m) => !m.complaint && (m.discussion ?? true) && m.excerpt.length > 40)
+    .sort((a, b) => Number(fromOwnCommunity(b)) - Number(fromOwnCommunity(a)))
+    .slice(0, TRIAGE_CAP);
+  if (unplaced.length === 0) return 0;
+
+  emit('info', `complaint triage: ${flagged} flagged by vocabulary, reading ${unplaced.length} more`);
+
+  // The post, not the snippet. This decides whether something is a complaint at
+  // all, and a search description is a truncated sentence chosen by a ranker —
+  // the fault is usually described in the paragraph after it. Cached, so the
+  // scoring stage that fetches the same URLs later pays nothing.
+  const bodies = await fetchAll(unplaced, (done, total, full) =>
+    emit('info', `complaint triage: fetched ${done}/${total} (${full} with full text)`));
+  const bodyOf = (mention: Mention) =>
+    (bodies.get(mention.url)?.text ?? mention.excerpt).slice(0, 700);
+
+  let found = 0;
+  let invented = 0;
+  for (let start = 0; start < unplaced.length; start += TRIAGE_BATCH) {
+    const batch = unplaced.slice(start, start + TRIAGE_BATCH);
+    try {
+      const result = await runAgent<{ verdict: { index: number; evidence?: string; isProblem: boolean }[] }>(complaintsAgent, {
+        prompt: `Product: "${company}".\n\n`
+          + batch.map((m, index) => {
+            // Saying where it came from is what lets the model stop asking
+            // whether the item is even about this product.
+            const origin = fromOwnCommunity(m) ? ' [own community]' : '';
+            return `${index}${origin}: ${m.url}\n${`${m.title} ${bodyOf(m)}`.replace(/\s+/g, ' ')}`;
+          }).join('\n'),
+        items: batch.length,
+        note: `unplaced ${start + 1}–${start + batch.length}`,
+        timeoutMs: 180_000,
+      });
+      for (const verdict of result.verdict ?? []) {
+        const mention = batch[verdict.index];
+        if (!mention || !verdict.isProblem) continue;
+        // The quote has to be real.
+        //
+        // Requiring evidence before the verdict is only worth something if the
+        // evidence is checked; otherwise it is a field the model can fill with
+        // anything and the ordering has bought nothing. Because the quote must
+        // be copied verbatim, this is a substring test — a claim the code can
+        // falsify, in the same spirit as running a new regression test against
+        // unpatched code before believing a fix.
+        if (!quotesTheSource(verdict.evidence, `${mention.title} ${mention.excerpt}`)) {
+          invented += 1;
+          continue;
+        }
+        mention.complaint = true;
+        found += 1;
+      }
+    } catch (error) {
+      // One failed batch leaves those items unflagged, which is the state they
+      // were already in. Never a reason to fail discovery.
+      emit('warn', `complaint triage batch failed — ${error instanceof Error ? error.message.slice(0, 100) : 'error'}`);
+    }
+  }
+
+  emit(
+    'info',
+    `complaint triage: ${found} more flagged by reading them`
+    + (invented ? `, ${invented} rejected for quoting words that are not in the post` : ''),
+  );
+  return found;
+}
+
+/** Does the model's quote actually occur in what it was reading?
+ *
+ *  Loose about whitespace and case, strict about the words. Models reflow a
+ *  quote — collapsing a newline, changing a curly apostrophe — without changing
+ *  what it says, and rejecting those would throw away good verdicts. Inventing
+ *  a sentence is a different thing entirely and this catches it.
+ *
+ *  A very short quote is not evidence of anything: "error" appears in plenty of
+ *  posts that are answering somebody else's error. */
+function quotesTheSource(evidence: string | undefined, source: string): boolean {
+  // Compared on words alone: letters, digits and single spaces.
+  //
+  // Punctuation is where a faithful quote drifts. A model reproducing
+  // `Missing "Open" preview window` as `Missing 'Open' preview window` has
+  // copied it correctly by any standard that matters, and an earlier version of
+  // this normalised curly quotes but not straight ones and threw that verdict
+  // away — rejecting a real fault report over a apostrophe. Inventing a
+  // sentence is a different thing entirely, and dropping punctuation does not
+  // help anyone do it.
+  const words = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const quote = words(evidence ?? '');
+  // A handful of characters is not evidence: "error" occurs in plenty of posts
+  // that are answering somebody else's error.
+  if (quote.length < 12) return false;
+  return words(source).includes(quote);
 }
 
 /** The subject's own repository as `owner/name`, so a source that searches all
@@ -382,6 +676,8 @@ function ownRepoOf(subject?: Subject): string | null {
   const [owner, repo] = path.split('/');
   return owner && repo ? `${owner}/${repo}` : null;
 }
+
+export { resetSearchBudget, searchSpend } from './search.ts';
 
 export async function findMentions(
   company: string, site: string, profiles: Profile[], emit: Emit, subject?: Subject,
@@ -419,7 +715,7 @@ export async function findMentions(
   //
   // Paging deeper mostly returns URLs the other queries already found: going
   // from three pages to six raised the raw count by about a sixth, because the
-  // same thirty queries were競 competing for the same results. Each new query
+  // same thirty queries were competing for the same results. Each new query
   // shape below reaches material none of the others do — a venue nobody else
   // searched, or a subject people discuss without ever writing "review".
   const generalQueries = [
@@ -575,12 +871,35 @@ export async function findMentions(
   // all.
   const onError = (query: string, message: string) => emit('warn', `search "${query}" failed — ${message}`);
 
+  // Other languages, when the scan asks for them.
+  //
+  // These go in with the complaint queries rather than the general ones,
+  // because they are complaint queries — the brand plus 崩溃, plus the venues
+  // where that argument happens. That also puts them in the unwindowed pass,
+  // which is right for the same reason it is right in English: a complaint
+  // does not stop being true because it was written last year.
+  const packs = enabledLanguages(runLanguages());
+  if (packs.length) {
+    const foreign = [...new Set(packs.flatMap((pack) => queriesFor(pack, brand, isDeep())))];
+    complaintQueries.push(...foreign);
+    emit('info', `also searching in ${packs.map((p) => p.label).join(', ')} — ${foreign.length} more queries`);
+  }
+
   emit('info', `${generalQueries.length} general + ${complaintQueries.length} complaint searches`);
 
   // The general pass chases recency: what is being said right now.
   const general = await searchWidening(
     generalQueries,
-    { count: 20, target: DISCOVERY_TARGET, pages: SEARCH_PAGES },
+    {
+      count: 20,
+      target: deeper(DISCOVERY_TARGET),
+      pages: SEARCH_PAGES,
+      // A deep run walks every rung to the end rather than stopping at the
+      // first one that satisfies the target. That is the whole difference:
+      // "last month had enough" is exactly how the last five years stayed
+      // invisible.
+      exhaustive: isDeep(),
+    },
     onError,
     (rung, total) => emit('info', `general: ${windowLabel(rung)} → ${total} results`),
   );
@@ -715,14 +1034,27 @@ export async function findMentions(
     // four people grumbling about a crash plus the filed bug describing it is
     // one issue with five pieces of evidence, and knowing a ticket already
     // exists changes what to do about it.
-    upstreamMentions(company, site, emit),
-    searchHackerNews(brand, emit, { days: 365, limit: 80 }).catch(() => []),
+    upstreamMentions(company, site, emit, subject),
+    // Algolia pages at 1,000 and charges nothing, so this is two requests for
+    // everything HN has said in a year. The classifier downstream is a regex,
+    // so a wider pool costs seconds of fetching and no judgement at all.
+    searchHackerNews(brand, emit, { days: 365 }).catch(() => []),
     searchGithubIssues(brand, emit, { ownRepo: ownRepoOf(subject), limit: 40 }).catch(() => []),
     findAppReviews(brand, site, emit, 60).catch(() => []),
     // Reddit through its own API rather than through `site:reddit.com`. Null
     // when there are no credentials, which is not an error — the search path
     // still covers reddit.com, just less deeply.
-    searchReddit([brand], emit, 25).then((found) => found ?? []).catch(() => []),
+    searchReddit([brand], emit, {
+      // A listing request returns up to 100 whether you ask for 25 or 100, so
+      // this is four times the corpus for the same rate-limit cost.
+      perAlias: 100,
+      exclude,
+      site,
+      // The footprint stage already searched for this product's communities.
+      // Handing them over is what stops the subreddit probe guessing at a name
+      // when the right one has been sitting in `profiles` all along.
+      discovered: profiles.filter((p) => p.platform === 'reddit').map((p) => p.handle),
+    }).then((found) => found ?? []).catch(() => []),
   ]);
 
   const searched = ordered.map((hit) => ({
@@ -759,11 +1091,20 @@ export async function findMentions(
   // disappears below the cut. Round-robin means no source can be starved by
   // another being louder.
   const filed = [...upstream, ...ghIssues];
+  // Content from a product's own subreddit is on-topic by construction.
+  //
+  // Everything in r/GIMP is about GIMP whether or not the word appears in it —
+  // "it crashes when I export" needs no brand name to be a GIMP bug report, and
+  // a site-wide sweep for "gimp" returns motorbikes. That is a real difference
+  // in what a mention is worth, so it ranks: the topic question is already
+  // answered and only the fault question remains.
   const voices = [...hn, ...appReviews, ...reddit]
     // Complaint-shaped first within this pool: these arrive unranked, straight
     // from a date-sorted index, so nothing else has already surfaced the ones
-    // that matter.
-    .sort((a, b) => Number(Boolean(b.complaint)) - Number(Boolean(a.complaint)));
+    // that matter. Then the community's own, for the reason above.
+    .sort((a, b) =>
+      Number(Boolean(b.complaint)) - Number(Boolean(a.complaint))
+      || Number(fromOwnCommunity(b)) - Number(fromOwnCommunity(a)));
 
   const corpus: Mention[] = [];
   const seenUrls = new Set<string>();
@@ -779,7 +1120,16 @@ export async function findMentions(
     take(searched[i * 2 + 1]);
   }
 
-  const head = corpus.slice(0, SCORE_BUDGET);
+  // Disambiguation first, complaint triage second. Both are paid model time,
+  // and there is no sense reading an item for what is wrong with it before
+  // establishing that it is about this product at all — a well-written
+  // complaint about a different Bolt would sail through triage.
+  const onTopic = await dropWrongSubject(company, site, corpus, emit, subject);
+
+  // Before the cut, because the flag is what decides who survives it.
+  await triageUnflagged(company, onTopic, emit);
+
+  const head = onTopic.slice(0, SCORE_BUDGET);
   const share = (pool: Mention[]) => head.filter((m) => pool.includes(m)).length;
   emit(
     'info',
@@ -788,7 +1138,7 @@ export async function findMentions(
     + `${share(searched)} from search`,
   );
 
-  return corpus.slice(0, MENTION_CAP);
+  return onTopic.slice(0, deeper(MENTION_CAP));
 }
 
 /* ------------------------------------------------------------------- feed */
@@ -928,7 +1278,15 @@ function normalizeDate(value: string | null | undefined): string | null {
  *
  *  Raise it when pointing at a fast hosted model, where the arithmetic is
  *  completely different. */
-const SCORE_BUDGET = Number(process.env.SCORE_BUDGET ?? 60);
+/** How many mentions the model reads and scores.
+ *
+ *  Was 60, chosen when a batch held four items and 60 meant fifteen sequential
+ *  model calls. Batches are packed by size now, and a corpus of Reddit comments
+ *  packs at ten to fourteen — so the same wall-clock buys far more reading. The
+ *  pool it selects from has also grown by an order of magnitude: HN alone
+ *  returns 965 items about GIMP in a year, and a scan sees a couple of thousand.
+ *  Reading 4% of that and calling it the sentiment was the real cap. */
+const SCORE_BUDGET = Number(process.env.SCORE_BUDGET ?? 180);
 
 export async function scoreBuzz(
   company: string, mentions: Mention[], emit: Emit,
@@ -956,20 +1314,47 @@ export async function scoreBuzz(
   // 3,900 the whole stage is lost. Batches keep each turn inside the model's
   // context and output limits, let a bad batch fail on its own without taking
   // the other five with it, and report progress as they land.
-  // 4, and note this shrank twice for the same reason.
+  // Packed by size, with a measured item ceiling.
   //
-  // 12 breached the model's 4,096-token output cap. 8 held while the corpus was
-  // search snippets, then started timing out and truncating mid-JSON once real
-  // page text was fetched: more input to read means more reasoning emitted
-  // before the answer starts, and the answer has to fit in what is left. 4
-  // items of real discussion is what actually completes here.
-  const BATCH = 4;
+  // This was a fixed four per batch because eight and twelve overflowed the
+  // reply. That was real, but the cause was not the batch size — it was that
+  // every scored item had to carry its URL back: ninety characters of Reddit
+  // permalink per item, in the prompt AND in the answer, none of which is
+  // needed to judge a sentiment. Keyed by index instead (see buzzSchema) the
+  // same model on the same corpus handles far more:
+  //
+  //      4 items  3/3 ok   8s        24 items  2/2 ok  20s
+  //      8 items  3/3 ok  11s        32 items  2/2 ok  29s
+  //     16 items  3/3 ok  14s        48 items  0/2 ok  — all failed
+  //
+  // 24 is that measurement with a margin under the 32 that still worked. The
+  // character budget is the second limit, for long fetched articles where two
+  // dozen would be a novel; short comments pack to the item ceiling instead.
+  const BATCH_CHARS = 12_000;
+  const MAX_BATCH_ITEMS = 24;
 
   /** Characters of page text per item. Real thread text is far longer than a
    *  search snippet and has to be trimmed to leave output budget. */
   const TEXT_BUDGET = 900;
+
+  const sizeOf = (m: Mention) => Math.min(m.excerpt.length, TEXT_BUDGET) + m.title.length + 40;
+
   const batches: Mention[][] = [];
-  for (let i = 0; i < budgeted.length; i += BATCH) batches.push(budgeted.slice(i, i + BATCH));
+  {
+    let current: Mention[] = [];
+    let chars = 0;
+    for (const mention of budgeted) {
+      const size = sizeOf(mention);
+      if (current.length && (chars + size > BATCH_CHARS || current.length >= MAX_BATCH_ITEMS)) {
+        batches.push(current);
+        current = [];
+        chars = 0;
+      }
+      current.push(mention);
+      chars += size;
+    }
+    if (current.length) batches.push(current);
+  }
 
   // Fetch what people actually wrote before scoring any of it. Without this the
   // model is rating Brave's meta description — SEO copy, not opinion. Only the
@@ -981,16 +1366,23 @@ export async function scoreBuzz(
   const fullCount = [...fetched.values()].filter((f) => f.full).length;
   emit('info', `${fullCount}/${budgeted.length} yielded real content; the rest keep their search snippet`);
 
-  emit('info', `scoring ${budgeted.length} mentions in ${batches.length} batches of ${BATCH}`);
+  emit(
+    'info',
+    `scoring ${budgeted.length} mentions in ${batches.length} batches `
+    + `(${Math.round(budgeted.length / Math.max(1, batches.length))} per batch on average)`,
+  );
 
   const scores = new Map<string, { sentiment: Mention['sentiment']; score: number; themes?: string[] }>();
   const verdicts: string[] = [];
 
   for (const [index, batch] of batches.entries()) {
-    const corpus = batch.map((m) => {
+    const corpus = batch.map((m, i) => {
       const got = fetched.get(m.url);
       return {
-        url: m.url,
+        // The URL is not sent either. Scoring sentiment needs the words, not
+        // the address they live at, and leaving it out saves as much input as
+        // the index saves output.
+        index: i,
         venue: m.venue,
         date: m.date,
         title: m.title,
@@ -1006,7 +1398,7 @@ export async function scoreBuzz(
       // Straight to the model endpoint with the schema attached — see
       // app/server/model.ts for why this does not go through a saved agent.
       const { scored, verdict } = await runAgent<{
-        scored: { url: string; sentiment: Mention['sentiment']; score: number; themes?: string[] }[];
+        scored: { index: number; sentiment: Mention['sentiment']; score: number; themes?: string[] }[];
         verdict: string;
       }>(buzzAgent, {
         prompt: `Product: "${company}". Score every item and write the verdict.\n\n${JSON.stringify(corpus)}`,
@@ -1022,7 +1414,13 @@ export async function scoreBuzz(
         emit('warn', `batch ${index + 1}: ${outOfRange} score(s) outside -1..1 — clamped, treat this batch's numbers as rough`);
       }
 
-      for (const entry of scored ?? []) if (entry?.url) scores.set(entry.url, entry);
+      for (const entry of scored ?? []) {
+        // An index outside the batch is a model error with no safe repair —
+        // there is no way to tell which item was meant, and attaching a score
+        // to the wrong mention is worse than leaving one unscored.
+        const mention = batch[entry?.index ?? -1];
+        if (mention) scores.set(mention.url, entry);
+      }
       if (verdict) verdicts.push(verdict);
       emit('info', `batch ${index + 1}/${batches.length}: ${(scored ?? []).length} scored`);
     } catch (error) {
@@ -1137,6 +1535,7 @@ export async function findIssues(
   const corpus = complaints.map((m) => {
     const got = fetched.get(m.url);
     return {
+      id: m.id,
       url: m.url,
       date: m.date,
       venue: m.venue,
@@ -1163,14 +1562,34 @@ export async function findIssues(
   const issues: Omit<Issue, 'id' | 'status' | 'firstSeen' | 'lastSeen'>[] = [];
   const failures: string[] = [];
   let succeeded = 0;
+  /** Issues that cited something outside their batch. Counted rather than
+   *  hidden: an issue whose sources cannot be opened is exactly the one a
+   *  reader needs warning about. */
+  let unresolved = 0;
   for (const [index, batch] of batches.entries()) {
     try {
-      const result = await runAgent<{ issues: Omit<Issue, 'id' | 'status' | 'firstSeen' | 'lastSeen'>[] }>(healthAgent, {
-        prompt: `Product: "${company}". Triage these complaints.\n\n${JSON.stringify(batch)}`,
+      const result = await runAgent<{
+        issues: (Omit<Issue, 'id' | 'status' | 'firstSeen' | 'lastSeen' | 'evidence'> & { evidence: number[] })[];
+      }>(healthAgent, {
+        // Numbered, and the id withheld. The model is given an index to cite
+        // and nothing that looks like one to copy — the internal id was never
+        // in the prompt, and the url is now labelled rather than offered as an
+        // identifier.
+        prompt: `Product: "${company}". Triage these complaints.\n\n`
+          + batch.map((item, i) => `${i}: ${JSON.stringify({ ...item, id: undefined })}`).join('\n'),
         note: `batch ${index + 1}/${batches.length}`,
         items: batch.length,
       });
-      issues.push(...(result.issues ?? []));
+
+      for (const issue of result.issues ?? []) {
+        // Resolved here, inside the batch, because the indices only mean
+        // anything against the items this call was given.
+        const cited = (issue.evidence ?? [])
+          .map((i) => batch[Number(i)]?.id)
+          .filter((id): id is string => Boolean(id));
+        if (cited.length !== (issue.evidence ?? []).length) unresolved += 1;
+        issues.push({ ...issue, evidence: cited });
+      }
       succeeded += 1;
       emit('info', `batch ${index + 1}/${batches.length}: ${(result.issues ?? []).length} issue(s)`);
     } catch (error) {
@@ -1192,21 +1611,44 @@ export async function findIssues(
     emit('warn', `${failures.length}/${batches.length} triage batches failed — this list is incomplete`);
   }
 
-  const byUrl = new Map(mentions.map((m) => [m.url, m]));
-  return (issues ?? []).map((issue) => {
+  if (unresolved) {
+    emit('warn', `${unresolved} issue(s) cited a source outside their batch — those citations were dropped`);
+  }
+
+  const byId = new Map(mentions.map((m) => [m.id, m]));
+  const catalogued = (issues ?? []).map((issue) => {
     const dates = (issue.evidence ?? [])
-      .map((url) => byUrl.get(url)?.date)
+      .map((id) => byId.get(id)?.date)
       .filter((d): d is string => Boolean(d))
       .sort();
     return {
       ...issue,
       id: randomUUID().slice(0, 8),
-      evidence: (issue.evidence ?? []).map((url) => byUrl.get(url)?.id ?? url),
       firstSeen: dates[0] ?? null,
       lastSeen: dates.at(-1) ?? null,
       status: 'open' as const,
     };
   });
+
+  // Who raised each one, and how to answer them.
+  //
+  // Done here rather than on demand because it is the thing the whole pipeline
+  // is for, and leaving it until somebody opens an issue means the outbox is
+  // full of replies addressed to nobody. Cheap: one GitHub profile lookup for
+  // the issues whose reporter posted there, nothing at all for the rest.
+  const withReporters = await Promise.all(catalogued.map(async (issue) => {
+    const reporter = await resolveReporter(issue, mentions).catch(() => undefined);
+    return reporter ? { ...issue, reporter } : issue;
+  }));
+
+  const reachable = withReporters.filter((issue) => issue.reporter && issue.reporter.channel !== 'none').length;
+  const named = withReporters.filter((issue) => issue.reporter).length;
+  emit(
+    'info',
+    `reporters: ${named}/${withReporters.length} issues have a named reporter, ${reachable} reachable`,
+  );
+
+  return withReporters;
 }
 
 /* ------------------------------------------------------------------- abuse */
@@ -1244,15 +1686,34 @@ export async function findAbuse(
   })();
 
   // The company's own pages are not abusing the company.
-  const candidates = hits
+  const shortlist = hits
     .filter((hit) => !ownHost || !hit.url.includes(ownHost))
-    .slice(0, 30)
-    .map((hit) => ({ url: hit.url, title: hit.title, excerpt: hit.description.slice(0, 300) }));
+    .slice(0, 30);
 
-  if (candidates.length === 0) {
+  if (shortlist.length === 0) {
     emit('info', 'integrity sweep found nothing to judge');
     return [];
   }
+
+  // Read the pages.
+  //
+  // This stage calls things phishing, impersonation and malware, and it was
+  // making those calls from three hundred characters of search description —
+  // which is the one thing a scam page controls completely. A fake support site
+  // writes a description that reads like the real product's; the giveaway is on
+  // the page. Judging the summary rather than the document is how this panel
+  // would eventually accuse somebody wrongly.
+  const pages = await fetchAll(
+    shortlist.map((hit) => ({ url: hit.url, title: hit.title, excerpt: hit.description } as Mention)),
+    (done, total, full) => emit('info', `integrity: fetched ${done}/${total} (${full} with full text)`),
+  );
+
+  const candidates = shortlist.map((hit) => ({
+    url: hit.url,
+    title: hit.title,
+    excerpt: (pages.get(hit.url)?.text ?? hit.description).slice(0, 900),
+  }));
+
   emit('info', `judging ${candidates.length} candidate pages`);
 
   // Batched, like buzz and health. Judging thirty candidate pages in one turn
@@ -1321,6 +1782,68 @@ ${JSON.stringify(batch)}`,
 export const wasScored = (m: Mention): boolean =>
   m.scored ?? (m.score !== 0 || m.sentiment !== 'neutral');
 
+/** How finely to bucket a timeline.
+ *
+ *  Everything was monthly, which for a product watched over a fortnight draws
+ *  one bar. The window a scan actually covers varies enormously — a busy
+ *  subreddit gives a week of dense discussion, an obscure project gives two
+ *  years of sparse — and a fixed grain is wrong at one end or the other.
+ *
+ *  Chosen from the span rather than made configurable: the right granularity is
+ *  a fact about the data, not a preference, and nobody wants to set it. */
+export type Grain = 'day' | 'week' | 'month';
+
+const DAY_MS = 86_400_000;
+
+export function grainFor(dates: string[]): Grain {
+  const times = dates.map((d) => Date.parse(d)).filter(Number.isFinite).sort((a, b) => a - b);
+  if (times.length === 0) return 'month';
+
+  // The middle of the data, not its extremes.
+  //
+  // Corpora here are mixed: Reddit and the feed are all from the last few days,
+  // while a project's own tracker reaches back years — GIMP's spans two
+  // decades. Measuring end to end let two ancient bug reports force a monthly
+  // grain on a corpus that is otherwise a fortnight old, and drew 123 bars
+  // nobody can read. The 10th to 90th percentile is where the discussion
+  // actually is.
+  const at = (q: number) => times[Math.min(times.length - 1, Math.floor(q * (times.length - 1)))]!;
+  const span = (at(0.9) - at(0.1)) / DAY_MS;
+
+  const grain: Grain = span <= 45 ? 'day' : span <= 300 ? 'week' : 'month';
+
+  // Then check what that actually draws. A long tail still produces buckets
+  // outside the percentile window, and forty-odd bars is the most a strip this
+  // size can carry before they stop being distinguishable.
+  const bars = (g: Grain) => new Set(dates.map((d) => bucketOf(d, g))).size;
+  if (grain === 'day' && bars('day') > 45) return bars('week') > 45 ? 'month' : 'week';
+  if (grain === 'week' && bars('week') > 45) return 'month';
+  return grain;
+}
+
+/** The most bars a timeline strip carries before they stop being readable.
+ *
+ *  Applied by dropping the oldest, not by coarsening further: month is already
+ *  the coarsest grain, and GIMP's corpus reaches back to 2005, so nothing but a
+ *  cut brings 123 bars into range. Taking the recent end is also the right cut
+ *  for this panel — it answers "what are they talking about", which is a
+ *  question about now. */
+const MAX_BUCKETS = 36;
+
+const recent = <T>(points: T[]): T[] => points.slice(-MAX_BUCKETS);
+
+/** The bucket an ISO date falls in, as the bucket's own start date. */
+export function bucketOf(iso: string, grain: Grain): string {
+  if (grain === 'month') return `${iso.slice(0, 7)}-01`;
+  if (grain === 'day') return iso.slice(0, 10);
+  // Weeks start on Monday, so a bar means a working week rather than a
+  // seven-day window whose meaning shifts with when the scan happened to run.
+  const date = new Date(`${iso.slice(0, 10)}T00:00:00Z`);
+  const weekday = (date.getUTCDay() + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - weekday);
+  return date.toISOString().slice(0, 10);
+}
+
 export function buildBuzz(mentions: Mention[]): BuzzPoint[] {
   // Only what was actually scored.
   //
@@ -1333,19 +1856,20 @@ export function buildBuzz(mentions: Mention[]): BuzzPoint[] {
   const dated = (judged.length ? judged : mentions).filter((m) => m.date);
   if (dated.length === 0) return [];
 
+  const grain = grainFor(dated.map((m) => m.date!));
   const buckets = new Map<string, Mention[]>();
   for (const m of dated) {
-    const key = m.date!.slice(0, 7);
+    const key = bucketOf(m.date!, grain);
     buckets.set(key, [...(buckets.get(key) ?? []), m]);
   }
 
-  return [...buckets.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
+  return recent([...buckets.entries()]
+    .sort(([a], [b]) => a.localeCompare(b)))
     .map(([bucket, items]) => {
       const byVenue: Partial<Record<Venue, number>> = {};
       for (const m of items) byVenue[m.venue] = (byVenue[m.venue] ?? 0) + 1;
       return {
-        bucket: `${bucket}-01`,
+        bucket,
         score: items.reduce((sum, m) => sum + m.score, 0) / items.length,
         volume: items.length,
         byVenue,
@@ -1367,6 +1891,31 @@ export function buildBuzz(mentions: Mention[]): BuzzPoint[] {
  *  scan's time, not five. */
 const TOPIC_VOCABULARY_LIMIT = 60;
 const TOPIC_GROUPING_TIMEOUT_MS = 150_000;
+
+/** How many themes to hand the model at once.
+ *
+ *  Measured, not chosen. The run log is unambiguous: 43 themes grouped fine in
+ *  29 seconds, and 47, 57, 58 and 60 all came back as `model returned an empty
+ *  response` after thirty to a hundred and thirty seconds of generation. Every
+ *  topics call today failed, three for three, and the whole chart fell back to
+ *  mechanical merging every time.
+ *
+ *  The input was never the problem — the prompt is thirteen hundred characters.
+ *  The output is: up to eight named groups whose members between them have to
+ *  account for sixty indices, emitted under a schema, in one turn. Same failure
+ *  the buzz stage had, and the same fix — ask for less per call.
+ *
+ *  Twenty, measured again after thirty-six failed in a real run while a
+ *  twenty-four-theme batch beside it succeeded. The earlier reading of
+ *  forty-three was a lucky one. Under the size that demonstrably works, rather
+ *  than near the size that sometimes does.
+ *
+ *  The size is only half of it — see the split-and-retry below. Themes are
+ *  ordered by how often they were used, so the first batch holds the head of
+ *  the distribution and losing it is the expensive failure: one run grouped
+ *  sixteen themes and still covered 2% of theme uses, because the batch that
+ *  died held all the common ones. */
+const TOPIC_BATCH = Number(process.env.TOPIC_BATCH ?? 20);
 
 export async function groupTopics(
   company: string, mentions: Mention[], emit: Emit,
@@ -1393,38 +1942,96 @@ export async function groupTopics(
     .slice(0, TOPIC_VOCABULARY_LIMIT)
     .map(([theme, count]) => ({ theme, count }));
 
-  try {
-    const { topics } = await runAgent<{ topics: { name: string; members: number[] }[] }>(topicsAgent, {
-      prompt: `Product: "${company}". Group these ${listed.length} themes.\n\n`
-        + listed.map((entry, index) => `${index}: ${entry.theme} (${entry.count})`).join('\n'),
-      items: listed.length,
-      // Time-boxed. This is one nicety on top of a chart that already works
-      // without it, so it must never be the reason a scan sits there.
-      timeoutMs: TOPIC_GROUPING_TIMEOUT_MS,
-    });
+  const grouping = new Map<string, string>();
+  const named = new Set<string>();
+  let failures = 0;
+  let batches = 0;
 
-    const grouping = new Map<string, string>();
-    for (const topic of topics ?? []) {
-      const name = topic.name?.trim();
-      if (!name) continue;
-      for (const member of topic.members ?? []) {
-        // An index outside the list is a model error, and dropping it is the
-        // only safe response: there is no way to tell which theme was meant,
-        // and guessing would attribute real discussion to the wrong topic.
-        const entry = listed[member];
-        if (entry && !grouping.has(entry.theme)) grouping.set(entry.theme, name);
+  // In batches, most-used themes first, carrying the names already chosen into
+  // the next call. Carrying them is what keeps this from producing "credits &
+  // pricing" in one batch and "billing" in the next: each call can see the
+  // vocabulary the earlier ones settled on and reuse it, so the chunking is an
+  // implementation detail rather than something visible in the chart.
+  /** Group one slice, and on failure split it and try the halves.
+   *
+   *  A failed batch has two possible causes and this handles both. Either it
+   *  was genuinely too much to emit in one turn, in which case half of it is
+   *  not; or the endpoint hiccupped, in which case asking again works. The
+   *  extra call is only ever paid when something already went wrong.
+   *
+   *  It matters most for the first slice. Themes are ordered by how often they
+   *  were used, so slice one carries the head of the distribution — a run that
+   *  lost it grouped sixteen themes and still covered 2% of theme uses. */
+  const group = async (slice: typeof listed, depth = 0): Promise<void> => {
+    batches += 1;
+    try {
+      const { topics } = await runAgent<{ topics: { name: string; members: number[] }[] }>(topicsAgent, {
+        prompt: `Product: "${company}". Group these ${slice.length} themes.\n\n`
+          + slice.map((entry, index) => `${index}: ${entry.theme} (${entry.count})`).join('\n')
+          + (named.size
+            ? `\n\nTopics already named for this product: ${[...named].join(', ')}.\n`
+              + 'Reuse one of those names, exactly as written, whenever a theme belongs to it. '
+              + 'Only invent a name for a subject none of them covers.'
+            : ''),
+        items: slice.length,
+        note: `${slice.length} themes${depth ? ` (split ${depth})` : ''}`,
+        // Time-boxed. This is one nicety on top of a chart that already works
+        // without it, so it must never be the reason a scan sits there.
+        timeoutMs: TOPIC_GROUPING_TIMEOUT_MS,
+      });
+
+      for (const topic of topics ?? []) {
+        const name = topic.name?.trim();
+        if (!name) continue;
+        named.add(name);
+        for (const member of topic.members ?? []) {
+          // An index outside the slice is a model error, and dropping it is the
+          // only safe response: there is no way to tell which theme was meant,
+          // and guessing would attribute real discussion to the wrong topic.
+          const entry = slice[member];
+          if (entry && !grouping.has(entry.theme)) grouping.set(entry.theme, name);
+        }
       }
+    } catch (error) {
+      const why = error instanceof Error ? error.message.slice(0, 100) : 'error';
+      // Two splits deep is four themes at the smallest, and a model that cannot
+      // group four themes is not going to manage two. Stop and let those fall
+      // through to mechanical consolidation.
+      if (slice.length > 4 && depth < 2) {
+        emit('info', `topic slice of ${slice.length} failed (${why}) — splitting and retrying`);
+        const half = Math.ceil(slice.length / 2);
+        await group(slice.slice(0, half), depth + 1);
+        await group(slice.slice(half), depth + 1);
+        return;
+      }
+      // One failed slice costs its own themes, which then fall through to
+      // mechanical consolidation. It is not a reason to throw away the slices
+      // that worked — that was the old behaviour, and it meant a single empty
+      // response wiped the whole chart.
+      failures += 1;
+      emit('warn', `topic slice of ${slice.length} failed — ${why}`);
     }
+  };
 
-    const covered = [...grouping.keys()].reduce((sum, theme) => sum + (vocabulary.get(theme) ?? 0), 0);
-    const total = [...vocabulary.values()].reduce((sum, n) => sum + n, 0);
-    emit('info', `topics: ${listed.length} themes grouped into ${topics?.length ?? 0} (${Math.round((covered / total) * 100)}% of theme uses matched)`);
+  for (let start = 0; start < listed.length; start += TOPIC_BATCH) {
+    await group(listed.slice(start, start + TOPIC_BATCH));
+  }
 
-    return buildTopics(mentions, { grouping });
-  } catch (error) {
-    emit('warn', `topic grouping failed, falling back to mechanical merge — ${error instanceof Error ? error.message.slice(0, 120) : 'error'}`);
+  if (grouping.size === 0) {
+    emit('warn', 'topic grouping produced nothing, falling back to mechanical merge');
     return buildTopics(mentions);
   }
+
+  const covered = [...grouping.keys()].reduce((sum, theme) => sum + (vocabulary.get(theme) ?? 0), 0);
+  const total = [...vocabulary.values()].reduce((sum, n) => sum + n, 0);
+  emit(
+    'info',
+    `topics: ${grouping.size}/${listed.length} themes grouped into ${named.size} `
+    + `(${Math.round((covered / total) * 100)}% of theme uses matched)`
+    + (failures ? `, ${failures}/${batches} batch(es) failed` : ''),
+  );
+
+  return buildTopics(mentions, { grouping });
 }
 
 /** Discussion volume per topic over time, from the timestamps the mentions
@@ -1512,11 +2119,15 @@ export function buildTopics(
     label.set(root, best ? best[0] : root);
   }
 
-  // 4. Cross with the month buckets, using the same convention as buildBuzz so
-  //    the two charts sit on one timeline.
+  // 4. Cross with the time buckets, using the same convention AND the same
+  //    grain as buildBuzz so the two charts sit on one timeline. Deriving the
+  //    grain from the same dated set is what keeps them aligned; picking it
+  //    twice from different inputs would let one chart show days while the
+  //    other showed months.
+  const grain = grainFor(dated.map((m) => m.date!));
   const buckets = new Map<string, Record<string, number>>();
   for (const mention of dated) {
-    const bucket = mention.date!.slice(0, 7);
+    const bucket = bucketOf(mention.date!, grain);
     const row = buckets.get(bucket) ?? {};
     const already = new Set<string>();
     for (const raw of new Set((mention.themes ?? []).map(resolve))) {
@@ -1542,9 +2153,9 @@ export function buildTopics(
     buckets.set(bucket, row);
   }
 
-  return [...buckets.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([bucket, byTopic]) => ({ bucket: `${bucket}-01`, byTopic }));
+  return recent([...buckets.entries()]
+    .sort(([a], [b]) => a.localeCompare(b)))
+    .map(([bucket, byTopic]) => ({ bucket, byTopic }));
 }
 
 /** The pooled remainder. Named so it cannot be mistaken for a topic the model
@@ -1685,8 +2296,25 @@ export async function findMigrations(
 
   emit('info', `migrations: reading ${candidates.length} of ${mentions.length} mentions that mention switching`);
 
+  // The page, not the snippet.
+  //
+  // Same treatment discovery and triage already give their corpus, and it
+  // matters more here than anywhere: a search description arrives clipped, so
+  // the model was quoting "I switched from Photoshop to GIMP, but this free
+  // tool is..." verbatim from text that stopped mid-sentence — and the reason
+  // somebody moved is exactly the half that was missing. Nearly free, because
+  // the buzz stage has already fetched most of these URLs into the cache.
+  const fetched = await fetchAll(candidates, (done, total, full) =>
+    emit('info', `migrations: fetched ${done}/${total} (${full} with full text)`));
+
+  const textFor = (mention: Mention) => {
+    const got = fetched.get(mention.url);
+    return (got?.text ?? mention.excerpt).slice(0, 900);
+  };
+
   const found: Migration[] = [];
   let read = 0;
+  let invented = 0;
 
   for (let start = 0; start < candidates.length; start += MIGRATION_BATCH) {
     const batch = candidates.slice(start, start + MIGRATION_BATCH);
@@ -1699,8 +2327,19 @@ export async function findMigrations(
       }>(migrationsAgent, {
         prompt: `Product: "${company}". Which of these ${batch.length} posts describe somebody `
           + 'actually switching to or away from it?\n\n'
+          // The URL goes in, and it earns its place.
+          //
+          // A migration was recorded as "Photoshop → GIMP" from an article at
+          // `xda-developers.com/switched-from-photoshop-to-gimp-but-this-free-
+          // tool-beats-both` — a listicle about a THIRD product beating both,
+          // which the slug says outright. The model was shown a title and a
+          // clipped snippet and had no way to know. The host is signal too: a
+          // publication is not somebody describing their own move, and the
+          // instructions already exclude those if the model can tell.
           + batch.map((mention, index) =>
-            `${index}: ${mention.title}\n${mention.excerpt.slice(0, 700)}`).join('\n\n'),
+            `${index}: ${mention.title}\n${mention.url}`
+            + `${mention.discussion === false ? '\n[a published article, not a personal post]' : ''}`
+            + `\n${textFor(mention)}`).join('\n\n'),
         items: batch.length,
         note: `posts ${start + 1}–${start + batch.length}`,
         timeoutMs: MIGRATION_TIMEOUT_MS,
@@ -1721,6 +2360,17 @@ export async function findMigrations(
         if (!competitor || !quote) continue;
         // "They moved from GIMP to GIMP" is a misread, not a migration.
         if (competitor.toLowerCase() === company.trim().toLowerCase()) continue;
+        // The quote has to be in the text it was drawn from.
+        //
+        // Same rule the complaint pass applies: requiring a verbatim quote is
+        // only worth something if the quote is checked, otherwise it is a field
+        // the model can fill with anything. A bar on this chart is a claim that
+        // a named person said a specific sentence, and an unverifiable one is
+        // the worst thing this panel could show.
+        if (!quotesTheSource(quote, `${mention.title} ${textFor(mention)}`)) {
+          invented += 1;
+          continue;
+        }
 
         found.push({
           id: randomUUID().slice(0, 8),
@@ -1749,6 +2399,7 @@ export async function findMigrations(
 
   const inbound = found.filter((move) => move.direction === 'inbound').length;
   emit('info', `migrations: ${found.length} switching claims from ${read} posts read `
-    + `(${inbound} in, ${found.length - inbound} out)`);
+    + `(${inbound} in, ${found.length - inbound} out)`
+    + (invented ? `, ${invented} dropped for quoting words that are not in the post` : ''));
   return found;
 }

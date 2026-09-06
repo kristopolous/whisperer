@@ -25,7 +25,15 @@ import { cleanText } from '../shared/html.ts';
 import { usableConnectors } from './config.ts';
 import { callTool } from './mcp.ts';
 import { cached, DAY } from './cache.ts';
-import { bindingFor, connectorsForRole } from './roles.ts';
+import { bindingFor } from './roles.ts';
+import { connectorsForRole } from './providers.ts';
+import { abortable } from './run-context.ts';
+import { publishedAt } from './published.ts';
+
+/** The date a URL's own path implies, for the readers that return structured
+ *  text and never see the page's markup. */
+const fromUrlOnly = (url: string) => publishedAt('', url);
+import { fetchRedditPage, redditDate } from './reddit.ts';
 
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
 
@@ -151,16 +159,105 @@ async function get(url: string, timeoutMs = 15_000): Promise<string | null> {
 }
 
 /** Every comment on a Hacker News item, newest-page order, joined. */
+/** A Hacker News thread, through the API rather than the page.
+ *
+ *  The scrape it replaces read `<div class="commtext">` out of the HTML, which
+ *  missed the submission text entirely and only ever saw the comments the first
+ *  page happened to render — measured across the cache, 15 of 85 HN fetches came
+ *  back as nothing and the median was 890 characters for what is often a
+ *  hundred-comment thread.
+ *
+ *  There was never a reason to scrape it. Algolia's index is what the search
+ *  side of this app already queries, it serves the whole comment tree at
+ *  `/items/{id}`, it needs no key, and Hacker News does not guard it. */
 async function hackerNews(url: string): Promise<string | null> {
-  const html = await get(url);
-  if (!html) return null;
+  const id = (() => {
+    try {
+      return new URL(url).searchParams.get('id');
+    } catch {
+      return null;
+    }
+  })();
+  if (!id || !/^\d+$/.test(id)) return null;
 
-  const comments = [...html.matchAll(/<div class="commtext[^"]*">([\s\S]*?)<\/div>/g)]
-    .map((match) => toText(match[1]!))
-    .filter((text) => text.length > 20);
+  interface Item {
+    title?: string | null;
+    text?: string | null;
+    author?: string | null;
+    type?: string;
+    children?: Item[];
+  }
 
-  if (comments.length === 0) return null;
-  return comments.join('\n\n');
+  let root: Item;
+  try {
+    const response = await fetch(`https://hn.algolia.com/api/v1/items/${id}`, {
+      headers: { 'User-Agent': 'whisperer' },
+      signal: abortable(20_000),
+    });
+    if (!response.ok) return null;
+    root = (await response.json()) as Item;
+  } catch {
+    return null;
+  }
+
+  // Depth-first, so a reply stays under what it replies to — the thread reads
+  // as a conversation rather than as a bag of sentences, which is what makes a
+  // complaint and its rebuttal distinguishable.
+  const out: string[] = [];
+  const walk = (item: Item, depth: number) => {
+    const body = toText(item.text ?? '');
+    if (body.length > 20) out.push(`${'  '.repeat(Math.min(depth, 4))}${item.author ? `${item.author}: ` : ''}${body}`);
+    for (const child of item.children ?? []) walk(child, depth + 1);
+  };
+
+  if (root.title) out.push(root.title);
+  walk(root, 0);
+  return out.length ? out.join('\n\n') : null;
+}
+
+/** Is this a Discourse forum, and if so read the topic through its JSON.
+ *
+ *  Discourse serves the whole post stream for any topic by appending `.json` to
+ *  its URL — no key, no login, no scraper. Every product that runs its own
+ *  support forum on it was therefore reachable all along, and 17 of 17 fetches
+ *  of `replit.discourse.group` came back as a 318-character search snippet.
+ *  That is the highest-value corpus there is for this product: a company's own
+ *  forum is where faults get described in detail, by people who came
+ *  specifically to describe them.
+ *
+ *  Recognised by the URL shape rather than by a probe. `/t/<slug>/<id>` is
+ *  Discourse's topic route and is distinctive enough; a wrong guess costs one
+ *  request that 404s and falls through to the ordinary path. */
+const DISCOURSE_TOPIC = /\/t\/[^/]+\/(\d+)(?:\/\d+)?\/?$/;
+
+async function discourse(url: string): Promise<string | null> {
+  if (!DISCOURSE_TOPIC.test(new URL(url).pathname)) return null;
+
+  interface Post { cooked?: string; username?: string }
+  let body: { title?: string; post_stream?: { posts?: Post[] } };
+  try {
+    const target = url.replace(/\/?$/, '').replace(/\.json$/, '') + '.json';
+    const response = await fetch(target, {
+      headers: { Accept: 'application/json', 'User-Agent': 'whisperer' },
+      signal: abortable(20_000),
+    });
+    if (!response.ok) return null;
+    const parsed: unknown = await response.json();
+    if (!parsed || typeof parsed !== 'object') return null;
+    body = parsed as typeof body;
+  } catch {
+    return null;
+  }
+
+  const posts = body.post_stream?.posts ?? [];
+  if (posts.length === 0) return null;
+
+  const out = body.title ? [body.title] : [];
+  for (const post of posts) {
+    const text = toText(post.cooked ?? '');
+    if (text.length > 20) out.push(`${post.username ? `${post.username}: ` : ''}${text}`);
+  }
+  return out.length ? out.join('\n\n') : null;
 }
 
 /** Detect the bot-check interstitials that come back with HTTP 200. */
@@ -170,6 +267,13 @@ const isChallenge = (html: string) =>
 export interface Fetched {
   /** The text to reason over. */
   text: string;
+  /** When the page says it was published, when it says.
+   *
+   *  Read off the page rather than taken from whatever the search provider
+   *  returned, because the providers mostly return nothing: a third of one real
+   *  corpus was undated, which put it outside every timeline while the headline
+   *  count still included it. */
+  date?: string | null;
   /** True when this is real page content; false when it is the search snippet
    *  because the page could not be read. The caller must not present a snippet
    *  as if it were someone's words. */
@@ -198,15 +302,22 @@ export async function fetchContent(url: string, snippet: string, limit = 4_000):
   const hit = memo.get(url);
   if (hit) return hit;
 
-  const stored = await cached<string | null>('content', url, CONTENT_TTL, async () => {
-    // Fetched unclipped so the stored copy can serve a caller that wants more
-    // text than the first caller did.
-    const fetched = await fetchContentUncached(url, snippet, 200_000);
-    return fetched.full ? fetched.text : null;
-  });
+  const stored = await cached<{ text: string; date: string | null } | string | null>(
+    'content', url, CONTENT_TTL, async () => {
+      // Fetched unclipped so the stored copy can serve a caller that wants more
+      // text than the first caller did.
+      const got = await fetchContentUncached(url, snippet, 200_000);
+      return got.full ? { text: got.text, date: got.date ?? null } : null;
+    },
+  );
 
-  const fetched: Fetched = stored
-    ? { text: stored.slice(0, limit), full: true }
+  // Entries written before the date was extracted are bare strings. Read both
+  // rather than invalidating the cache: those are pages already paid for, and
+  // the text in them is exactly as good as it was.
+  const body = typeof stored === 'string' ? { text: stored, date: null } : stored;
+
+  const fetched: Fetched = body
+    ? { text: body.text.slice(0, limit), full: true, date: body.date }
     : { text: snippet, full: false };
   memo.set(url, fetched);
   return fetched;
@@ -227,40 +338,98 @@ async function fetchContentUncached(url: string, snippet: string, limit: number)
     return { text: snippet, full: false };
   }
 
-  // Reddit blocks this network on every route (public .json and old.reddit both
-  // return its "Blocked" page), so skip the wasted request and go straight to
-  // the scraper that can get through.
+  // Reddit blocks this network on every unauthenticated route (public .json
+  // and old.reddit both return its "Blocked" page), so a plain fetch is a
+  // wasted request.
+  //
+  // The API comes first when credentials are set: it is free, it returns the
+  // thread structured rather than as scraped HTML, and it saves a metered
+  // request. Every reddit.com page used to go straight to the paid scraper —
+  // for a site we hold credentials to.
   if (host.endsWith('reddit.com')) {
+    const viaApi = await fetchRedditPage(url);
+    if (viaApi) return { text: viaApi.text.slice(0, limit), full: true, date: viaApi.date };
     const scraped = await brightDataScrape(url);
     return scraped ? { text: scraped.slice(0, limit), full: true } : { text: snippet, full: false };
   }
+
+  // Discourse forums, which are a product's own support site more often than
+  // not. Tried before the plain fetch because the HTML is a JavaScript shell
+  // that strips to nothing.
+  const viaDiscourse = await discourse(url).catch(() => null);
+  if (viaDiscourse) return { text: viaDiscourse.slice(0, limit), full: true, date: fromUrlOnly(url) };
 
   const html = await get(url);
   if (!html || isChallenge(html)) {
     // A bot check is exactly what Bright Data is for.
     const scraped = await brightDataScrape(url);
-    return scraped ? { text: scraped.slice(0, limit), full: true } : { text: snippet, full: false };
+    return scraped
+      ? { text: scraped.slice(0, limit), full: true, date: publishedAt(scraped, url) }
+      : { text: snippet, full: false, date: fromUrlOnly(url) };
   }
+
+  // Read the date before deciding whether the text is usable.
+  //
+  // A YouTube watch page strips to almost nothing and is rejected below as a
+  // shell — correctly, there is no article in it — but it carries
+  // `datePublished` in its markup all the same. Twenty of twenty-one YouTube
+  // mentions in one corpus were undated for exactly this reason: the page was
+  // fetched, judged unreadable, and thrown away with the date still in it.
+  const date = publishedAt(html, url);
 
   const text = toText(html);
   // A page that strips to almost nothing is a shell, not an article.
-  if (text.length < 200) return { text: snippet, full: false };
-  return { text: text.slice(0, limit), full: true };
+  if (text.length < 200) return { text: snippet, full: false, date };
+  return { text: text.slice(0, limit), full: true, date };
 }
 
 /** Fetch content for many URLs with bounded concurrency.
  *
  *  Bounded because these are other people's servers and this runs on every
  *  scan; unbounded parallel fetching is how you get rate limited or blocked. */
-export async function fetchAll<T extends { url: string; excerpt: string }>(
+/** Does this item still need a date? */
+const isDateless = (item: { date?: string | null }) => !item.date;
+
+/** The publication date of a page, fetched and cached on its own.
+ *
+ *  Separate from the content cache on purpose. That cache holds pages fetched
+ *  before dates were extracted — as bare strings, with no date and no markup
+ *  left to read one from — and it short-circuits before any HTML is fetched, so
+ *  those entries could never gain one. Discarding them to force a refetch would
+ *  throw away text that was paid for; this asks the one extra question instead,
+ *  once per URL, and keeps the answer for a month.
+ *
+ *  Null is a real answer and is cached as one: a page that genuinely does not
+ *  say when it was published should be asked once, not on every scan. */
+export const publishedDateFor = async (url: string): Promise<string | null> => {
+  // Free without a request when the path carries it.
+  const fromPath = publishedAt('', url);
+  if (fromPath) return fromPath;
+
+  // Reddit refuses this network unauthenticated, so a plain fetch would answer
+  // null and then cache that null for a month — for the venue that is half the
+  // corpus and whose API we hold credentials to.
+  if (/(^|\.)reddit\.com$/i.test(new URL(url).hostname)) {
+    return await redditDate(url).catch(() => null);
+  }
+
+  const hit = await cached<string | null>('published', url, 30 * DAY, async () => {
+    const html = await get(url).catch(() => null);
+    return publishedAt(html ?? '', url);
+  });
+  return hit ?? null;
+};
+
+export async function fetchAll<T extends { url: string; excerpt: string; date?: string | null }>(
   items: T[],
-  onProgress: (done: number, total: number, full: number) => void,
+  onProgress: (done: number, total: number, full: number, dated?: number) => void,
   concurrency = 4,
   perItemLimit = 4_000,
 ): Promise<Map<string, Fetched>> {
   const out = new Map<string, Fetched>();
   let done = 0;
   let full = 0;
+  let dated = 0;
 
   const queue = [...items];
   const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
@@ -269,9 +438,22 @@ export async function fetchAll<T extends { url: string; excerpt: string }>(
       if (!item) return;
       const fetched = await fetchContent(item.url, item.excerpt, perItemLimit);
       out.set(item.url, fetched);
+      // Backfill. Whichever stage fetched this first, every later one — and the
+      // stored record, and every timeline drawn from it — gets the date. Only
+      // when the mention has none: a date the source itself reported is better
+      // than one read off a page that may be a listing or a mirror.
+      if (isDateless(item)) {
+        // What the fetch already saw, else one extra look. The second path is
+        // what rescues everything cached before dates were read at all.
+        const when = fetched.date ?? await publishedDateFor(item.url).catch(() => null);
+        if (when) {
+          (item as { date?: string | null }).date = when;
+          dated += 1;
+        }
+      }
       done += 1;
       if (fetched.full) full += 1;
-      if (done % 10 === 0 || done === items.length) onProgress(done, items.length, full);
+      if (done % 10 === 0 || done === items.length) onProgress(done, items.length, full, dated);
     }
   });
 

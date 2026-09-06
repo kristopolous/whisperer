@@ -25,10 +25,6 @@
         "param": "token",
         "value": "${BRIGHTDATA_API_TOKEN}"
       },
-      "roles": [
-        "scrape",
-        "search"
-      ],
       "bindings": {
         "search": {
           "tool": "search_engine",
@@ -44,25 +40,11 @@
       }
     },
     {
-      "name": "brave",
-      "url": "http://localhost:8094/mcp",
-      "description": "Brave web, news, video and image search. Note the free tier is one request per second and 429s anything faster \u2014 app/server/search.ts serialises every call in the process for exactly this reason.",
-      "requires": [
-        "BRAVE_API_KEY"
-      ],
-      "roles": [
-        "search"
-      ]
-    },
-    {
       "name": "youtube",
       "url": "http://localhost:8091/mcp",
       "description": "YouTube search over videos, channels and playlists, with view/like/comment counts and publish dates. The primary feed source, and the fastest to answer.",
       "requires": [
         "YOUTUBE_API_KEY"
-      ],
-      "roles": [
-        "search"
       ]
     },
     {
@@ -75,11 +57,7 @@
       "auth": {
         "type": "bearer",
         "token": "${X_BEARER_TOKEN}"
-      },
-      "roles": [
-        "contact",
-        "search"
-      ]
+      }
     },
     {
       "name": "tiktok",
@@ -87,39 +65,25 @@
       "description": "TikTok keyword search plus a video's full metadata and captions/transcript.",
       "requires": [
         "TIKNEURON_MCP_API_KEY"
-      ],
-      "roles": [
-        "search"
       ]
     },
     {
       "name": "hn",
       "url": "http://localhost:8086/mcp",
       "description": "Hacker News stories, full comment threads and user profiles. Largely redundant now: a plain fetch of an HN item page already yields every comment, so app/server/content.ts reads threads without going through here.",
-      "enabled": false,
-      "roles": [
-        "contact",
-        "search"
-      ]
+      "enabled": false
     },
     {
       "name": "reddit",
       "url": "http://localhost:3000/mcp",
       "description": "Reddit. Disabled: Reddit blocks unauthenticated requests from this network on every route tried, so the connector reports up and returns nothing. Reddit is reached through bright-data instead.",
-      "enabled": false,
-      "roles": [
-        "contact",
-        "search"
-      ]
+      "enabled": false
     },
     {
       "name": "exa",
       "url": "http://localhost:8095/mcp",
       "description": "Exa neural search. Disabled: the shared endpoint returned empty results and 429s for a full day, and a broken connector wired into every stage just makes turns fail and panels come back blank.",
-      "enabled": false,
-      "roles": [
-        "search"
-      ]
+      "enabled": false
     },
     {
       "name": "discord",
@@ -127,20 +91,12 @@
       "description": "Discord bot control: channels, messages, reactions, roles, moderation, webhooks, forums and invites. The bot token lives in the container, which is bound to loopback, so no auth block here.",
       "requires": [
         "DISCORD_TOKEN"
-      ],
-      "roles": [
-        "contact",
-        "search"
       ]
     },
     {
       "name": "linkedin",
       "url": "http://localhost:8087/mcp",
-      "description": "LinkedIn through a logged-in browser session: profiles, company pages and post search. The session lives in the container's own browser profile, so there is no credential here to check \u2014 if it is logged out, the probe is what tells you.",
-      "roles": [
-        "contact",
-        "search"
-      ]
+      "description": "LinkedIn through a logged-in browser session: profiles, company pages and post search. The session lives in the container's own browser profile, so there is no credential here to check \u2014 if it is logged out, the probe is what tells you."
     },
     {
       "name": "telegram",
@@ -148,9 +104,6 @@
       "description": "Telegram as your own account: chats, groups, contacts, messages, folders and media.",
       "requires": [
         "TELEGRAM_SESSION_STRING"
-      ],
-      "roles": [
-        "contact"
       ]
     },
     {
@@ -159,9 +112,6 @@
       "description": "Signal via a registered signal-cli number: send and receive direct and group messages.",
       "requires": [
         "SIGNAL_USER_ID"
-      ],
-      "roles": [
-        "contact"
       ]
     },
     {
@@ -170,9 +120,6 @@
       "description": "WhatsApp through a linked phone: contacts, chat history, sending messages and media.",
       "requires": [
         "WHATSAPP_MCP_ENABLED"
-      ],
-      "roles": [
-        "contact"
       ]
     },
     {
@@ -181,9 +128,6 @@
       "description": "The company's own Instagram Business account: profile, recent posts and their insights, connected pages, DMs. Manages an owned account rather than searching.",
       "requires": [
         "INSTAGRAM_ACCESS_TOKEN"
-      ],
-      "roles": [
-        "contact"
       ]
     }
   ],
@@ -201,5 +145,20 @@
     "       (search_engine / tavily-search / web_search) and neither are argument names",
     "       (query / q / keyword). A role with no binding is declared but not used.",
     "       The settings screen suggests both by reading the server's own tools/list."
-  ]
+  ],
+  "roles": {
+    "search": [
+      "perplexity",
+      "brave",
+      "bright-data",
+      "reddit"
+    ],
+    "scrape": [
+      "reddit",
+      "bright-data"
+    ],
+    "contact": [],
+    "ticket": [],
+    "exec": []
+  }
 }

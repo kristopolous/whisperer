@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import type { FeedItem, Scan } from '../../../shared/types.ts';
+import type { FeedItem, Scan, Venue } from '../../../shared/types.ts';
 import { Filter, matches } from './Filter.tsx';
-import { fmtDate, venueOf } from '../lib.ts';
+import { VENUES, fmtDate, venueOf } from '../lib.ts';
 
 /** Pull the video id out of a YouTube watch/shorts/embed URL. */
 function youtubeId(url: string): string | null {
@@ -26,10 +26,18 @@ function youtubeId(url: string): string | null {
  *  back to the original, and embeds the video when the item is a YouTube upload. */
 export function FeedView({ scan }: { scan: Scan }) {
   const [query, setQuery] = useState('');
+  const [venue, setVenue] = useState<Venue | 'all'>('all');
   const all = scan.feed ?? [];
-  const items = all.filter((i) => matches(query, i.headline, i.snippet, i.author, i.url, i.venue));
 
-  if (items.length === 0) {
+  const items = all
+    .filter((i) => venue === 'all' || venueOf(i.venue).key === venue)
+    .filter((i) => matches(query, i.headline, i.snippet, i.author, i.url, i.venue));
+
+  // Only a genuinely empty feed gets the empty state. Emptying it with a filter
+  // used to unmount the filter along with the rows, so a search that matched
+  // nothing took away the box you would have cleared it in — the panel looked
+  // broken and the only way out was to change tab.
+  if (all.length === 0) {
     return (
       <div className="panel">
         <div className="empty">
@@ -38,6 +46,11 @@ export function FeedView({ scan }: { scan: Scan }) {
       </div>
     );
   }
+
+  // Only the venues actually present. A row reading "YouTube 0" is a filter
+  // that does nothing, and this is a control rather than a survey — the gaps
+  // belong on Sources, where they are actionable.
+  const present = VENUES.filter((v) => all.some((i) => venueOf(i.venue).key === v.key));
 
   return (
     <div className="panel feed">
@@ -48,53 +61,83 @@ export function FeedView({ scan }: { scan: Scan }) {
         showing={items.length}
         total={all.length}
       />
-      {items.map((item) => (
-        <FeedRow key={item.id} item={item} />
-      ))}
+
+      {present.length > 1 && (
+        <div className="legend" role="group" aria-label="Filter by source">
+          <button
+            className="tag plain"
+            aria-pressed={venue === 'all'}
+            onClick={() => setVenue('all')}
+            style={{ borderColor: venue === 'all' ? 'var(--signal)' : undefined, color: venue === 'all' ? 'var(--ink)' : undefined }}
+          >
+            All {all.length}
+          </button>
+          {present.map((v) => {
+            const n = all.filter((i) => venueOf(i.venue).key === v.key).length;
+            return (
+              <button
+                key={v.key}
+                className="tag"
+                aria-pressed={venue === v.key}
+                onClick={() => setVenue(venue === v.key ? 'all' : v.key)}
+                style={{ color: v.slot, borderColor: venue === v.key ? v.slot : undefined }}
+              >
+                {v.label} {n}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {items.length === 0
+        ? <div className="empty"><h3>Nothing matches</h3></div>
+        : items.map((item) => <FeedRow key={item.id} item={item} />)}
     </div>
   );
 }
 
+/** One line per item: where it came from, what it says, when.
+ *
+ *  This was a stacked block per row — a source line, a headline, an author, a
+ *  snippet, an "Open in…" link, and for YouTube a 240px video embed. Six items
+ *  filled the screen, which is the opposite of what a feed is for. A feed is
+ *  read by scanning it, and scanning needs rows.
+ *
+ *  The whole row is the link, so there is nothing to aim at; the snippet moves
+ *  to the tooltip rather than being cut; and the video is a marker instead of
+ *  an embed, because a wall of iframes is slow to load and impossible to skim.
+ */
 function FeedRow({ item }: { item: FeedItem }) {
   const venue = venueOf(item.venue);
-  const video = youtubeId(item.url);
+  const isVideo = Boolean(youtubeId(item.url));
 
   return (
-    <div className="feed-row">
-      <div className="feed-main">
-        <div className="feed-head">
-          <span className="feed-source" style={{ color: venue.slot }}>
-            {venue.label}
-          </span>
-          {item.date && <span className="feed-date">{fmtDate(item.date)}</span>}
-          {item.engagement != null && (
-            <span className="feed-engagement">{item.engagement.toLocaleString()}</span>
-          )}
-        </div>
-        <div className="feed-headline">{item.headline}</div>
-        {item.author && <div className="feed-author">by {item.author}</div>}
-        {item.snippet && (
-          <div className="feed-comment">
-            {item.snippet}
-          </div>
-        )}
-        <div className="feed-actions">
-          <a className="feed-link" href={item.url} target="_blank" rel="noreferrer">
-            Open in {venue.label} ↗
-          </a>
-        </div>
-      </div>
-      {video && (
-        <div className="feed-video">
-          <iframe
-            src={`https://www.youtube-nocookie.com/embed/${video}`}
-            title={item.headline}
-            loading="lazy"
-            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-            allowFullScreen
-          />
-        </div>
+    <a
+      className="feed-row"
+      href={item.url}
+      target="_blank"
+      rel="noreferrer"
+      title={item.snippet || item.headline}
+    >
+      <span className="feed-tag" style={{ color: venue.slot, borderColor: venue.slot }}>
+        {venue.label}
+      </span>
+      <span className="feed-title">
+        {isVideo && <span className="feed-video-mark" aria-label="video">▶</span>}
+        {item.headline}
+        {item.author && <span className="feed-by"> — {item.author}</span>}
+      </span>
+      {item.engagement != null && (
+        <span className="feed-engagement">{item.engagement.toLocaleString()}</span>
       )}
-    </div>
+      <span className="feed-date">{item.date ? fmtDate(item.date) : '—'}</span>
+      {/* Second line: what was actually said. A headline alone tells you a post
+          exists; this is the line that tells you whether it matters. Still one
+          line — the rest stays on the row's tooltip — so the feed is scannable
+          at two rows per item rather than six. */}
+      {item.snippet && item.snippet !== item.headline && (
+        <span className="feed-snippet">{item.snippet}</span>
+      )}
+    </a>
   );
 }

@@ -18,9 +18,21 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Stage } from '../shared/types.ts';
 
+/** How hard this run is willing to look.
+ *
+ *  `normal` is the daily shape: the recency ladder stops as soon as it has
+ *  enough, which for an active product means it never looks past the last
+ *  month. `deep` runs every rung of the ladder to the end and lifts the volume
+ *  caps with it — more wall clock and more paid requests, in exchange for the
+ *  part of the internet the early stop was hiding. */
+export type Depth = 'normal' | 'deep';
+
 export interface RunContext {
   scanId?: string;
   stage?: Stage;
+  depth?: Depth;
+  /** Language codes this run searches in, beyond English. */
+  languages?: string[];
   /** Aborted when someone cancels this scan. */
   signal?: AbortSignal;
 }
@@ -30,6 +42,13 @@ const context = new AsyncLocalStorage<RunContext>();
 export const withRunContext = <T>(value: RunContext, fn: () => T): T => context.run(value, fn);
 
 export const currentRun = (): RunContext | undefined => context.getStore();
+
+/** Is this run digging? Read wherever a volume control is applied, so depth is
+ *  one decision at the top rather than a parameter on twelve functions. */
+export const isDeep = (): boolean => context.getStore()?.depth === 'deep';
+
+/** Which languages this run searches in, beyond English. */
+export const runLanguages = (): string[] => context.getStore()?.languages ?? [];
 
 /** Thrown at a checkpoint so a cancelled run unwinds like any other failure,
  *  then is recognised and reported as a cancellation rather than an error. */

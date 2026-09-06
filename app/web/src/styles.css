@@ -258,7 +258,9 @@ button.primary:hover:not(:disabled) { filter: brightness(1.08); box-shadow: var(
 /* ---------------------------------------------------------------- sign in */
 
 .login-wrap {
-  height: 100vh;
+  /* dvh, not vh: on a phone `100vh` is the viewport WITHOUT the address bar,
+     so a centred card sits partly under it. */
+  min-height: 100dvh;
   display: grid;
   place-items: center;
   padding: 24px;
@@ -490,7 +492,10 @@ section { margin-top: 44px; }
 
 .legend {
   display: flex; flex-wrap: wrap; gap: 4px 16px;
-  padding: 0 16px 14px;
+  /* Top padding, not zero: these sit directly under a panel header whose
+     bottom rule they were touching, so the first row of pills read as part of
+     the heading rather than as the controls below it. */
+  padding: 12px 16px 14px;
   font: 400 11px var(--mono);
   color: var(--ink-2);
 }
@@ -720,6 +725,44 @@ td .quote { color: var(--ink-2); font-size: 12.5px; margin-top: 3px; }
 
 .actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
 
+/* Going into the source is the product's headline move, and it was sharing a
+   button style with "Discard". Given room, and a border, so it reads as a
+   thing you decide to do rather than a control you happen upon. */
+.source-action {
+  margin: 14px 0 20px;
+  padding: 18px 20px 20px;
+  border: 1px solid color-mix(in srgb, var(--signal) 45%, var(--hair));
+  border-radius: var(--r-lg);
+  background: color-mix(in srgb, var(--signal) 7%, transparent);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--signal) 12%, transparent);
+}
+.source-action-title {
+  margin: 0 0 8px;
+  font-family: var(--display);
+  font-variation-settings: 'wdth' 92, 'wght' 700;
+  font-size: 16px;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+.source-action-what {
+  margin: 0 0 16px;
+  max-width: 68ch;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+.source-action-go { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.source-action-note { font: 400 11.5px var(--mono); color: var(--ink-3); }
+.source-action .conn-err { margin: 12px 0 0; }
+
+/* The one button on the page that should look like a commitment. */
+button.big {
+  padding: 13px 26px;
+  font-size: 15px;
+  font-weight: 600;
+  border-radius: var(--r);
+}
+
 .payload {
   margin: 12px 0 0;
   padding: 13px 15px;
@@ -852,7 +895,7 @@ td .quote { color: var(--ink-2); font-size: 12.5px; margin-top: 3px; }
 
 .dash {
   display: flex;
-  height: calc(100vh - 60px);
+  height: calc(100dvh - 60px);
   max-width: 100%;
   margin: 0 auto;
   padding: 0;
@@ -1138,6 +1181,168 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 .run-company input::placeholder { color: var(--ink-3); }
 .run-company button { flex: 0 0 auto; padding-inline: 22px; }
 
+/* ------------------------------------------------------- role chains ---- */
+
+/* Each role is its own card.
+   Five roles rendered as headings and paragraphs on one flat ground read as a
+   single undifferentiated column — you could not see where one ended and the
+   next began without reading it. A boundary and a header band do that work. */
+.chain-list-wrap { padding: 4px 16px 18px; display: flex; flex-direction: column; gap: 16px; }
+.chain {
+  border: 1px solid var(--hair);
+  border-radius: var(--r-lg);
+  background: color-mix(in srgb, var(--ink) 2%, transparent);
+  overflow: hidden;
+}
+.chain-head {
+  padding: 11px 14px 12px;
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+  border-bottom: 1px solid var(--hair);
+}
+.chain-title { display: flex; align-items: baseline; gap: 10px; }
+.chain-title strong {
+  font-family: var(--display);
+  font-variation-settings: 'wdth' 92, 'wght' 700;
+  font-size: 14px;
+  letter-spacing: 0.01em;
+}
+.chain-title button { margin-left: auto; flex: 0 0 auto; }
+.chain-count { font: 400 11px var(--mono); color: var(--ink-3); }
+.chain-uses {
+  margin: 6px 0 0;
+  max-width: 76ch;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.chain-empty {
+  margin: 0;
+  /* Matches the horizontal padding of .chain-list so the sentence lines up
+     with where a provider row would sit, and is generous vertically because it
+     is the whole body of the card. */
+  padding: 18px 14px 20px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ink-3);
+  font-style: italic;
+}
+.chain > .conn-detail { border-top: 1px solid var(--hair); }
+.chain-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 12px 14px 14px;
+  border-top: 1px solid var(--hair);
+}
+.chain-add button { font: 400 12px var(--mono); }
+
+.chain-list { margin: 0; padding: 12px 14px 14px; display: flex; flex-direction: column; }
+.chain-row {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r);
+  background: var(--paper);
+  cursor: grab;
+}
+/* The rank number carries the ordering on its own now that each role is a
+   distinct card. An explicit "if that fails" between every pair said the same
+   thing a second time, once per row, which is noise rather than help. */
+.chain-row + .chain-row { margin-top: 8px; }
+.chain-row.dragging { opacity: 0.4; }
+/* The drop target, so it is obvious where the row will land rather than only
+   obvious after letting go. */
+.chain-row.over { border-color: var(--signal); box-shadow: inset 0 0 0 1px var(--signal); }
+.chain-rank {
+  font: 500 11px var(--mono); color: var(--ink-3);
+  width: 18px; text-align: center;
+}
+.chain-grip { color: var(--ink-3); cursor: grab; }
+.chain-name { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 13px; }
+.chain-name .conn-err { font-size: 11.5px; }
+/* One control on the row, and it only appears on hover — a × on every line of
+   a five-line list reads as clutter when nothing is being removed. */
+.chain-remove {
+  padding: 2px 7px;
+  line-height: 1.2;
+  opacity: 0;
+  transition: opacity 90ms ease;
+}
+.chain-row:hover .chain-remove,
+.chain-remove:focus-visible { opacity: 1; }
+
+/* ----------------------------------------------------- investigation ---- */
+
+.steps-run { list-style: none; margin: 14px 0 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+.steps-run-item { display: flex; align-items: center; gap: 9px; font-size: 12.5px; color: var(--ink-3); }
+.steps-run-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  /* Visible on its own terms. At 1px of --ink-3 with no fill, a step that had
+     not run yet read as plain text beside the filled green and red ones — the
+     rows after a failure looked unmarked rather than pending, which is the
+     opposite of what the list is for. */
+  border: 1.5px solid color-mix(in srgb, var(--ink-3) 70%, transparent);
+  background: none;
+  flex: 0 0 auto;
+}
+.steps-run-item[data-state='done'] { color: var(--ink-2); }
+.steps-run-item[data-state='done'] .steps-run-dot { background: var(--good); border-color: var(--good); }
+.steps-run-item[data-state='active'] { color: var(--ink); font-weight: 500; }
+.steps-run-item[data-state='active'] .steps-run-dot {
+  background: var(--signal); border-color: var(--signal);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* ------------------------------------------------------------ work log ---- */
+
+.worklog { margin-top: 14px; border: 1px solid var(--hair); border-radius: var(--r-lg); overflow: hidden; }
+.worklog-head {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 9px 13px;
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+  border: 0; border-bottom: 1px solid var(--hair);
+  font: inherit; color: inherit; text-align: left; cursor: pointer;
+}
+.worklog-title { font-weight: 600; font-size: 13px; }
+.worklog-head .conn-meta:first-of-type { margin-left: auto; }
+.worklog-list { list-style: none; margin: 0; padding: 0; }
+.worklog-step { padding: 11px 13px; border-bottom: 1px solid var(--hair); }
+.worklog-step:last-child { border-bottom: 0; }
+/* The one that worked reads differently from the ones that did not. */
+.worklog-step[data-outcome='kept'] { background: color-mix(in srgb, var(--good) 5%, transparent); }
+.worklog-step-head { display: flex; align-items: center; gap: 9px; margin-bottom: 6px; }
+.worklog-n { font: 500 11px var(--mono); color: var(--ink-3); }
+.worklog-step .payload { max-height: 180px; }
+
+/* ---------------------------------------------------- project settings ---- */
+
+.project-fields { padding: 4px 16px 16px; display: flex; flex-direction: column; gap: 16px; }
+.project-field {
+  padding: 14px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-lg);
+  background: color-mix(in srgb, var(--ink) 2%, transparent);
+}
+.project-field-head { display: flex; align-items: baseline; gap: 9px; }
+.project-field-head strong { font-size: 13px; }
+.project-field-what {
+  margin: 6px 0 0;
+  max-width: 76ch;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.project-field .actions input { flex: 1 1 320px; min-width: 0; }
+.project-field-note {
+  margin: 9px 0 0;
+  font: 400 11.5px var(--mono);
+  color: var(--ink-3);
+}
+
 .set-head {
   display: flex;
   align-items: center;
@@ -1213,54 +1418,72 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 
 /* --- feed --- */
 .feed { display: flex; flex-direction: column; }
+/* A row, not a card. See FeedRow for why. */
 .feed-row {
-  display: flex;
-  gap: 18px;
-  padding: 16px;
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) auto auto;
+  align-items: baseline;
+  gap: 3px 12px;
+  padding: 7px 16px;
   border-bottom: 1px solid var(--hair);
+  text-decoration: none;
+  color: inherit;
 }
 .feed-row:last-child { border-bottom: 0; }
-.feed-row:hover { background: color-mix(in srgb, var(--signal) 4%, transparent); }
-.feed-main { flex: 1; min-width: 0; }
-.feed-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
-.feed-source {
-  font: 600 10.5px var(--mono);
-  text-transform: uppercase;
+.feed-row:hover { background: color-mix(in srgb, var(--signal) 6%, transparent); }
+.feed-tag {
+  font: 500 9.5px var(--mono);
   letter-spacing: 0.06em;
-  border: 1px solid currentColor;
+  text-transform: uppercase;
+  border: 1px solid;
   border-radius: 3px;
-  padding: 1px 5px;
+  padding: 2px 5px;
+  text-align: center;
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
 }
-.feed-date { font: 400 11px var(--mono); color: var(--ink-3); }
-.feed-engagement { font: 400 11px var(--mono); color: var(--ink-3); }
-.feed-headline { font: 600 15px/1.35 var(--display); font-variation-settings: 'wdth' 100, 'wght' 600; }
-.feed-author { font: 400 12px var(--mono); color: var(--signal); margin-top: 2px; }
-.feed-comment {
-  margin-top: 8px;
+.feed-title {
   font-size: 13.5px;
-  line-height: 1.5;
+  line-height: 1.4;
+  /* One line, cut with an ellipsis. The full text is on the row's tooltip. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+/* The content line, under the title and aligned with it — the tag column stays
+   empty so the two lines read as one item rather than two rows. */
+.feed-snippet {
+  grid-column: 2 / -1;
+  font-size: 12px;
+  line-height: 1.45;
   color: var(--ink-2);
-  border-left: 2px solid color-mix(in srgb, var(--signal) 35%, transparent);
-  padding-left: 10px;
-  white-space: pre-wrap;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
-.feed-actions { margin-top: 10px; }
-.feed-link { font: 500 12px var(--mono); color: var(--signal); text-decoration: none; }
-.feed-link:hover { text-decoration: underline; }
-.feed-video { flex: 0 0 240px; max-width: 240px; }
-.feed-video iframe {
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  border: 1px solid var(--hair);
-  border-radius: 4px;
-  background: #000;
-}
+.feed-video-mark { color: var(--signal); margin-right: 6px; font-size: 10px; }
+.feed-by { color: var(--ink-3); }
+.feed-engagement { font: 400 11px var(--mono); color: var(--ink-3); white-space: nowrap; }
+.feed-date { font: 400 11px var(--mono); color: var(--ink-3); white-space: nowrap; }
 
-
+/* The narrow-viewport layout, whose opening line my earlier edit removed. */
 @media (max-width: 900px) {
-  .dash { height: auto; flex-direction: column; }
+  /* Give the page back its own scroll.
+     The desktop layout is a fixed-height shell with an inner scroller: the body
+     is locked to 100% and `overflow: hidden`, and .dash-main does the
+     scrolling. Stacked into one column that stops working — the column grows
+     past the viewport, the body clips it, and nothing scrolls, so everything
+     below the fold is simply unreachable. On a phone the native page scroll is
+     also the better one: it is what hides the address bar and what momentum
+     and overscroll are attached to. */
+  html, body, #root { height: auto; min-height: 100%; }
+  body { overflow: visible; }
+  .dash { flex-direction: column; height: auto; }
   .dash-rail { width: 100%; height: auto; max-height: 320px; border-right: 0; border-bottom: 1px solid var(--hair); }
-  .dash-main { overflow-y: visible; }
+  .dash-main { overflow-y: visible; height: auto; }
   .split, .docket { grid-template-columns: 1fr; }
   .docket-list { border-right: 0; border-bottom: 1px solid var(--hair); max-height: 300px; }
   .masthead { flex-wrap: wrap; height: auto; padding: 12px 28px; }
@@ -1276,9 +1499,13 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 .topic-stack { display: grid; gap: 10px; }
 .topic-chart { width: 100%; height: auto; display: block; touch-action: none; }
 
+/* Inset from the container.
+   The chart above is deliberately edge to edge — a plot loses nothing by using
+   the full width — but the key is text, and text running into the container
+   wall reads as a layout fault rather than as a choice. */
 .topic-key {
   display: flex; flex-wrap: wrap; gap: 4px 14px;
-  padding-top: 8px; border-top: 1px solid var(--hair);
+  padding: 8px 16px 0; border-top: 1px solid var(--hair);
 }
 .topic-key-item {
   display: inline-flex; align-items: center; gap: 6px;
@@ -1339,7 +1566,10 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
    Direction is signed, so this takes the diverging encoding: arrivals right,
    departures left, off a shared centre. The side answers the question before
    any number is read. */
-.migration { display: grid; gap: 10px; }
+/* Padded like a `.tape-body`, which is what it is — it sits straight after a
+   `.tape-head` with no wrapper of its own, so without this the first row of
+   bars touches the header's bottom rule and the labels touch both edges. */
+.migration { display: grid; gap: 10px; padding: 14px 26px 8px; }
 .migration-head {
   display: flex; align-items: baseline; gap: 8px;
   font: 400 11px var(--mono); color: var(--ink-3);
@@ -1589,7 +1819,14 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 
 /* --- public scorecard --- */
 .score-group { padding: 0 16px 14px; }
-.score-kind {
+.score .score-kind {
+  font: 400 9.5px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 2px;
+}
+.score-kind-legacy {
   display: block;
   margin-bottom: 8px;
   font: 500 10.5px var(--mono);
@@ -1597,12 +1834,29 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   text-transform: uppercase;
   color: var(--ink-3);
 }
-.score-row { display: flex; flex-wrap: wrap; gap: 10px; }
+/* Three to a row, on a fixed grid.
+   A wrapping flex row packed them by width, so the number per line changed with
+   how long the site names were and the cards never lined up between one group
+   and the next. A grid puts them in columns you can read down. */
+.score-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  padding: 4px 16px 16px;
+}
+@media (max-width: 720px) {
+  .score-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 460px) {
+  .score-row { grid-template-columns: minmax(0, 1fr); }
+}
 .score {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  min-width: 132px;
+  /* The grid owns the width now; a min-width here would force a fourth column
+     to overflow rather than shrink. */
+  min-width: 0;
   padding: 10px 12px;
   border: 1px solid var(--hair);
   border-radius: 6px;
@@ -1648,3 +1902,200 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 .role-option { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; color: var(--ink-2); }
 .role-option input { margin-top: 2px; }
 .role-option b { color: var(--ink); font-weight: 500; }
+
+/* ---------------------------------------------------------- provenance ---
+ *
+ *  Under a defect's title: the links it was built from, so the reading can be
+ *  checked against the thread. Links only — everything that described them was
+ *  furniture on the way to the one thing that matters. */
+.prov { margin: 0 0 18px; }
+.prov h5 { margin: 0 0 6px; }
+.prov-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
+.prov-list a {
+  font: 400 12px var(--mono);
+  overflow-wrap: anywhere;
+}
+
+/* One line above the defect list: what moved since the previous run. */
+.delta {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--rule);
+  font: 400 11px var(--mono);
+  color: var(--ink-2);
+}
+.delta b { color: var(--ink); font-weight: 500; }
+
+/* Presence editing: adding a channel, and the venues with none. */
+.presence-add {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--rule);
+}
+.presence-add input { min-width: 260px; }
+.presence-row.gap .handle { font-style: italic; }
+/* Rows inside a named venue drop the platform column: the section heading
+   already says it, and the handle carries the link. */
+.presence-row.bare { grid-template-columns: minmax(0, 1fr) auto; }
+.presence-row .meta { display: flex; align-items: center; gap: 6px; }
+
+/* The venue heading now carries whether a reply can be sent from it. */
+.presence-section { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.presence-section .q { text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+/* The loop as a ladder: what has happened, and what has not.
+   The unfinished rungs are the point — a complaint sitting unacknowledged for
+   nine days is the story this panel exists to tell. */
+.loop-step[data-state='todo'] { opacity: 0.55; }
+.loop-step[data-state='todo'] .loop-dot { background: none; border: 1px dashed var(--ink-3); }
+.loop-step[data-state='next'] .loop-dot { background: var(--signal); box-shadow: 0 0 0 3px color-mix(in srgb, var(--signal) 22%, transparent); }
+.loop-step[data-state='next'] .loop-label { color: var(--ink); font-weight: 600; }
+.loop-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.loop-status-m { font: 400 11px var(--mono); color: var(--ink-2); margin-top: 4px; }
+.loop-quote {
+  margin: 6px 0 0;
+  padding: 8px 12px;
+  border-left: 2px solid var(--rule);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+/* The subject line: where it lives, and how much of the internet to search.
+   The second is the most consequential control on the page, so it sits beside
+   the first rather than behind a tab. */
+.subject-line { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+/* Filled, because outlined it was indistinguishable from a `.tag` — same pill,
+   same border weight, same small mono — and every tag on this page is inert. It
+   read as a label saying "search deeper" rather than a control that does it. */
+.subject-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.headline {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 14px;
+  border: 1px solid var(--signal);
+  border-radius: var(--r);
+  background: linear-gradient(180deg, color-mix(in srgb, white 10%, var(--signal)) 0%, var(--signal) 100%);
+  color: var(--paper);
+  font: 600 11.5px var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(19, 24, 32, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  transition: filter 0.15s ease;
+}
+.headline:hover:not(:disabled) { filter: brightness(1.08); }
+.headline:disabled { opacity: 0.45; cursor: default; box-shadow: none; }
+.headline-n {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, black 22%, transparent);
+  font-size: 10.5px;
+}
+
+.deeper {
+  padding: 5px 12px;
+  border: 1px solid var(--signal);
+  border-radius: var(--r);
+  background: linear-gradient(180deg, color-mix(in srgb, white 10%, var(--signal)) 0%, var(--signal) 100%);
+  color: var(--paper);
+  font: 600 11px var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(19, 24, 32, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  transition: filter 0.15s ease;
+}
+.deeper:hover:not(:disabled) { filter: brightness(1.08); }
+.deeper:disabled { opacity: 0.45; cursor: default; box-shadow: none; }
+
+/* Watching a run somebody else started: the same console the live run shows. */
+.busy-run { padding: 10px 14px 0; }
+.busy-run .console { max-height: 260px; }
+.busy-clock { font: 600 15px var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+
+.log-raw {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  max-height: 180px;
+  overflow: auto;
+  border-left: 2px solid var(--rule);
+  font: 400 11px var(--mono);
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.notice details { flex-basis: 100%; }
+
+/* The step that failed, so the ladder says how far it got. */
+.steps-run-item[data-state='failed'] { align-items: flex-start; flex-wrap: wrap; }
+.steps-run-item[data-state='failed'] .steps-run-dot { background: var(--critical); box-shadow: 0 0 0 3px color-mix(in srgb, var(--critical) 22%, transparent); margin-top: 5px; }
+.steps-run-item[data-state='failed'] .steps-run-label { color: var(--critical); font-weight: 600; }
+/* `.conn-err` is `nowrap` with an ellipsis, which is right in a settings row
+   and wrong here — it cut "nothing is listening there" to "noth …" and hid the
+   only part that says what to do. The whole message wraps onto its own line. */
+.steps-run-item[data-state='failed'] .conn-err {
+  flex-basis: 100%;
+  margin: 2px 0 0 17px;
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  color: var(--critical);
+}
+
+/* ------------------------------------------------------------ coverage ---
+ *
+ *  Source down the side, time across the top. The empty cells carry the
+ *  meaning, so they are drawn rather than left blank. */
+.cover { border-bottom: 1px solid var(--rule); padding: 12px 16px 16px; }
+.cover-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.cover-head h3 {
+  margin: 0;
+  font: 500 11px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.cover-grid { display: grid; gap: 2px; align-items: center; }
+/* Turned on its side so every bucket can be labelled.
+   `vertical-rl` reads top-to-bottom, which is the conventional direction for a
+   rotated column header and needs no transform — a rotate() would take the
+   label out of flow and stop the row sizing itself. */
+.cover-col {
+  writing-mode: vertical-rl;
+  font: 400 9.5px var(--mono);
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  height: 44px;
+  justify-self: center;
+  align-self: end;
+  letter-spacing: 0.02em;
+}
+/* A fixed slot, so hovering a cell cannot move the grid under the cursor. */
+.cover-note {
+  margin: 10px 0 0;
+  min-height: 2.4em;
+  font: 400 11px var(--mono);
+  color: var(--ink-3);
+}
+.cover-row-name {
+  display: flex; align-items: center; gap: 6px;
+  background: none; border: 0; padding: 0 6px 0 0;
+  font: 400 11px var(--mono); color: var(--ink-2);
+  text-align: left; cursor: pointer; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.cover-row-name:hover { color: var(--ink); }
+/* A source with nothing at all is the actionable row, so it is legible rather
+   than faded into the background like an ordinary empty cell. */
+.cover-row-name.empty { color: var(--warning); }
+.cover-swatch { width: 7px; height: 7px; border-radius: 2px; flex: none; }
+.cover-cell { height: 14px; border-radius: 2px; }
+.cover-cell.none { background: color-mix(in srgb, var(--ink-3) 12%, transparent); }
+.cover-total { font: 400 10px var(--mono); color: var(--ink-3); text-align: right; }
+.cover-total.none { color: var(--warning); }

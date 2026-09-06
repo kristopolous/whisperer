@@ -54,6 +54,34 @@ export const fmtScore = (n: number) => (n > 0 ? '+' : n < 0 ? '−' : '') + Math
 export const fmtMonth = (iso: string) =>
   new Date(iso).toLocaleDateString(undefined, { month: 'short', year: '2-digit' });
 
+/** Label a timeline bucket at whatever grain it actually is.
+ *
+ *  Buckets are no longer always months — a scan covering a fortnight is bucketed
+ *  by day, and calling every bar "Sep 26" when there are thirty of them in
+ *  September is worse than useless. The bucket's own shape says which it is: a
+ *  month bucket is always the first of the month, so anything else is finer.
+ *
+ *  Not perfect — the 1st of a month is genuinely ambiguous — so callers pass the
+ *  series and the decision is made once for all of it. */
+export function fmtBucket(iso: string, grain: 'day' | 'week' | 'month'): string {
+  const date = new Date(iso);
+  if (grain === 'month') return date.toLocaleDateString(undefined, { month: 'short', year: '2-digit' });
+  return date.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+}
+
+/** What grain a series of buckets is at, read from the gaps between them.
+ *
+ *  Derived rather than passed down from the server: the charts take a list of
+ *  points and nothing else, and threading a grain through every caller to say
+ *  something the data already shows would be ceremony. */
+export function grainOf(buckets: string[]): 'day' | 'week' | 'month' {
+  if (buckets.length < 2) return buckets[0]?.endsWith('-01') ? 'month' : 'day';
+  const days = (Date.parse(buckets[1]!) - Date.parse(buckets[0]!)) / 86_400_000;
+  if (days >= 28) return 'month';
+  if (days >= 6) return 'week';
+  return 'day';
+}
+
 export const fmtDate = (iso: string | null) =>
   iso ? new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) : 'undated';
 
@@ -66,8 +94,29 @@ export function counts(mentions: Mention[]) {
   return [...map.entries()].sort((a, b) => b[1] - a[1]);
 }
 
+/** Turn an API path into one that survives being served behind a proxy.
+ *
+ *  Two things go wrong otherwise, and both are silent.
+ *
+ *  A leading slash means "the root of this origin", which throws away whatever
+ *  prefix the app is mounted under — `/api/scans` instead of
+ *  `/whisperer/api/scans`. So any leading slash is stripped rather than
+ *  trusted; a caller writing one is asking for a path, not for the root.
+ *
+ *  A bare relative path is resolved against the current document, which is
+ *  correct only while that document's URL ends in a slash. Mounted at
+ *  `/whisperer` with no trailing slash, `api/scans` resolves to `/api/scans`
+ *  and loses the prefix in the other direction. So it is joined onto the base
+ *  the bundle was built with, which is the one thing that knows where this is
+ *  mounted.
+ */
+export function apiUrl(path: string): string {
+  const base = (import.meta.env.BASE_URL || '/').replace(/\/*$/, '/');
+  return base + path.replace(/^\/+/, '');
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetch(apiUrl(path), {
     ...init,
     headers: init?.body ? { 'Content-Type': 'application/json' } : undefined,
   });
@@ -84,8 +133,12 @@ export function fmtAgo(iso: string | undefined | null): string | null {
   if (!iso) return null;
   const ms = Date.now() - Date.parse(iso);
   if (!Number.isFinite(ms) || ms < 0) return null;
+  // No "ago". Every reading of this is already in a context that says so — a
+  // column of ages, a "pulled" label — and the word is then printed once per
+  // row to add nothing. The unit carries it: `14h` beside a company name is not
+  // ambiguous.
   if (ms < 90_000) return 'just now';
-  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`;
-  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h ago`;
-  return `${Math.round(ms / 86_400_000)}d ago`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.round(ms / 86_400_000)}d`;
 }

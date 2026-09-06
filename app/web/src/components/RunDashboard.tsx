@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { Scan, Stage } from '../../../shared/types.ts';
-import { cleanName, fmtMonth } from '../lib.ts';
+import { cleanName, fmtAgo, fmtMonth } from '../lib.ts';
 
 /** A past run as served by GET /api/scans — mentions/issues stripped to counts. */
 export interface RunSummary {
@@ -124,8 +124,18 @@ export function RunDashboard({
                 {run.counts.scored ? fmtScore(run.net.now) : '—'}
               </span>
               <span className="c">{run.counts.issues} issues</span>
-              <span className={`tag ${run.status === 'done' ? 'good' : run.status === 'error' ? 'critical' : 'warning'}`}>
-                {run.status}
+              {/* Age, not "done".
+                  A run that finished says nothing useful by saying so — every
+                  row in a working install says "done" and the word is the same
+                  on a scan from an hour ago and one from a fortnight ago. What
+                  the rail is actually asked is "which of these is stale", and
+                  only the age answers it. The other states keep their word,
+                  because "running" and "error" are not about time. */}
+              <span
+                className={`tag ${run.status === 'done' ? 'plain' : run.status === 'error' ? 'critical' : 'warning'}`}
+                title={new Date(run.createdAt).toLocaleString()}
+              >
+                {run.status === 'done' ? (fmtAgo(run.createdAt) ?? 'done') : run.status}
               </span>
             </span>
           </button>

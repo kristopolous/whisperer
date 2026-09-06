@@ -14,7 +14,7 @@ import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { loadConfig } from './config.ts';
+import { loadConfig, loadRaw, writeRaw } from './config.ts';
 import { resolveWorkspace } from './workspace.ts';
 
 const run = promisify(execFile);
@@ -33,6 +33,111 @@ export interface RepoConfig {
    *  GitLab mirror of a GitHub repo. Include the query that selects the right
    *  product: `https://bugs.kde.org/rest/bug?product=krita`. */
   tracker?: string;
+}
+
+/** What is known about a company's project, and where each part came from.
+ *
+ *  Two sources, kept apart on purpose. Discovery is a guess made by a model
+ *  from a name and a website — usually right, sometimes confidently wrong, and
+ *  never something to silently prefer over a person's answer. What somebody
+ *  typed in is a statement. So both are carried, the typed one wins, and the
+ *  screen can show what would have been used if it were removed.
+ *
+ *  Per company rather than per scan: rescanning a company must not lose the
+ *  fact that its tracker is a Bugzilla on a different host. That is a durable
+ *  fact about the project, not about one run of it. */
+export interface Project {
+  company: string;
+  /** What a person specified, if anything. */
+  specified: Omit<RepoConfig, 'company'>;
+  /** What the resolve agent worked out, for the fields it can answer. */
+  discovered: { url?: string; tracker?: string };
+  /** What will actually be used, field by field. */
+  effective: { url?: string; tracker?: string; path?: string; testCommand?: string };
+  /** Where each effective value came from.
+   *
+   *  Three origins, not two, and the third is the one that was being
+   *  misreported. `specified` is a person's answer and `discovered` is the
+   *  resolve agent's, but the tracker has a fourth possibility: nothing
+   *  discovers a tracker, ever, and the effective value is the repository URL
+   *  on the reasoning that a GitHub or GitLab repo is its own issue tracker.
+   *  That is a default. Labelling it "discovered" credited a guess nobody made,
+   *  and the note that would have explained it never rendered because the
+   *  discovered field was empty. */
+  source: Record<'url' | 'tracker' | 'path' | 'testCommand', 'specified' | 'discovered' | 'default' | 'none'>;
+}
+
+export function projectFor(company: string, discovered: { repo?: string } = {}): Project {
+  const { company: _named, ...specified } = repoFor(company) ?? { company };
+  void _named;
+
+  // A repository host is its own issue tracker unless told otherwise, which is
+  // true for GitHub and GitLab and false for anything using a separate
+  // Bugzilla — hence the override.
+  const url = specified.url || discovered.repo || undefined;
+  const tracker = specified.tracker || url;
+
+  const origin = (
+    typed: string | undefined,
+    found: string | undefined,
+    fallback: string | undefined,
+  ): 'specified' | 'discovered' | 'default' | 'none' => {
+    if (typed) return 'specified';
+    if (found) return 'discovered';
+    return fallback ? 'default' : 'none';
+  };
+
+  return {
+    company,
+    specified,
+    discovered: { url: discovered.repo || undefined, tracker: undefined },
+    effective: {
+      url,
+      tracker,
+      path: specified.path,
+      testCommand: specified.testCommand,
+    },
+    source: {
+      url: origin(specified.url, discovered.repo, undefined),
+      // The only field with a real default, and the reason this map exists.
+      tracker: origin(specified.tracker, undefined, tracker),
+      path: origin(specified.path, undefined, undefined),
+      testCommand: origin(specified.testCommand, undefined, undefined),
+    },
+  };
+}
+
+/** Write a company's project settings. An empty string clears a field back to
+ *  whatever discovery says, which is why they are stored as absent rather than
+ *  as empty strings. */
+export function patchProject(company: string, changes: Partial<Omit<RepoConfig, 'company'>>): Project {
+  const raw = loadRaw<{ repos: RepoConfig[] }>('repos');
+  raw.value.repos ??= [];
+  const index = raw.value.repos.findIndex(
+    (r) => r.company.toLowerCase() === company.trim().toLowerCase(),
+  );
+  const entry: RepoConfig = index === -1 ? { company: company.trim() } : raw.value.repos[index]!;
+
+  const fields = entry as unknown as Record<string, string | undefined>;
+  for (const [key, value] of Object.entries(changes)) {
+    if (key === 'company') continue;
+    const trimmed = String(value ?? '').trim();
+    if (trimmed) fields[key] = trimmed;
+    else delete fields[key];
+  }
+
+  // An entry holding nothing but a company name is noise in the file; drop it
+  // so "cleared everything" leaves the config as it was before anyone typed.
+  const meaningful = Object.keys(entry).some((k) => k !== 'company');
+  if (index === -1) {
+    if (meaningful) raw.value.repos.push(entry);
+  } else if (!meaningful) {
+    raw.value.repos.splice(index, 1);
+  }
+
+  writeRaw('repos', raw.value);
+  reloadRepos();
+  return projectFor(company);
 }
 
 let cache: ReturnType<typeof loadConfig<{ repos: RepoConfig[] }>> | null = null;
@@ -67,6 +172,15 @@ export async function ensureCheckout(
    *  repository this app has no credential for — which is the normal case
    *  inside a company. */
   workspace?: string,
+  /** The fork to clone from, as `owner/repo`.
+   *
+   *  Cloning the fork rather than upstream is what makes the working copy
+   *  writable. Everything downstream then has a remote it is allowed to push
+   *  to, so a fix is a branch and a push instead of a file-by-file walk of the
+   *  Contents API — which cannot express a rename or a deletion and chokes on
+   *  anything binary. The guard does not move: the fork is under the token's
+   *  own account, and `assertWritable` still checks that before any write. */
+  fork?: string,
 ): Promise<{ path: string; config: RepoConfig }> {
   if (workspace) {
     // Throws with a plain explanation if the name escapes the workspace, is not
@@ -78,8 +192,9 @@ export async function ensureCheckout(
     return { path: resolved, config: { company, path: resolved } };
   }
 
-  const config = repoFor(company)
-    ?? (discovered ? { company, url: discovered } : undefined);
+  const config = fork
+    ? { company, url: `https://github.com/${fork}.git` }
+    : repoFor(company) ?? (discovered ? { company, url: discovered } : undefined);
   if (!config) {
     throw new Error(
       `no repository configured for "${company}" — add it to config/repos.json before diagnosing`,
@@ -98,7 +213,11 @@ export async function ensureCheckout(
 
   if (!config.url) throw new Error(`repository for "${company}" has neither a url nor a path`);
 
-  const dir = path.join(ROOT, config.company.toLowerCase().replace(/[^a-z0-9._-]+/g, '-'));
+  // A fork gets its own directory. The upstream clone is read-only by
+  // convention and the fork's is written to, and one directory serving both
+  // would mean a stray branch on a checkout something else assumed was clean.
+  const slug = (fork ?? config.company).toLowerCase().replace(/[^a-z0-9._-]+/g, '-');
+  const dir = path.join(ROOT, fork ? `fork-${slug}` : slug);
   if (existsSync(path.join(dir, '.git'))) {
     emit('info', `using existing checkout at ${path.relative(process.cwd(), dir)}`);
     return { path: dir, config };

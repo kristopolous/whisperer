@@ -1,8 +1,6 @@
-import { useCallback, useState } from 'react';
-import { STAGES, type Stage } from '../../../shared/types.ts';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { STAGES, type ErrorKind, type Scan, type Stage } from '../../../shared/types.ts';
 import { api } from '../lib.ts';
-
-type ErrorKind = 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'busy' | 'other';
 
 interface ConnectorStatus {
   name: string;
@@ -12,10 +10,111 @@ interface ConnectorStatus {
   error?: string;
 }
 
+/** What the run that refused this one is actually doing.
+ *
+ *  The run's own log, not a summary of it. A one-line digest could say
+ *  "Discovery, 4 minutes" and still leave the only question that matters —
+ *  is it moving? — unanswered; the log answers it by scrolling. It is also the
+ *  same thing the live run shows, so watching a run somebody else started looks
+ *  like watching your own.
+ *
+ *  Polled rather than streamed: the event stream belongs to whoever started the
+ *  run, and this is by definition the other caller. The scan record is written
+ *  at every stage boundary, so the log is on disk and only had to be read.
+ */
+function BusyProgress({ scanId, onStop, stopping }: {
+  scanId: string;
+  onStop?: () => void;
+  stopping?: boolean;
+}) {
+  const [scan, setScan] = useState<Scan | null>(null);
+  const [now, setNow] = useState(Date.now());
+  const tail = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let live = true;
+    const read = () => {
+      api<Scan>(`api/scans/${scanId}`)
+        .then((data) => { if (live) setScan(data); })
+        .catch(() => {});
+    };
+    read();
+    const poll = setInterval(read, 4_000);
+    // The clock ticks on its own so it moves every second rather than jumping
+    // in four-second steps — a clock that stutters reads as a stalled run.
+    const tick = setInterval(() => setNow(Date.now()), 1_000);
+    return () => { live = false; clearInterval(poll); clearInterval(tick); };
+  }, [scanId]);
+
+  useEffect(() => { tail.current?.scrollTo({ top: 1e6 }); }, [scan?.log?.length]);
+
+  if (!scan) return null;
+  if (scan.status !== 'running') {
+    // The status alone said "FINISHED — ERROR" and stopped there, which names
+    // the outcome and withholds the only part that is any use. The scan carries
+    // the message and the stage that produced it; both go on screen.
+    const failed = scan.status === 'error';
+    return (
+      <div className={`notice${failed ? '' : ' ok'}`}>
+        <span className={`tag ${failed ? 'critical' : 'plain'}`}>finished — {scan.status}</span>
+        {failed && scan.error && (
+          <span>
+            {scan.failedStage && <b>{STAGES.find((s) => s.key === scan.failedStage)?.label ?? scan.failedStage}: </b>}
+            {scan.error}
+          </span>
+        )}
+        {failed && scan.errorDetail && scan.errorDetail !== scan.error && (
+          <details>
+            <summary className="conn-meta">raw</summary>
+            <pre className="log-raw">{scan.errorDetail}</pre>
+          </details>
+        )}
+      </div>
+    );
+  }
+
+  const log = scan.log ?? [];
+  const label = STAGES.find((s) => s.key === scan.stage)?.label ?? scan.stage;
+  // From the first line of THIS run. The record is created once and re-run for
+  // months, so `createdAt` reported a three-minute scan as "2924 min in".
+  const startedAt = log[0]?.at;
+  const seconds = startedAt ? Math.max(0, Math.round((now - new Date(startedAt).getTime()) / 1000)) : 0;
+  const clock = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+
+  return (
+    <>
+      <div className="notice">
+        <span className="tag warning">already running</span>
+        <span className="busy-clock">{clock}</span>
+        <span className="conn-meta">{label}</span>
+        {onStop && (
+          <button className="rerun" onClick={onStop} disabled={stopping}>
+            {stopping ? 'Stopping…' : '■ Stop it'}
+          </button>
+        )}
+      </div>
+      {log.length > 0 && (
+        <div className="busy-run">
+          <div className="console" ref={tail}>
+            {log.slice(-200).map((line, i) => (
+              <div key={i} className={`log-line lvl-${line.level}`}>
+                <span className="log-time">{line.at.slice(11, 19)}</span>
+                <span className="log-stage">{line.stage}</span>
+                {line.text}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 /** A run (or a single step of it) failed. Explain it in plain language, offer a
  *  corrective action where one exists (reconnect connectors), let the user retry
  *  the failed step, and tuck the raw error behind a details toggle. */
 export function FailureBox({
+  scanId,
   stage,
   message,
   detail,
@@ -26,6 +125,7 @@ export function FailureBox({
   onStop,
   stopping,
 }: {
+  scanId?: string;
   stage?: Stage;
   message: string;
   detail?: string;
@@ -51,21 +151,14 @@ export function FailureBox({
   // Following that advice is the one thing that cannot help — the second run is
   // refused for the same reason, so the box reappears and reads as a loop.
   if (kind === 'busy') {
+    // No prose. The tag says what is happening and the clock says how long; the
+    // paragraph that used to be here explained a situation the two of them
+    // already describe.
     return (
       <div className="panel">
-        <div className="notice">
-          <span className="tag warning">already running</span>
-          <span>
-            {message} It keeps going on the server whether or not the dashboard is watching, so its
-            results will be there when it finishes — reload to watch it, or stop it and keep
-            whatever it has collected so far.
-          </span>
-          {onStop && (
-            <button className="rerun" onClick={onStop} disabled={stopping}>
-              {stopping ? 'Stopping…' : '■ Stop it'}
-            </button>
-          )}
-        </div>
+        {scanId
+          ? <BusyProgress scanId={scanId} onStop={onStop} stopping={stopping} />
+          : <div className="notice"><span className="tag warning">already running</span></div>}
       </div>
     );
   }

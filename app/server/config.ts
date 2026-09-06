@@ -115,10 +115,12 @@ export interface ConnectorConfig {
     | { type: 'query'; param: string; value: string };
   /** Set false to keep an entry documented but out of the running set. */
   enabled?: boolean;
-  /** What this connector is for, and therefore where the pipeline uses it.
-   *  A list: bright-data really is both a search engine and a scraper. See
-   *  app/server/roles.ts. */
-  roles?: ConnectorRole[];
+  /** Tool names as last reported by the server, cached from `tools/list`.
+   *
+   *  Kept so the settings screen can say which roles a server plausibly suits
+   *  without dialling every server on every page load. Advisory only — see
+   *  Provider.likely in providers.ts. */
+  tools?: string[];
   /** Which tool serves each declared role, and what its argument is called.
    *  Bound once when the server is added rather than guessed per call, so a
    *  renamed tool is a visible settings error instead of a silent empty. */
@@ -182,7 +184,6 @@ export function addConnector(entry: {
   url: string;
   description?: string;
   requires?: string[];
-  roles?: ConnectorRole[];
   auth?: ConnectorConfig['auth'];
 }): ConnectorConfig {
   const name = entry.name.trim();
@@ -207,7 +208,6 @@ export function addConnector(entry: {
     url: entry.url,
     description: entry.description?.trim() || 'Added from the settings screen.',
     ...(entry.requires?.length ? { requires: entry.requires } : {}),
-    ...(entry.roles?.length ? { roles: entry.roles } : {}),
     ...(entry.auth ? { auth: entry.auth } : {}),
   };
   raw.value.connectors.push(connector);
@@ -232,7 +232,8 @@ export function patchConnector(
   changes: {
     url?: string;
     enabled?: boolean;
-    roles?: ConnectorRole[];
+    /** Tool names from the last successful dial, cached for the role hints. */
+    tools?: string[];
     bindings?: Partial<Record<ConnectorRole, RoleBinding>>;
   },
 ): ConnectorConfig {
@@ -251,7 +252,7 @@ export function patchConnector(
     connector.url = changes.url;
   }
   if (changes.enabled !== undefined) connector.enabled = changes.enabled;
-  if (changes.roles !== undefined) connector.roles = changes.roles;
+  if (changes.tools !== undefined) connector.tools = changes.tools;
   if (changes.bindings !== undefined) {
     // Merged, not replaced: binding a server's search tool must not silently
     // drop the scrape binding it already had.

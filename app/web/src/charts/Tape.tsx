@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
 import type { BuzzPoint, Issue } from '../../../shared/types.ts';
-import { fmtDate, fmtMonth, fmtScore } from '../lib.ts';
+import { fmtBucket, fmtDate, fmtScore, grainOf } from '../lib.ts';
 import { useTooltip } from './tooltip.tsx';
 
 /** The tape: sentiment drawn as a continuous trace on ruled recorder paper,
@@ -20,6 +20,9 @@ export function Tape({
 }) {
   const W = 1000, H = 190, PAD = { t: 22, r: 12, b: 26, l: 40 };
   const svgRef = useRef<SVGSVGElement>(null);
+  // Read from the buckets themselves — days, weeks or months depending on
+  // what the scan actually covered.
+  const grain = grainOf(buzz.map((p) => p.bucket));
   const [hover, setHover] = useState<number | null>(null);
   const tip = useTooltip();
 
@@ -68,7 +71,7 @@ export function Tape({
         ref={svgRef}
         viewBox={`0 0 ${W} ${H}`}
         role="img"
-        aria-label={`Sentiment trace across ${buzz.length} months, from ${fmtMonth(buzz[0].bucket)} to ${fmtMonth(buzz.at(-1)!.bucket)}`}
+        aria-label={`Sentiment trace across ${buzz.length} ${grain === 'month' ? 'months' : grain === 'week' ? 'weeks' : 'days'}, from ${fmtBucket(buzz[0].bucket, grain)} to ${fmtBucket(buzz.at(-1)!.bucket, grain)}`}
         onPointerMove={(event) => {
           const index = nearest(event);
           setHover(index);
@@ -76,7 +79,7 @@ export function Tape({
           tip.show(
             event,
             <>
-              <div className="k">{fmtMonth(point.bucket)}</div>
+              <div className="k">{fmtBucket(point.bucket, grain)}</div>
               <div>
                 <span className="v">{fmtScore(point.score)}</span> mean sentiment
               </div>
@@ -147,7 +150,7 @@ export function Tape({
           // Label the ends and every third bucket; a tick under every point is noise.
           i === 0 || i === buzz.length - 1 || i % 3 === 0 ? (
             <text key={point.bucket} className="tick" x={x(i)} y={H - 8} textAnchor="middle">
-              {fmtMonth(point.bucket)}
+              {fmtBucket(point.bucket, grain)}
             </text>
           ) : null,
         )}

@@ -67,6 +67,21 @@ export interface AgentDefinition {
    *  the other. */
   role?: 'general' | 'coding';
   effort: Effort;
+  /** True when the agent's instructions tell it to go and use tools.
+   *
+   *  Nothing in this app can honour that. `runAgent` has no tool loop by
+   *  design, and the local runtime cannot be given one — llama.cpp will not
+   *  compile a json_schema response format and a tools array into the same
+   *  grammar, so a request carrying both is rejected outright. An agent told to
+   *  "run the search connectors attached to you" therefore answers from memory,
+   *  and an agent answering from memory about what people said online invents
+   *  URLs, dates and quotes.
+   *
+   *  So this is a warning label, not a capability. It sits on the definition
+   *  rather than being inferred from the prose, because guessing it from the
+   *  instructions would be exactly the kind of invisible behaviour this
+   *  registry exists to get rid of. */
+  needsTools?: boolean;
   /** False when the live pipeline no longer calls this agent, but it is kept
    *  because it is still worth having as a saved, manually fireable agent.
    *  The agent list shows these separately so "never ran" doesn't read as

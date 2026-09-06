@@ -19,7 +19,7 @@ import { fixIssue } from './agents/fix-run.ts';
 import { ensureFork } from './channels/fork.ts';
 import { openPullRequest } from './channels/github.ts';
 import { discard, outbox } from './outbox.ts';
-import { ensureCheckout, reloadRepos, repoConfig } from './repos.ts';
+import { ensureCheckout, patchProject, projectFor, reloadRepos, repoConfig } from './repos.ts';
 import { hintFor, warnAbout } from './credential-hints.ts';
 import { secretSource, setSecrets, storedSecrets } from './secrets.ts';
 import { availableConnectors, checkConnectors, listTools, toolUsage, type McpTool } from './mcp.ts';
@@ -28,13 +28,23 @@ import {
 } from './roles.ts';
 import { runStage, explainFailure } from './stages.ts';
 import * as store from './store.ts';
+import { buildSeries } from './series.ts';
+import { describeError } from './errors.ts';
+import { performScan } from './run.ts';
+import { listSchedule, removeEntry, runningNow, startScheduler, upsert } from './schedule.ts';
+import { listCredits, setLedger } from './credits.ts';
+import { add as addProfile, applyOverrides, block, overridesFor, unblock } from './presence-overrides.ts';
+import { LANGUAGES } from './languages.ts';
 import { buildPayload } from './trackers.ts';
 import { fileTicket, submitTicket, ticketFiledEvent } from './agents/file-ticket.ts';
 import { respondToUser, deliverReply, replyEvent, type ReplyPhase } from './agents/respond-to-user.ts';
 import { testReddit } from './reddit.ts';
 import { sourceStates } from './sources/index.ts';
+import { investigate } from './agents/investigate-run.ts';
+import { withRunContext } from './run-context.ts';
+import { chainFor, listProviders, setRoleChain } from './providers.ts';
 import { listWorkspaces, resolveWorkspace, workspaceRoot, WorkspaceError } from './workspace.ts';
-import { braveExhausted } from './search.ts';
+import { braveExhausted, resetSearchBudget, searchSpend } from './search.ts';
 import * as cancel from './cancel.ts';
 import { wasCancelled } from './run-context.ts';
 
@@ -76,6 +86,7 @@ app.get('/api/agents', (_req, res) => {
     connectors: agent.connectors,
     effort: agent.effort,
     inPipeline: agent.inPipeline,
+    needsTools: agent.needsTools ?? false,
     /** Roughly how big the standing instructions are — the prompt is the asset,
      *  and its size is worth seeing next to a context-length limit. */
     instructionChars: agent.instructions.length,
@@ -209,6 +220,12 @@ app.get('/api/credentials', (_req, res) => {
       (c.requires ?? []).map((name) => ({ name, usedBy: c.label, kind: 'channel' as const })));
     const fromSources = sourceStates().flatMap((s) =>
       [...s.requires, ...(s.optional ?? [])].map((name) => ({ name, usedBy: s.label, kind: 'source' as const })));
+    // Providers too. Perplexity was registered as a role-chain provider and
+    // nowhere else, so the settings screen showed "needs PERPLEXITY_API_KEY"
+    // with no field anywhere to put it in. Anything that can be asked for a
+    // credential has to be able to receive one.
+    const fromProviders = listProviders().flatMap((p) =>
+      p.missing.map((name) => ({ name, usedBy: p.label, kind: 'provider' as const })));
 
     // One row per credential, listing everything that wants it — several
     // connectors can share a key and asking for it twice would be silly.
@@ -216,7 +233,7 @@ app.get('/api/credentials', (_req, res) => {
       name: string; usedBy: string[]; kind: string; source: string;
       what: string; where: string; url: string; billingUrl: string; secret: boolean;
     }>();
-    for (const entry of [...fromConnectors, ...fromChannels, ...fromSources]) {
+    for (const entry of [...fromConnectors, ...fromChannels, ...fromSources, ...fromProviders]) {
       const hint = hintFor(entry.name);
       const row = byName.get(entry.name) ?? {
         name: entry.name,
@@ -266,6 +283,75 @@ app.put('/api/credentials', async (req, res) => {
  *  Kept as its own surface rather than buried in each issue: the useful review
  *  question is "read everything we were about to post", not "click through
  *  twelve issues". */
+/* ------------------------------------------------------------- schedule --
+ *
+ *  Listed with its next and last run, and what that run found. A schedule that
+ *  only says when it will fire cannot tell you it has been firing into a wall
+ *  for a week. */
+/* -------------------------------------------------------------- credits --
+ *
+ *  What each provider has left. Retrieval is what this product costs, and while
+ *  it is being demoed the free grants are the whole budget — so the number
+ *  belongs on the screen, not in four separate vendor consoles. */
+app.get('/api/credits', (_req, res) => res.json(listCredits()));
+
+/* ------------------------------------------------------------- presence --
+ *
+ *  The footprint is an input, not a readout: a subreddit in it becomes a direct
+ *  query against that subreddit on the next run, and a wrong entry sends every
+ *  later stage somewhere useless. So it is editable, and the edits are rules
+ *  rather than record changes — a channel deleted from one run would simply be
+ *  found again by the next crawl. */
+app.post('/api/scans/:id/presence', (req, res) => {
+  const scan = store.get(req.params.id);
+  if (!scan) return res.status(404).json({ error: 'no such scan' });
+  const { url, action, official } = req.body as { url?: string; action?: string; official?: boolean };
+  if (!url?.trim()) return res.status(400).json({ error: 'expected a url' });
+
+  const key = store.companyKey(scan);
+  if (action === 'block') {
+    block(key, url);
+    // Applied to the loaded scan too, so the panel reflects it without waiting
+    // for a re-crawl that is minutes away and may not be run today.
+    store.patch(scan.id, { profiles: applyOverrides(key, scan.profiles) });
+  } else if (action === 'unblock') {
+    unblock(key, url);
+  } else {
+    const profile = addProfile(key, url, official ?? true);
+    if (!profile) return res.status(400).json({ error: `cannot read a channel out of "${url}"` });
+    store.patch(scan.id, { profiles: applyOverrides(key, scan.profiles) });
+  }
+
+  res.json({ profiles: store.get(req.params.id)!.profiles, overrides: overridesFor(key) });
+});
+
+app.get('/api/scans/:id/presence', (req, res) => {
+  const scan = store.get(req.params.id);
+  if (!scan) return res.status(404).json({ error: 'no such scan' });
+  res.json({ profiles: scan.profiles, overrides: overridesFor(store.companyKey(scan)) });
+});
+
+app.put('/api/credits/:provider', (req, res) => {
+  const body = req.body as { unit?: 'dollars' | 'requests'; granted?: number | null; spent?: number };
+  res.json({ ledger: setLedger(req.params.provider, body ?? {}), credits: listCredits() });
+});
+
+app.get('/api/schedule', (_req, res) => {
+  res.json({ entries: listSchedule(), running: runningNow() });
+});
+
+app.put('/api/schedule', (req, res) => {
+  const body = req.body as { input?: string };
+  if (!body?.input?.trim()) return res.status(400).json({ error: 'expected an input to watch' });
+  upsert({ ...(req.body as object), input: body.input.trim() } as Parameters<typeof upsert>[0]);
+  res.json({ entries: listSchedule(), running: runningNow() });
+});
+
+app.delete('/api/schedule/:id', (req, res) => {
+  if (!removeEntry(req.params.id)) return res.status(404).json({ error: 'no such schedule' });
+  res.json({ entries: listSchedule(), running: runningNow() });
+});
+
 app.get('/api/outbox', (req, res) => {
   res.json(outbox(req.query.scan ? String(req.query.scan) : undefined));
 });
@@ -318,6 +404,45 @@ app.put('/api/inference', (req, res) => {
  *  things, and only the third one is what this app actually depends on. A proxy
  *  that accepts the schema and quietly forwards the request without it looks
  *  identical to success until a stage returns prose. */
+/** What a host actually serves.
+ *
+ *  The model id was a free-text box, and every way of getting it wrong is
+ *  silent: `qwen3.8:27b` against a router that has never heard of it answers
+ *  `all servers failed`, and a baseUrl missing its `/v1` answers 405. Both were
+ *  live in this project's own config. The host will list its models if asked,
+ *  so ask it rather than making somebody type from memory.
+ *
+ *  Reachability comes back too, because "which models" and "is it up" are the
+ *  same question at the moment somebody is configuring one. */
+app.get('/api/inference/models', async (req, res) => {
+  const key = String(req.query.host ?? '').trim();
+  try {
+    // From the config rather than from inferenceHosts(), which deliberately
+    // withholds the key so it can be sent to a browser. This runs server-side
+    // and the key never leaves it.
+    const host = key ? (inferenceConfig().value.hosts ?? {})[key] : undefined;
+    const baseUrl = (String(req.query.baseUrl ?? '') || host?.baseUrl || '').replace(/\/$/, '');
+    if (!baseUrl) return res.status(400).json({ error: 'no baseUrl to ask' });
+
+    const response = await fetch(`${baseUrl}/models`, {
+      headers: host?.apiKey ? { Authorization: `Bearer ${host.apiKey}` } : {},
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) {
+      return res.json({ reachable: false, error: `${response.status}`, models: [] });
+    }
+    const body = (await response.json()) as { data?: { id?: string }[] };
+    const models = (body.data ?? []).map((m) => m.id).filter((id): id is string => Boolean(id));
+    res.json({ reachable: true, models });
+  } catch (error) {
+    res.json({
+      reachable: false,
+      models: [],
+      error: error instanceof Error ? error.message.slice(0, 140) : 'could not reach it',
+    });
+  }
+});
+
 app.post('/api/inference/test', async (_req, res) => {
   const started = Date.now();
   try {
@@ -356,14 +481,6 @@ app.put('/api/connectors/:name', async (req, res) => {
     const changes: Parameters<typeof patchConnector>[1] = {};
     if (typeof req.body?.url === 'string') changes.url = req.body.url.trim();
     if (typeof req.body?.enabled === 'boolean') changes.enabled = req.body.enabled;
-    if (Array.isArray(req.body?.roles)) {
-      const roles = req.body.roles.filter((r: unknown): r is ConnectorRole =>
-        typeof r === 'string' && (ROLES as readonly string[]).includes(r));
-      if (roles.length !== req.body.roles.length) {
-        return res.status(400).json({ error: `roles must be drawn from: ${ROLES.join(', ')}` });
-      }
-      changes.roles = roles;
-    }
     if (req.body?.bindings && typeof req.body.bindings === 'object') {
       const bindings: Partial<Record<ConnectorRole, RoleBinding>> = {};
       for (const [role, value] of Object.entries(req.body.bindings as Record<string, RoleBinding>)) {
@@ -392,7 +509,38 @@ app.put('/api/connectors/:name', async (req, res) => {
 
 /** The role catalogue, so the settings screen can explain what picking one
  *  does rather than showing five bare words. */
-app.get('/api/roles', (_req, res) => res.json(Object.values(ROLE_INFO)));
+/** The role chains, in order, plus every provider that could join one.
+ *
+ *  One payload rather than three requests: the screen is a set of ordered
+ *  lists and an "add" menu of what is not in them, and those are the same
+ *  question asked twice. */
+app.get('/api/roles', (_req, res) => {
+  res.json({
+    roles: ROLES.map((role) => ({ ...ROLE_INFO[role], chain: chainFor(role) })),
+    providers: listProviders(),
+  });
+});
+
+/** Reorder a role's chain, or change who is in it.
+ *
+ *  The array is the complete membership in priority order — first choice
+ *  first — so dragging a row out of the list removes it from the role, and
+ *  dragging one up genuinely changes which provider is asked first. */
+app.put('/api/roles/:role', (req, res) => {
+  const role = req.params.role as ConnectorRole;
+  if (!(ROLES as readonly string[]).includes(role)) {
+    return res.status(400).json({ error: `no role called "${role}"` });
+  }
+  if (!Array.isArray(req.body?.chain)) {
+    return res.status(400).json({ error: 'chain must be an array of provider ids, best first' });
+  }
+  try {
+    setRoleChain(role, req.body.chain.map(String));
+    res.json({ roles: ROLES.map((r) => ({ ...ROLE_INFO[r], chain: chainFor(r) })), providers: listProviders() });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
 
 /** What this process has actually spent on connectors, per tool.
  *
@@ -426,10 +574,6 @@ app.post('/api/connectors', async (req, res) => {
       url: String(body.url ?? '').trim(),
       description: typeof body.description === 'string' ? body.description : undefined,
       requires: Array.isArray(body.requires) ? body.requires.map(String) : undefined,
-      roles: Array.isArray(body.roles)
-        ? body.roles.filter((r: unknown): r is ConnectorRole =>
-          typeof r === 'string' && (ROLES as readonly string[]).includes(r))
-        : undefined,
     });
     res.json({ connector, ...(await inspectConnector(connector.name)) });
   } catch (error) {
@@ -463,6 +607,14 @@ async function inspectConnector(name: string) {
 
   try {
     const tools = await listTools(connector);
+    // Cached on the connector so the role screen can hint at what a server
+    // plausibly does without dialling every server on every page load.
+    try {
+      patchConnector(name, { tools: tools.map((t: McpTool) => t.name) });
+    } catch {
+      // A config that will not take the cache is not a reason to fail the
+      // inspection the caller actually asked for.
+    }
     const suggested: Partial<Record<ConnectorRole, RoleBinding>> = {};
     for (const role of ROLES) {
       const tool = guessTool(role, tools);
@@ -529,6 +681,17 @@ app.get('/api/scans/:id', (req, res) => {
 
 const STAGE_KEYS: Stage[] = STAGES.map((s) => s.key);
 
+
+/** `?languages=zh,ja` — validated against the packs that exist, so a typo is
+ *  dropped rather than silently producing a language nobody searches in.
+ *  Undefined when the parameter is absent, which is different from an empty
+ *  list: absent means "leave it as it was", empty means "English only". */
+function parseLanguages(raw: unknown): string[] | undefined {
+  if (raw === undefined) return undefined;
+  const known = new Set(LANGUAGES.map((l) => l.code));
+  return String(raw).split(',').map((code) => code.trim()).filter((code) => known.has(code));
+}
+
 /** Set up an in-memory, streamed execution context for a scan id. */
 function openStream(res: import('express').Response, onEvent: (event: ScanEvent) => void) {
   res.writeHead(200, {
@@ -571,6 +734,19 @@ app.get('/api/scans/:id/stream', async (req, res) => {
   // the rail — does not jump when the stream opens.
   const existing = store.get(req.params.id);
 
+  // What the last run of this company already worked out.
+  //
+  // A daily run mints a new scan id, so `existing` is an empty shell and
+  // everything static would be re-derived from nothing every morning: the
+  // subject re-resolved with a model call and a search, and the footprint
+  // re-crawled before anything that actually changes got a look in. The
+  // footprint and the resolved subject belong to the company, not to the run.
+  //
+  // Only from a run that got far enough to have them, and never a fixture.
+  const previous = [...store.history(req.params.id)]
+    .reverse()
+    .find((run) => run.id !== req.params.id && !run.fixture && (run.profiles?.length ?? 0) > 0);
+
   const scan: Scan = {
     id: req.params.id,
     input: existing?.input ?? raw,
@@ -579,7 +755,13 @@ app.get('/api/scans/:id/stream', async (req, res) => {
     createdAt: existing?.createdAt ?? new Date().toISOString(),
     status: 'running',
     stage: 'queued',
-    profiles: [],
+    depth: req.query.depth === 'deep' ? 'deep' : (existing?.depth ?? 'normal'),
+    // Carried over from the stored record when the request does not say.
+    // Languages are a property of what is being watched, not of one run, so a
+    // rescan should not quietly stop looking in Japanese.
+    languages: parseLanguages(req.query.languages) ?? existing?.languages ?? previous?.languages ?? [],
+    ...(existing?.subject ?? previous?.subject ? { subject: existing?.subject ?? previous?.subject } : {}),
+    profiles: existing?.profiles?.length ? existing.profiles : (previous?.profiles ?? []),
     mentions: [],
     issues: [],
     abuse: [],
@@ -596,92 +778,14 @@ app.get('/api/scans/:id/stream', async (req, res) => {
   store.put(scan);
 
   const signal = cancel.begin(req.params.id);
+  // One budget per run, not per process — otherwise the second scan of a
+  // session inherits an already-spent one.
+  resetSearchBudget();
 
   const send = openStream(res, () => {});
-  const log: Log = (level, text) => {
-    scan.log.push({ at: new Date().toISOString(), level, stage: scan.stage, text });
-    send({ type: 'log', line: scan.log.at(-1)! });
-  };
 
   try {
-    const servers = availableConnectors();
-    log('info', `${servers.length} connectors: ${servers.join(', ') || 'none'}`);
-    if (servers.length === 0) log('warn', 'no usable connectors — check config/connectors.json and the credentials it names');
-
-    for (const next of STAGE_KEYS) {
-      send({ type: 'stage', stage: next });
-      try {
-        await runStage({ scan, log, send, signal }, next);
-      } catch (error) {
-        // Cancelling stops the run where it is and keeps what it collected.
-        // Handled before the generic branch below, which steps over a failed
-        // stage and carries on — exactly what must not happen here.
-        if (wasCancelled(error)) {
-          scan.status = 'cancelled';
-          scan.stage = next;
-          log('warn', `cancelled at ${next} — keeping what was collected`);
-          store.put(scan);
-          send({ type: 'patch', scan: { status: 'cancelled', stage: next } });
-          send({ type: 'done', scan });
-          return;
-        }
-        const raw = error instanceof Error ? error.message : String(error);
-        const { message, detail, kind } = explainFailure(next, raw);
-        log('error', `failed at ${next}: ${raw}`);
-        scan.status = 'error';
-        scan.stage = next;
-        scan.failedStage = next;
-        scan.error = message;
-        scan.errorDetail = detail;
-        scan.errorKind = kind;
-        store.put(scan);
-        send({ type: 'error', message, stage: next, detail, kind });
-        res.end();
-        return;
-      }
-    }
-
-    // A stage that fails is logged and stepped over (see runStage) so one dead
-    // connector cannot throw away five good stages. That resilience used to end
-    // in a lie: the loop finished, status was set to 'done' unconditionally, and
-    // a scan where every single stage had failed was presented as a completed
-    // scan with six empty panels. Whether the run produced anything is decided
-    // here, from what is actually in the scan.
-    const produced =
-      scan.profiles.length + scan.mentions.length + scan.feed.length +
-      scan.issues.length + scan.abuse.length;
-
-    if (produced === 0) {
-      const reason = scan.error
-        ? `Every stage failed — the last error was: ${scan.error}`
-        : 'Every stage ran without erroring but returned nothing at all.';
-      scan.status = 'error';
-      scan.stage = scan.failedStage ?? 'presence';
-      scan.error = `The scan finished with no data. ${reason}`;
-      scan.errorKind = scan.errorKind ?? 'other';
-      log('error', 'scan produced no data at all');
-      store.put(scan);
-      send({ type: 'error', message: scan.error, stage: scan.stage, detail: scan.errorDetail ?? '', kind: scan.errorKind });
-      return;
-    }
-
-    if (scan.failedStage) {
-      // Partial result: real data, but the user must be told which parts of the
-      // dashboard are empty because a stage broke rather than because there was
-      // nothing to find.
-      log('warn', `finished with ${scan.failedStage} failed — that section is incomplete`);
-    }
-
-    scan.status = 'done';
-    scan.stage = 'done';
-    log('stage', 'done');
-    store.put(scan);
-    send({ type: 'done', scan });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    log('error', message);
-    store.put({ ...scan, status: 'error', error: message });
-    send({ type: 'error', message });
+    await performScan(scan, send, signal);
   } finally {
     cancel.end(req.params.id);
     store.release(req.params.id, 'full scan');
@@ -716,6 +820,19 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
     return res.end();
   }
 
+  // A stage rerun can dig even when the run that produced the scan did not —
+  // "search deeper" is a thing you decide after seeing a thin result, not
+  // before.
+  if (req.query.depth === 'deep' || req.query.depth === 'normal') {
+    scan.depth = req.query.depth;
+    store.patch(req.params.id, { depth: scan.depth });
+  }
+  const asked = parseLanguages(req.query.languages);
+  if (asked) {
+    scan.languages = asked;
+    store.patch(req.params.id, { languages: asked });
+  }
+
   if (req.query.reset === '1') {
     scan.log = [];
     scan.error = undefined;
@@ -747,7 +864,7 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
   } catch (error) {
     if (wasCancelled(error)) {
       log('warn', `cancelled at ${next} — keeping what was collected`);
-      store.put({ ...scan, status: 'cancelled', stage: next });
+      store.patch(req.params.id, { status: 'cancelled', stage: next });
       send({ type: 'patch', scan: { status: 'cancelled', stage: next } });
       send({ type: 'done', scan });
       return;
@@ -755,8 +872,7 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
     const raw = error instanceof Error ? error.message : String(error);
     const { message, detail, kind } = explainFailure(next, raw);
     log('error', `failed at ${next}: ${raw}`);
-    store.put({
-      ...scan,
+    store.patch(req.params.id, {
       status: 'error',
       stage: next,
       failedStage: next,
@@ -815,6 +931,54 @@ app.post('/api/scans', (req, res) => {
  *
  *  Returns whether anything was actually running, so the dashboard can say "it
  *  had already finished" rather than claiming to have stopped something. */
+/** What is known about this company's project, and where each fact came from.
+ *
+ *  Returned as three layers rather than one merged answer — specified,
+ *  discovered, effective — because the interesting question on this screen is
+ *  not only "what will be used" but "is that because I said so, or because
+ *  something guessed". A resolver is right most of the time and confidently
+ *  wrong the rest, and the difference has to be visible before somebody trusts
+ *  a diagnosis built on it. */
+/** How this company's runs compare, and what moved between them.
+ *
+ *  Keyed on the run's own timestamp rather than on when anything was written —
+ *  see the note in series.ts. This is the daily-check surface: what is new
+ *  since yesterday, what is still open, what went away. */
+app.get('/api/scans/:id/series', (req, res) => {
+  const runs = store.history(req.params.id);
+  if (runs.length === 0) return res.status(404).json({ error: 'no such scan' });
+  res.json(buildSeries(runs));
+});
+
+app.get('/api/scans/:id/project', (req, res) => {
+  const scan = store.get(req.params.id);
+  if (!scan) return res.status(404).json({ error: 'no such scan' });
+  res.json({ ...projectFor(scan.company, { repo: scan.subject?.repo }), workspace: scan.workspace ?? null });
+});
+
+/** Specify any of them by hand. An empty value clears the override and lets
+ *  discovery answer again, which is why this is a patch and not a put. */
+app.put('/api/scans/:id/project', (req, res) => {
+  const scan = store.get(req.params.id);
+  if (!scan) return res.status(404).json({ error: 'no such scan' });
+
+  const body = req.body ?? {};
+  const changes: Record<string, string> = {};
+  for (const field of ['url', 'tracker', 'testCommand'] as const) {
+    if (typeof body[field] === 'string') changes[field] = body[field];
+  }
+  if (Object.keys(changes).length === 0) {
+    return res.status(400).json({ error: 'nothing to change' });
+  }
+
+  try {
+    const project = patchProject(scan.company, changes);
+    res.json({ ...project, workspace: scan.workspace ?? null });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.post('/api/scans/:id/cancel', (req, res) => {
   const scan = store.get(req.params.id);
   if (!scan) return res.status(404).json({ error: 'no such scan' });
@@ -978,6 +1142,20 @@ app.post('/api/scans/:id/issues/:issueId/diagnose', async (req, res) => {
     const { path: repo } = await ensureCheckout(scan.company, emit, scan.subject?.repo, scan.workspace);
     const result = await diagnoseIssue(scan, issue, repo, emit);
     issue.diagnosis = { ...result, at: new Date().toISOString() };
+    // On the ledger, not just in the record. Reading the source against a
+    // stranger's complaint is a step somebody took on their behalf, and the
+    // audit trail is the point of this feature — an issue should read top to
+    // bottom as what was done, when, and what it concluded.
+    issue.loop = [...(issue.loop ?? []), {
+      id: randomUUID().slice(0, 8),
+      step: 'reproduced',
+      actor: 'agent',
+      at: issue.diagnosis.at,
+      human: false,
+      summary: `Read the source: ${result.verdict} (${result.confidence} confidence). `
+        + `${result.searched.hits} matching lines across ${result.searched.files.length} files. `
+        + result.likelyCause.slice(0, 200),
+    }];
     store.put(scan);
     res.json({ diagnosis: issue.diagnosis, log: trail });
   } catch (error) {
@@ -985,6 +1163,56 @@ app.post('/api/scans/:id/issues/:issueId/diagnose', async (req, res) => {
       error: error instanceof Error ? error.message : 'diagnosis failed',
       log: trail,
     });
+  }
+});
+
+/** Fork it, read it, patch it, and publish the record — streamed.
+ *
+ *  One route because it is one action. The separate diagnose and fix endpoints
+ *  stay, for anyone who wants a single step, but this is the one the button
+ *  calls: minutes of work with visible progress, rather than four controls in
+ *  an order you have to know. */
+app.get('/api/scans/:id/issues/:issueId/investigate/stream', async (req, res) => {
+  const scan = store.get(req.params.id);
+  const issue = scan?.issues.find((i) => i.id === req.params.issueId);
+  if (!scan || !issue) return res.status(404).json({ error: 'no such issue' });
+
+  const lock = store.claim(req.params.id, 'investigation');
+  const send = openStream(res, () => {});
+  if (!lock.ok) {
+    send({ type: 'error', kind: 'busy', message: `This scan is busy (${lock.held.what}, ${store.heldFor(lock.held)}s).` });
+    return res.end();
+  }
+
+  const signal = cancel.begin(req.params.id);
+  const log: Log = (level, text) => {
+    scan.log.push({ at: new Date().toISOString(), level, stage: 'health', text });
+    send({ type: 'log', line: scan.log.at(-1)! });
+  };
+
+  try {
+    await withRunContext({ scanId: scan.id, stage: 'health', signal }, () => investigate(
+      scan, issue, log,
+      (progress) => send({ type: 'log', line: {
+        at: new Date().toISOString(), level: 'info', stage: 'health',
+        text: `[${progress.step}] ${progress.note}`,
+      } }),
+    ));
+    store.put(scan);
+    send({ type: 'done', scan });
+  } catch (error) {
+    if (wasCancelled(error)) {
+      store.put(scan);
+      send({ type: 'error', kind: 'busy', message: 'Investigation cancelled — what it found so far is kept.' });
+    } else {
+      const raw = describeError(error);
+      store.put(scan);
+      send({ type: 'error', message: raw.slice(0, 300), stage: 'health' });
+    }
+  } finally {
+    cancel.end(req.params.id);
+    store.release(req.params.id, 'investigation');
+    res.end();
   }
 });
 
@@ -1006,6 +1234,21 @@ app.post('/api/scans/:id/issues/:issueId/fix', async (req, res) => {
     const { path: repo } = await ensureCheckout(scan.company, emit, scan.subject?.repo, scan.workspace);
     const result = await fixIssue(scan, issue, issue.diagnosis, repo, emit);
     issue.fix = { ...result, at: new Date().toISOString() };
+    const proven = result.provesTheBug.checked && result.provesTheBug.failedOnOriginal;
+    issue.loop = [...(issue.loop ?? []), {
+      id: randomUUID().slice(0, 8),
+      step: result.applied && result.tests.passed ? 'fixed' : 'reproduced',
+      actor: 'agent',
+      at: issue.fix.at,
+      human: false,
+      summary: result.applied && result.tests.passed
+        ? `Patched ${result.files.length} file(s) in ${result.attempts} attempt(s); `
+          + `\`${result.tests.command}\` passes. `
+          + (proven ? 'The new test fails against the original code, so it catches the bug.'
+            : 'The new test does not fail against the original code, so it proves nothing yet.')
+        : `Tried ${result.attempts} time(s) and did not land a working patch. ${result.notes.slice(0, 160)}`,
+      ref: { label: `${result.attempts} attempt(s)` },
+    }];
     store.put(scan);
     res.json({ fix: issue.fix, log: trail });
   } catch (error) {
@@ -1160,4 +1403,13 @@ const port = Number(process.env.PORT ?? 8791);
  * Deployments that want a wider bind set HOST explicitly and put their own
  * access control in front of it. */
 const host = process.env.HOST ?? '127.0.0.1';
-app.listen(port, host, () => console.log(`whisperer on http://${host}:${port}`));
+app.listen(port, host, () => {
+  console.log(`whisperer on http://${host}:${port}`);
+  // Started with the server and dying with it, on purpose. Say out loud what
+  // is armed, so a scan that appears overnight has a visible cause.
+  startScheduler();
+  const armed = listSchedule().filter((entry) => entry.enabled);
+  console.log(armed.length
+    ? `scheduled: ${armed.map((e) => `${e.input} ${e.cadence} at ${String(e.hour).padStart(2, '0')}:00`).join(', ')}`
+    : 'scheduled: nothing — add one under /api/schedule');
+});

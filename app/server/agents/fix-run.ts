@@ -20,7 +20,8 @@ import { execFile } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import type { Issue, Scan } from '../../shared/types.ts';
+import { purgeCaches } from '../verify.ts';
+import type { FixStep, Issue, Scan } from '../../shared/types.ts';
 import { fixAgent } from './fix.ts';
 import type { Diagnosis } from './diagnose-run.ts';
 import { runAgent } from './runtime.ts';
@@ -59,6 +60,8 @@ function applyEdit(root: string, edit: Edit): { ok: true; contents: string } | {
   return { ok: true, contents: before.replace(edit.find, edit.replace) };
 }
 
+/** The result of one call to fixIssue. Named for the loop it runs, not for a
+ *  single iteration of it — a single iteration is a FixStep, in shared types. */
 export interface FixAttempt {
   applied: boolean;
   summary: string;
@@ -70,6 +73,10 @@ export interface FixAttempt {
   tests: { command: string; passed: boolean; output: string };
   /** Did the new test actually catch the original bug? */
   provesTheBug: { checked: boolean; failedOnOriginal: boolean; detail: string };
+  /** Every iteration, kept whether it worked or not. */
+  trail: FixStep[];
+  /** Whether the suite passed before anything was touched. */
+  baseline: { passed: boolean; note: string };
   attempts: number;
   workdir: string;
 }
@@ -173,6 +180,13 @@ export async function fixIssue(
   let attempts = 0;
   let failure = '';
 
+  // The paper trail. Every attempt is recorded whether it worked or not — the
+  // ones that failed are the ones that say whether the fix is trustworthy.
+  const trail: FixStep[] = [];
+  const record = (entry: Omit<FixStep, 'n' | 'at'>) => {
+    trail.push({ n: attempts, at: new Date().toISOString(), ...entry });
+  };
+
   while (attempts < maxAttempts) {
     attempts += 1;
 
@@ -210,6 +224,7 @@ Return targeted edits: for each change, the exact text to find in the file and w
     } catch (error) {
       const why = error instanceof Error ? error.message.slice(0, 140) : 'error';
       emit('warn', `attempt ${attempts}: the model call failed — ${why}`);
+      record({ edits: [], rejected: [], modelError: why, outcome: 'model-failed' });
       failure = `Your previous attempt did not return a usable answer (${why}). Try again.`;
       continue;
     }
@@ -220,6 +235,11 @@ Return targeted edits: for each change, the exact text to find in the file and w
     if (edits.length === 0 && newFiles.length === 0) {
       last = { summary: drafted.summary, notes: drafted.notes, files: [] };
       emit('warn', `attempt ${attempts}: no changes returned — ${drafted.notes?.slice(0, 160) ?? 'no reason given'}`);
+      record({
+        edits: [], rejected: [],
+        modelError: drafted.notes?.slice(0, 300) || 'the model returned no changes and gave no reason',
+        outcome: 'no-changes',
+      });
       break;
     }
 
@@ -246,6 +266,13 @@ Return targeted edits: for each change, the exact text to find in the file and w
       written.set(file.path, file.contents);
     }
 
+    // The suite has already run in this directory, so it has left compiled
+    // output behind that is keyed on each source file's size and mtime. A
+    // one-character fix changes neither within the same second and the stale
+    // object is reused — the patch then appears to do nothing, and a correct
+    // fix is reported as broken. Found by the verifier's own tests.
+    purgeCaches(workdir);
+
     last = {
       summary: drafted.summary,
       notes: drafted.notes,
@@ -259,12 +286,22 @@ Return targeted edits: for each change, the exact text to find in the file and w
     if (rejected.length) emit('warn', `attempt ${attempts}: ${rejected.length} change(s) refused — ${rejected[0]}`);
     if (written.size === 0) {
       failure = `None of your edits could be applied:\n${rejected.join('\n')}\nCopy the text to replace exactly from the file, and make sure it appears only once.`;
+      record({ edits: [], rejected: rejected.slice(0, 6), outcome: 'no-changes' });
       continue;
     }
     emit('info', `attempt ${attempts}: changed ${written.size} file(s) — ${[...written.keys()].join(', ')}`);
 
     result = await runTests(workdir, test);
     emit(result.passed ? 'info' : 'warn', `attempt ${attempts}: tests ${result.passed ? 'pass' : 'FAIL'}`);
+    record({
+      edits: last.files.map((f) => ({ path: f.path, why: f.why })),
+      rejected: rejected.slice(0, 6),
+      testsPassed: result.passed,
+      // The tail, not the whole log: a failing suite prints thousands of lines
+      // and the assertion is at the bottom.
+      testOutput: result.output.slice(-1_200),
+      outcome: result.passed ? 'kept' : 'retried',
+    });
     if (result.passed) break;
     failure = result.output;
   }
@@ -283,6 +320,7 @@ Return targeted edits: for each change, the exact text to find in the file and w
       mkdirSync(path.dirname(target), { recursive: true });
       writeFileSync(target, file.contents);
     }
+    purgeCaches(control);
     const control_result = await runTests(control, test);
     proves = {
       checked: true,
@@ -304,6 +342,13 @@ Return targeted edits: for each change, the exact text to find in the file and w
     tests: { command, passed: result.passed, output: result.output },
     provesTheBug: proves,
     attempts,
+    trail,
+    baseline: {
+      passed: baseline.passed,
+      note: baseline.passed
+        ? 'the suite passed before anything was changed, so a pass afterwards means something'
+        : 'the suite was ALREADY failing before anything was changed — a pass afterwards proves less than it looks',
+    },
     workdir,
   };
 }

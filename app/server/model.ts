@@ -70,6 +70,88 @@ function schemaInstruction(schema: { name: string; schema: unknown }): string {
   ].join('\n');
 }
 
+/** Escape raw control characters that appear inside JSON string literals.
+ *
+ *  A real failure, not a hypothetical: a scoring batch died on `Bad control
+ *  character in string literal in JSON at position 1258`. The model had put a
+ *  literal newline inside a string — writing a multi-line verdict the way a
+ *  person would — which is invalid JSON and which no amount of prompting
+ *  reliably prevents.
+ *
+ *  Repairing it beats retrying it. A retry is twenty seconds of local model
+ *  time for a fault that is mechanical: the bytes are all there, one of them
+ *  just needs escaping. Only characters INSIDE a string are touched, so the
+ *  document's own structure is never rewritten — a newline between fields is
+ *  whitespace and stays exactly as it is.
+ */
+/** Valid characters after a backslash in JSON. Anything else is a broken
+ *  escape and the backslash was meant literally. */
+const ESCAPES = new Set(['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u']);
+
+/** Structural characters that can legally follow a closing quote. */
+const AFTER_STRING = new Set([',', ':', '}', ']']);
+
+export function escapeControlChars(json: string): string {
+  const chars = [...json];
+  let out = '';
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < chars.length; i += 1) {
+    const ch = chars[i]!;
+
+    if (escaped) {
+      // A backslash before something JSON does not recognise as an escape.
+      // `"C:\path"` is what a model writes when it means a literal backslash,
+      // and it parses as "Bad escaped character" — so put the second one in.
+      out += ESCAPES.has(ch) ? ch : `\\${ch}`;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      out += ch;
+      escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      if (!inString) {
+        inString = true;
+        out += ch;
+        continue;
+      }
+      // Does this quote actually end the string?
+      //
+      // Toggling on every quote was the bug. A model writing `he said "hi"`
+      // without escaping puts the parser inside a string when it is outside
+      // and outside when it is inside, so the raw newline three lines later is
+      // seen as ordinary whitespace and left alone — which is why a repair
+      // pass still ended in "Bad control character".
+      //
+      // A closing quote is followed by a structural character or the end of
+      // the document. Anything else means the quote is part of the text.
+      let j = i + 1;
+      while (j < chars.length && /\s/.test(chars[j]!)) j += 1;
+      const next = chars[j];
+      if (next === undefined || AFTER_STRING.has(next)) {
+        inString = false;
+        out += ch;
+      } else {
+        out += '\\"';
+      }
+      continue;
+    }
+
+    if (inString && ch < ' ') {
+      out += ch === '\n' ? '\\n' : ch === '\r' ? '\\r' : ch === '\t' ? '\\t'
+        : `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 /** Models wrap JSON in prose or fences often enough that this is not optional,
  *  even with a grammar applied. */
 function parseJson<T>(raw: string): T {
@@ -78,7 +160,24 @@ function parseJson<T>(raw: string): T {
   const start = body.search(/[{[]/);
   if (start === -1) throw new Error(`no JSON in model output: ${raw.slice(0, 200)}`);
   const end = Math.max(body.lastIndexOf('}'), body.lastIndexOf(']'));
-  return JSON.parse(body.slice(start, end + 1)) as T;
+  const slice = body.slice(start, end + 1);
+
+  try {
+    return JSON.parse(slice) as T;
+  } catch (error) {
+    // One repair attempt, then give up honestly. The original error is thrown
+    // rather than the repair's, because the original says what was actually
+    // wrong with what the model produced.
+    try {
+      return JSON.parse(escapeControlChars(slice)) as T;
+    } catch {
+      // The original error, because it says what was wrong with what the model
+      // produced — with the text attached, so the next failure of this kind is
+      // read rather than deduced from a character offset.
+      (error as { raw?: string }).raw = slice;
+      throw error;
+    }
+  }
 }
 
 export interface AskOptions {

@@ -5,26 +5,35 @@ import { Buzz } from './components/Buzz.tsx';
 import { FailureBox } from './components/FailureBox.tsx';
 import { FeedView } from './components/Feed.tsx';
 import { Health } from './components/Health.tsx';
+import { ProjectPanel } from './components/ProjectPanel.tsx';
 import { Login } from './components/Login.tsx';
 import { Overview } from './components/Overview.tsx';
-import { PresenceView } from './components/Presence.tsx';
+import { SourcesView } from './components/Sources.tsx';
 import { RunDashboard, type RunSummary } from './components/RunDashboard.tsx';
 import { AgentsPanel } from './components/AgentsPanel.tsx';
 import { OutboxPanel } from './components/OutboxPanel.tsx';
 import { SettingsPanel } from './components/SettingsPanel.tsx';
 import { StatCards, type OverviewTab } from './components/StatCards.tsx';
-import { api, cleanName, normalize, siteOf } from './lib.ts';
+import { api, apiUrl, cleanName, normalize, siteOf } from './lib.ts';
 
-type Tab = 'overview' | 'presence' | 'discovery' | 'feed' | 'health' | 'integrity';
+/** `defects` was called `health`, and sat fifth. Finding a real complaint,
+ *  reading it against real code and patching it is what this product is for —
+ *  it does not belong behind a sentiment chart, and "Health" does not say what
+ *  it holds. The old key still resolves so existing links keep working. */
+type Tab = 'defects' | 'overview' | 'presence' | 'discovery' | 'feed' | 'integrity' | 'project';
 
 const TABS: { key: Tab; label: string }[] = [
+  { key: 'defects', label: 'Defects' },
   { key: 'overview', label: 'Overview' },
   { key: 'feed', label: 'Feed' },
-  { key: 'presence', label: 'Presence' },
+  { key: 'presence', label: 'Sources' },
   { key: 'discovery', label: 'Discovery' },
-  { key: 'health', label: 'Health' },
   { key: 'integrity', label: 'Integrity' },
+  { key: 'project', label: 'Project' },
 ];
+
+/** Tab keys that used to be called something else. */
+const TAB_ALIASES: Record<string, Tab> = { health: 'defects' };
 
 const TAB_KEYS = new Set<Tab>(TABS.map((t) => t.key));
 
@@ -34,8 +43,9 @@ const HASH_RE = /^#\/scan\/([^/?]+)(?:\/([a-z][a-z-]*))?/i;
 function parseHash(): { id: string; tab: Tab } | null {
   const m = window.location.hash.match(HASH_RE);
   if (!m || !m[1]) return null;
-  const tab = (m[2] as Tab) ?? 'overview';
-  return { id: m[1], tab: TAB_KEYS.has(tab) ? tab : 'overview' };
+  const raw = (m[2] ?? '') as Tab;
+  const tab = TAB_ALIASES[raw] ?? raw;
+  return { id: m[1], tab: TAB_KEYS.has(tab) ? tab : 'defects' };
 }
 
 function hashFor(id: string, tab: Tab): string {
@@ -84,7 +94,7 @@ export function App() {
   const [running, setRunning] = useState(false);
   const [rig, setRig] = useState<{ servers: string[]; model: string } | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>('overview');
+  const [tab, setTab] = useState<Tab>('defects');
   const [rerunningStage, setRerunningStage] = useState<Stage | null>(null);
   const [authed, setAuthed] = useState(() => sessionStorage.getItem('whisperer.auth') === '1');
   const [showSettings, setShowSettings] = useState(false);
@@ -124,7 +134,7 @@ export function App() {
    *  make "back to scans" quietly mean "back to nothing". */
   const closeView = useCallback(() => {
     const id = scanIdRef.current;
-    window.location.hash = id ? hashFor(id, 'overview') : '#/';
+    window.location.hash = id ? hashFor(id, 'defects') : '#/';
     setShowSettings(false);
     setShowAgents(false);
     setShowOutbox(false);
@@ -275,10 +285,13 @@ useEffect(() => {
 
   /** Open a scan from the rail: point the URL at it and let the hash change load it. */
   const open = useCallback((id: string) => {
-    if (window.location.hash !== hashFor(id, 'overview')) {
-      window.location.hash = hashFor(id, 'overview');
+    // Straight to the defects. It is what the tool is for, and a scan that
+    // found none says so plainly on that tab — which is itself the answer
+    // somebody opened it to get.
+    if (window.location.hash !== hashFor(id, 'defects')) {
+      window.location.hash = hashFor(id, 'defects');
     } else {
-      void applyHash(id, 'overview');
+      void applyHash(id, 'defects');
     }
   }, [applyHash]);
 
@@ -289,7 +302,7 @@ useEffect(() => {
     setScan(BLANK);
     setLog([]);
     setCursor(null);
-    setTab('overview');
+    setTab('defects');
     setRunning(false);
     setRerunningStage(null);
     if (window.location.hash && parseHash()) window.location.hash = '#/';
@@ -298,18 +311,25 @@ useEffect(() => {
 
   const attachStream = useCallback((id: string, company?: string) => {
     source.current?.close();
-    const stream = new EventSource(`api/scans/${id}/stream${company ? `?company=${encodeURIComponent(company)}` : ''}`);
+    const stream = new EventSource(apiUrl(`api/scans/${id}/stream${company ? `?company=${encodeURIComponent(company)}` : ''}`));
     source.current = stream;
 
     stream.onmessage = (message) => {
       const event = JSON.parse(message.data) as ScanEvent;
       if (event.type === 'stage') { setStage(event.stage); setStageStart(Date.now()); }
       if (event.type === 'log') setLog((l) => [...l.slice(-200), event.line]);
-      if (event.type === 'patch') setScan((s) => ({ ...s, ...event.scan, id }));
+      if (event.type === 'patch') {
+        setScan((s) => ({ ...s, ...event.scan, id }));
+        // The resolver renames the subject mid-run — a repository URL comes in
+        // as its path and comes out as what the project is actually called — so
+        // the runs rail has to be told. It used to refresh only at `done`,
+        // which left the old name sitting in the list for the length of a scan.
+        if (event.scan.company || event.scan.site) refresh();
+      }
       if (event.type === 'done') {
         scanIdRef.current = id;
         setScan(event.scan); setStage('done'); setRunning(false); refresh(); stream.close();
-        if (parseHash()?.id !== id) window.location.hash = hashFor(id, 'overview');
+        if (parseHash()?.id !== id) window.location.hash = hashFor(id, 'defects');
       }
       if (event.type === 'error') {
         scanIdRef.current = id;
@@ -324,7 +344,7 @@ useEffect(() => {
         setRunning(false);
         refresh();
         stream.close();
-        if (parseHash()?.id !== id) window.location.hash = hashFor(id, 'overview');
+        if (parseHash()?.id !== id) window.location.hash = hashFor(id, 'defects');
       }
     };
     stream.onerror = () => {
@@ -340,7 +360,7 @@ useEffect(() => {
       setRunning(false);
       refresh();
       stream.close();
-      if (parseHash()?.id !== id) window.location.hash = hashFor(id, 'overview');
+      if (parseHash()?.id !== id) window.location.hash = hashFor(id, 'defects');
     };
   }, [refresh]);
 
@@ -348,7 +368,7 @@ useEffect(() => {
     setScan({ ...BLANK, company: cleanName(company), site: siteOf(company) });
     setLog([]);
     setCursor(null);
-    setTab('overview');
+    setTab('defects');
     setRunning(true);
     setStage('presence');
     setRunStart(Date.now());
@@ -372,7 +392,7 @@ useEffect(() => {
    *  The target scan id is read from the selection ref rather than the state
    *  closure: the ref is set synchronously the instant a site is picked in the
    *  rail, so a rerun can never hit a different site than the one highlighted. */
-  const rerun = useCallback(async (stages: Stage[]) => {
+  const rerun = useCallback(async (stages: Stage[], options?: { depth?: 'deep' | 'normal'; languages?: string[] }) => {
     const target = scanIdRef.current;
     if (!target || stages.length === 0) return;
     source.current?.close();
@@ -393,7 +413,12 @@ useEffect(() => {
     const runOne = (stage: Stage, reset: boolean) =>
       new Promise<void>((resolve, reject) => {
         let settled = false;
-        const stream = new EventSource(`api/scans/${target}/stages/${stage}/stream${reset ? '?reset=1' : ''}`);
+        const params = new URLSearchParams();
+        if (reset) params.set('reset', '1');
+        if (options?.depth) params.set('depth', options.depth);
+        if (options?.languages) params.set('languages', options.languages.join(','));
+        const query = params.toString();
+        const stream = new EventSource(apiUrl(`api/scans/${target}/stages/${stage}/stream${query ? `?${query}` : ''}`));
         source.current = stream;
         stream.onopen = () => {
           setLog((l) => [
@@ -404,7 +429,10 @@ useEffect(() => {
         stream.onmessage = (message) => {
           const event = JSON.parse(message.data) as ScanEvent;
           if (event.type === 'log') setLog((l) => [...l.slice(-200), event.line]);
-          if (event.type === 'patch') setScan((s) => ({ ...s, ...event.scan, id: s.id }));
+          if (event.type === 'patch') {
+            setScan((s) => ({ ...s, ...event.scan, id: s.id }));
+            if (event.scan.company || event.scan.site) refresh();
+          }
           if (event.type === 'done') {
             if (settled) return;
             settled = true;
@@ -486,7 +514,7 @@ useEffect(() => {
       case 'presence': return ['presence'];
       case 'discovery': return ['discovery', 'buzz'];
       case 'feed': return ['feed'];
-      case 'health': return ['health'];
+      case 'defects': return ['health'];
       case 'integrity': return ['abuse'];
       default: return null;
     }
@@ -589,11 +617,44 @@ useEffect(() => {
           {(hasScan || running) && (
             <div className="subject">
               <h1>{scan.company}</h1>
-              {scan.site && (
-                <div>
+              <div className="subject-line">
+                {scan.site && (
                   <a className="site" href={scan.site} target="_blank" rel="noreferrer">{scan.site.replace(/^https?:\/\//, '')}</a>
-                </div>
-              )}
+                )}
+              </div>
+              {/* The three things this product does, on the subject rather than
+                  behind a tab. Rerun answers "is this still true", Deeper
+                  answers "did we look far enough", and Patch bugs is the one
+                  the whole pipeline exists to reach. Each was previously a
+                  control inside whichever tab happened to own its stage, which
+                  made the headline features the hardest ones to find. */}
+              <div className="subject-actions">
+                <button
+                  className="headline"
+                  onClick={() => rerun(['discovery', 'buzz', 'health', 'abuse'])}
+                  disabled={rerunningStage !== null || running}
+                  title="Search again and re-triage — a fresh observation of what people are saying now"
+                >
+                  ↻ Rerun
+                </button>
+                <button
+                  className="headline"
+                  onClick={() => rerun(['discovery', 'buzz'], { depth: 'deep' })}
+                  disabled={rerunningStage !== null || running}
+                  title="Walk every window back to all-time instead of stopping once there is enough, and lift the corpus caps"
+                >
+                  ⤓ Deeper
+                </button>
+                <button
+                  className="headline"
+                  onClick={() => setTab('defects')}
+                  disabled={running}
+                  title="Read the source against a defect, write a patch, and run the tests"
+                >
+                  ⚒ Patch bugs
+                  {scan.issues.length > 0 && <span className="headline-n">{scan.issues.length}</span>}
+                </button>
+              </div>
             </div>
           )}
 
@@ -667,6 +728,7 @@ useEffect(() => {
 
           {scan.status === 'error' && scan.error && (
             <FailureBox
+              scanId={scan.id}
               stage={scan.failedStage}
               message={scan.error}
               detail={scan.errorDetail}
@@ -714,7 +776,7 @@ useEffect(() => {
                 {tab === 'presence' && (
                   <section>
                     <div className="rubric">
-                      <h2>Presence</h2>
+                      <h2>Sources</h2>
                       <p>Accounts found on the site, and what to sweep.</p>
                       <button
                         className="rerun"
@@ -724,7 +786,7 @@ useEffect(() => {
                         {rerunningStage === 'presence' ? 'Running…' : '↻ Rerun'}
                       </button>
                     </div>
-                    <PresenceView scan={scan} />
+                    <SourcesView scan={scan} />
                   </section>
                 )}
 
@@ -740,6 +802,14 @@ useEffect(() => {
                       >
                         {rerunningStage === 'discovery' ? 'Running…' : '↻ Rerun'}
                       </button>
+                      {/* Deeper, and wider.
+                          The recency ladder normally stops at the first window
+                          that satisfies its target, which on an active product
+                          means it never looks past the last month. This walks
+                          the ladder to the end and lifts the caps with it.
+                          Costs several times the requests and the wall clock,
+                          which is why it is a button and not the default. */}
+
                     </div>
                     <Buzz scan={scan} cursor={cursor} />
                   </section>
@@ -762,14 +832,14 @@ useEffect(() => {
                   </section>
                 )}
 
-                {tab === 'health' && (
+                {tab === 'defects' && (
                   <section>
                     <div className="rubric">
-                      <h2>Health</h2>
-                      <p>Complaints triaged into things that can actually be fixed.</p>
+                      <h2>Defects</h2>
+                      <p>Public complaints triaged into things that can actually be fixed — then read against the source and patched.</p>
                       <button
                         className="rerun"
-                        onClick={() => rerun(rerunStageFor('health')!)}
+                        onClick={() => rerun(rerunStageFor('defects')!)}
                         disabled={rerunningStage !== null}
                       >
                         {rerunningStage === 'health' ? 'Running…' : '↻ Rerun'}
@@ -785,8 +855,22 @@ useEffect(() => {
                   </section>
                 )}
 
-                {tab === 'integrity' && (
+                {tab === 'project' && (
                   <section>
+                    <div className="rubric">
+                      <h2>Project</h2>
+                      <p>Where this company's code and issues actually are.</p>
+                    </div>
+                    <ProjectPanel scan={scan} />
+                  </section>
+                )}
+
+                {tab === 'integrity' && (
+                  /* Two independent cards — the review scorecard and the
+                     findings docket — which were rendering flush against each
+                     other. Same shared rule as the settings, agents and outbox
+                     views use. */
+                  <section className="card-stack">
                     <div className="rubric">
                       <h2>Integrity</h2>
                       <p>Impersonation, scams and other misuse of the brand.</p>

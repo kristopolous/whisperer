@@ -29,9 +29,16 @@ import { cached, HOUR } from '../cache.ts';
 import { complaintLanguage } from '../search.ts';
 
 const ENDPOINT = 'https://hn.algolia.com/api/v1/search_by_date';
-/** Algolia allows 1000, but a page of a hundred is already more than the model
- *  will read and keeps a failed request cheap. */
-const PER_PAGE = 100;
+/** Algolia's maximum page size, and worth taking all of it.
+ *
+ *  This was 100 on the reasoning that a page of a hundred is more than the
+ *  model will read. That confused two different budgets: the model reads a
+ *  ranked selection, and the size of the pool it selects from is set here. HN
+ *  holds 621 comments about Lovable in the past year and 933 about GIMP, and a
+ *  hundred-item page took a quarter of them — for the same single request that
+ *  would have returned the lot. The page size is free; only requests are
+ *  rationed, and Algolia charges nothing and asks for no key. */
+const PER_PAGE = 1_000;
 const TTL = 6 * HOUR;
 
 interface Hit {
@@ -100,7 +107,10 @@ export async function searchHackerNews(
 ): Promise<Mention[]> {
   const days = options.days === undefined ? 365 : options.days;
   const since = days ? Math.floor(Date.now() / 1000) - days * 86_400 : null;
-  const limit = options.limit ?? 120;
+  // Everything the window holds, rather than a slice of it. A busy subject
+  // yields several hundred; a quiet one yields what it yields, and asking for
+  // more costs nothing extra.
+  const limit = options.limit ?? 1_000;
 
   const collected: Mention[] = [];
   const seen = new Set<string>();

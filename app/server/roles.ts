@@ -18,9 +18,9 @@
  *  is both somewhere to search and somewhere to reply.
  */
 
-import { usableConnectors, type ConnectorConfig } from './config.ts';
+import type { ConnectorConfig } from './config.ts';
 
-export const ROLES = ['search', 'scrape', 'contact', 'ticket', 'exec'] as const;
+export const ROLES = ['search', 'scrape', 'contact', 'ticket', 'fix', 'exec'] as const;
 export type ConnectorRole = (typeof ROLES)[number];
 
 export interface RoleInfo {
@@ -38,13 +38,17 @@ export const ROLE_INFO: Record<ConnectorRole, RoleInfo> = {
   search: {
     id: 'search',
     label: 'Search',
-    uses: 'Discovery, the feed and the abuse sweep query every search connector, on top of Brave.',
+    uses:
+      'Discovery, the feed and the abuse sweep all run through this chain. Each query tries the '
+      + 'providers in order and stops at the first that answers.',
     wired: true,
   },
   scrape: {
     id: 'scrape',
     label: 'Fetch pages',
-    uses: 'Reading a page a plain fetch cannot — a bot check, a login wall, heavy client rendering.',
+    uses:
+      'Reading a page a plain fetch cannot — a bot check, a login wall, heavy client rendering. An '
+      + 'ordinary fetch is always tried first; this chain is what rescues it.',
     wired: true,
   },
   contact: {
@@ -60,6 +64,16 @@ export const ROLE_INFO: Record<ConnectorRole, RoleInfo> = {
     label: 'File and track',
     uses: 'Filing a defect and appending each loop step to it. GitHub is wired directly; this is for the rest.',
     wired: false,
+  },
+  fix: {
+    id: 'fix',
+    label: 'Write the patch',
+    uses:
+      'Turning a diagnosed defect into a change. The built-in agent reads the source and writes '
+      + 'the patch itself; a service here does that instead and opens a pull request. Whichever '
+      + 'writes it, the loop still runs the suite and requires the new test to fail against the '
+      + 'original code before calling anything fixed.',
+    wired: true,
   },
   exec: {
     id: 'exec',
@@ -103,6 +117,7 @@ const PREFERRED: Record<ConnectorRole, string[]> = {
   scrape: ['url', 'uri', 'link', 'href', 'target'],
   contact: ['message', 'text', 'body', 'content'],
   ticket: ['title', 'summary', 'subject'],
+  fix: ['prompt', 'task', 'instructions', 'description', 'issue'],
   exec: ['command', 'cmd', 'script', 'code'],
 };
 
@@ -132,23 +147,16 @@ export function guessTool(role: ConnectorRole, tools: { name: string }[]): strin
     scrape: /scrape|fetch|read_page|get_page|markdown|extract|browse/i,
     contact: /(send|post|reply|comment|message|dm|mail)/i,
     ticket: /(create|open|file)[_-]?\w*(issue|ticket|task)/i,
+    fix: /(fix|patch|implement|resolve|code)[_-]?\w*(issue|bug|task|session)?/i,
     exec: /(exec|run|shell|command|sandbox|terminal)/i,
   };
   const pattern = wanted[role];
   return tools.find((tool) => pattern.test(tool.name))?.name ?? null;
 }
 
-/** Every usable connector that declares this role, in config order.
- *
- *  Config order is priority order — the first one that answers wins — because
- *  a person ordering a list is a better ranking than anything inferable, and it
- *  is the ordering already implied by "try the free one before the metered
- *  one". */
-export function connectorsForRole(role: ConnectorRole): ConnectorConfig[] {
-  return usableConnectors().filter(
-    (connector) => (connector.roles ?? []).includes(role) && Boolean(connector.bindings?.[role]?.tool),
-  );
-}
+/* Which connectors serve a role, and in what order, lives in providers.ts —
+ * the ordering belongs to the role rather than to any connector, and the list
+ * includes providers that are not MCP servers at all. */
 
 export const bindingFor = (connector: ConnectorConfig, role: ConnectorRole): RoleBinding | undefined =>
   connector.bindings?.[role];

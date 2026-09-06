@@ -43,7 +43,8 @@ Hard rules:
 - When acknowledging: say plainly that it is real if it was reproduced, apologise once and without ceremony, and say what happens next. Do not thank them for their "feedback".
 - When following up on a fix: say what changed, and ask them to check. Ask, genuinely — they are the one who hit it and they are the one who decides whether it is resolved. Make it easy to say it is still broken.
 - No corporate filler. No "we appreciate", no "rest assured", no "we are committed to".
-- Do not sign off with a name you were not given.`;
+- Do not sign off with a name you were not given.
+- Do not write URLs. Where the work can be followed is appended after your message by the code that sends it, from the tickets and pull requests that actually exist. A link you compose is a link to somewhere that may not be there, and a wrong one in a public reply is worse than no reply at all.`;
 
 export type ReplyPhase = 'acknowledge' | 'fix-notify';
 
@@ -56,6 +57,43 @@ export interface DraftedReply {
   addresses: string[];
   /** Where it would go, in the venue's own terms. */
   destination: string;
+}
+
+/** Somewhere the person can follow this after the thread goes quiet.
+ *
+ *  A reply that only says "we are on it" ends the conversation: they have to
+ *  keep checking a thread, and the next person who hits the same bug and finds
+ *  it has nowhere to go. A link to the ticket turns the reply into a handover —
+ *  the work continues somewhere public, and they can watch it, add to it, or
+ *  say it is still broken, in a place that outlives the thread.
+ *
+ *  Assembled from what the issue actually has, never from the model. Everything
+ *  else in this project that asked a model to reproduce a URL got a mangled one
+ *  eventually, and the failure mode here is a public message from the company
+ *  pointing at a page that does not exist.
+ *
+ *  The tracker is the fork's, which is the honest destination: it is where the
+ *  ticket and the whole diagnosis were actually written. */
+export function followUpLinks(issue: Issue): { label: string; url: string }[] {
+  const links: { label: string; url: string }[] = [];
+  const seen = new Set<string>();
+  const add = (label: string, url?: string) => {
+    if (!url || !/^https?:\/\//i.test(url) || seen.has(url)) return;
+    seen.add(url);
+    links.push({ label, url });
+  };
+
+  // The ticket first — it is the thing the reply is promising.
+  for (const event of issue.loop ?? []) {
+    if (event.step === 'filed' || event.step === 'reproduced') add('The ticket', event.ref?.url);
+  }
+  if (typeof issue.filedTo?.ref === 'string') add('The ticket', issue.filedTo.ref);
+
+  // Then the work, when there is any to show.
+  for (const event of issue.loop ?? []) {
+    if (event.step === 'test-added') add('The fix', event.ref?.url);
+  }
+  return links.slice(0, 2);
 }
 
 /** Draft the reply. Sends nothing. */
@@ -98,9 +136,17 @@ ${JSON.stringify(theirWords)}
 ${brief}`,
   });
 
+  // Appended, not generated. The model wrote the words; the code owns the URLs.
+  const links = followUpLinks(issue);
+  const message = links.length
+    ? `${drafted.message.trim()}\n\n`
+      + links.map((link) => `${link.label}: ${link.url}`).join('\n')
+      + '\n\nFollow it there, or reply here — either reaches us.'
+    : drafted.message;
+
   return {
     phase,
-    message: drafted.message,
+    message,
     tone: drafted.tone,
     addresses: drafted.addresses ?? [],
     destination: reporter

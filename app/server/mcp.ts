@@ -15,7 +15,8 @@
  */
 
 import { enabledConnectors, missingCredentials, usableConnectors, type ConnectorConfig } from './config.ts';
-import type { ConnectorRole } from './roles.ts';
+import { ROLES, type ConnectorRole } from './roles.ts';
+import { roleLists } from './providers.ts';
 
 /** MCP endpoints answer as plain JSON or as SSE frames depending on the server
  *  and the Accept header it decided to honour. Accept both. */
@@ -245,11 +246,14 @@ async function probe(connector: ConnectorConfig): Promise<ConnectorStatus> {
     description: connector.description,
     missing,
     url: connector.url,
-    roles: connector.roles ?? [],
-    // Which of those roles actually resolve to a tool. A role declared but not
-    // bound is the state worth showing, because it looks configured and does
-    // nothing — which is what the whole connector list used to be.
-    bound: (connector.roles ?? []).filter((role) => Boolean(connector.bindings?.[role]?.tool)),
+    // Which role chains this server sits in, and which of those it can
+    // actually serve. A member with no tool bound does nothing, which matters
+    // more in an ordered list than it did in a flat one — it can be sitting at
+    // position one.
+    roles: ROLES.filter((role) => roleLists()[role].includes(connector.name)),
+    bound: ROLES.filter(
+      (role) => roleLists()[role].includes(connector.name) && Boolean(connector.bindings?.[role]?.tool),
+    ),
   };
 
   if (missing.length) return { ...base, status: 'unconfigured', tools: 0 };

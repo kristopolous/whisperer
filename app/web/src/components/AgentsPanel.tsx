@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { api } from '../lib.ts';
+import { api, apiUrl } from '../lib.ts';
 
 /** Everything the server knows about one agent, including how its runs went. */
 interface AgentRow {
@@ -11,6 +11,7 @@ interface AgentRow {
   connectors: string[];
   effort: 'low' | 'medium' | 'high';
   inPipeline: boolean;
+  needsTools: boolean;
   instructionChars: number;
   stats: {
     runs: number;
@@ -66,7 +67,7 @@ export function AgentsPanel({ onClose }: { onClose?: () => void }) {
 
     // Live runs. Each event is one state transition, so a run shows up as
     // "running" and is then replaced in place when it settles.
-    const stream = new EventSource('api/agents/stream');
+    const stream = new EventSource(apiUrl('api/agents/stream'));
     stream.onmessage = (event) => {
       const run = JSON.parse(event.data) as AgentRun;
       setRuns((current) => [run, ...current.filter((r) => r.id !== run.id)].slice(0, 100));
@@ -175,6 +176,11 @@ function AgentGroup(
           const { stats } = agent;
           // "never run" is its own state and must not read as green.
           const dot = stats.runs === 0 ? 'idle' : stats.lastStatus ?? 'idle';
+          // ...and it is not the same state as "nothing calls this". An agent
+          // kept in the registry that no code path fires has not failed to run;
+          // it is not wired in, and saying "never run" about it invites a hunt
+          // for a broken trigger that does not exist.
+          const unwired = stats.runs === 0 && !agent.inPipeline;
           return (
             <div key={agent.name}>
               <button className="conn-row agent-row" onClick={() => onToggle(agent.name)}>
@@ -185,7 +191,7 @@ function AgentGroup(
                 </span>
                 <span className="conn-meta">
                   {stats.runs === 0
-                    ? 'never run'
+                    ? (agent.needsTools ? 'cannot run here' : unwired ? 'not wired into a scan' : 'never run')
                     : `${stats.runs} run${stats.runs === 1 ? '' : 's'}`
                       + (stats.failures ? `, ${stats.failures} failed` : '')
                       + (stats.medianMs ? ` · ~${fmtMs(stats.medianMs)}` : '')}
@@ -205,6 +211,18 @@ function AgentGroup(
                       ? agent.connectors.join(', ')
                       : 'none — tool-free by contract; it may only reason over what it is handed'}
                   </dd>
+                  {agent.needsTools && (
+                    <>
+                      <dt>cannot run</dt>
+                      <dd className="conn-err">
+                        Its instructions tell it to go and search with the connectors above, and
+                        nothing here can do that: agent runs have no tool loop, and the local
+                        runtime rejects a request carrying both a JSON schema and a tools array.
+                        Fired as it stands it would answer from memory and invent URLs, dates and
+                        quotes. The pipeline does this work deterministically instead.
+                      </dd>
+                    </>
+                  )}
                   {stats.lastError && (<><dt>last failure</dt><dd className="conn-err">{stats.lastError}</dd></>)}
                 </dl>
               )}

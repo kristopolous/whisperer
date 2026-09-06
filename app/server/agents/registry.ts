@@ -9,6 +9,8 @@
 
 import { abuseAgent } from './abuse.ts';
 import { buzzAgent } from './buzz.ts';
+import { complaintsAgent } from './complaints.ts';
+import { subjectMatchAgent } from './subject-match.ts';
 import { crawlAgent } from './crawl.ts';
 import { diagnoseAgent } from './diagnose.ts';
 import { discoveryAgent } from './discovery.ts';
@@ -32,6 +34,8 @@ export const AGENTS: AgentDefinition[] = [
   crawlAgent,
   footprintAgent,
   discoveryAgent,
+  complaintsAgent,
+  subjectMatchAgent,
   feedAgent,
   buzzAgent,
   verdictAgent,

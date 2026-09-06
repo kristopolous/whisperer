@@ -42,5 +42,6 @@ Rules:
   schema: mentionsSchema,
   connectors: ['x', 'exa', 'youtube', 'tiktok', 'bright-data', 'brave'],
   effort: 'high',
+  needsTools: true,
   inPipeline: false,
 };

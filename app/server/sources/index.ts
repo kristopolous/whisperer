@@ -46,6 +46,42 @@ export interface DirectSource {
 
 const SOURCES: DirectSource[] = [
   {
+    id: 'perplexity',
+    label: 'Perplexity Search',
+    notes:
+      'General web search. Answers with up to fifty results per request and takes a recency filter '
+      + 'directly, so it covers the same ground in far fewer requests than a twenty-per-page engine. '
+      + 'Paid per request, paced, and capped by the per-run search budget.',
+    requires: ['PERPLEXITY_API_KEY'],
+  },
+  {
+    id: 'parallel',
+    label: 'Parallel Search',
+    notes:
+      'General web search that takes a natural-language objective as well as the query, and '
+      + 'returns passages from the page with a publish date on most results. The dates matter: '
+      + 'most engines return none, and an undated mention cannot be placed on a timeline.',
+    requires: ['PARALLEL_API_KEY'],
+  },
+  {
+    id: 'andi',
+    label: 'Andi Search',
+    notes:
+      'General web search. Returns up to a hundred results per request where most return ten or '
+      + 'twenty, takes date ranges and domain filters as parameters, and reports what each query '
+      + 'cost. Billed by outcome, so a run stops asking it once it has spent its dollar cap.',
+    requires: ['ANDI_API_KEY'],
+  },
+  {
+    id: 'you',
+    label: 'you.com Search',
+    notes:
+      'General web search over you.com\'s index. Returns web and news results together, takes a '
+      + 'recency filter, and paginates properly, so it can carry discovery on its own when Brave '
+      + 'is out of allowance. Prepaid and paced per request.',
+    requires: ['YDC_API_KEY'],
+  },
+  {
     id: 'brave',
     label: 'Brave Search',
     notes:

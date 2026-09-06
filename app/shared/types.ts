@@ -9,6 +9,19 @@ export type Venue =
 
 export type Sentiment = 'positive' | 'mixed' | 'neutral' | 'negative';
 
+/** Why something failed, in the one word that decides how it is presented.
+ *
+ *  Named rather than spelled out at each use: the server, the stream event and
+ *  the dashboard's failure box each had their own copy of this union, so adding
+ *  a kind meant finding all three, and missing one showed up as a type error in
+ *  an unrelated file. */
+export type ErrorKind =
+  | 'connector' | 'model' | 'rate' | 'timeout' | 'auth'
+  // Not failures of the run: it was refused because another was already going,
+  // or the server went away underneath it.
+  | 'busy' | 'interrupted'
+  | 'other';
+
 export interface Profile {
   platform: string;
   handle: string;
@@ -81,6 +94,12 @@ export interface Issue {
   diagnosis?: Diagnosis;
   /** The patch, and whether its tests actually passed. */
   fix?: FixResult;
+  /** How many loop events have already been written to the tracker, so a
+   *  second investigation appends what is new rather than repeating the lot. */
+  publishedUpTo?: number;
+  /** How many times this has been investigated. Each pass is labelled in the
+   *  ledger so a re-run reads as a second look rather than a second problem. */
+  investigations?: number;
 }
 
 /** The result of reading a project's source against a reported defect. */
@@ -104,6 +123,28 @@ export interface Diagnosis {
  *  was committed, pushed or merged. `provesTheBug` is the one that matters: a
  *  regression test that passes against the ORIGINAL code has not tested the
  *  fix, and a green suite means nothing without it. */
+/** One try at the patch, kept whether it worked or not.
+ *
+ *  The audit is the product here as much as the patch is. "Fixed in 3 attempts"
+ *  tells you nothing about whether to trust it; what the first two tried, and
+ *  why each was abandoned, is the difference between a fix somebody can review
+ *  and a number they have to take on faith. All of this was already being
+ *  logged and then discarded when the run ended. */
+export interface FixStep {
+  n: number;
+  at: string;
+  /** Files it changed, and the reason it gave for each. */
+  edits: { path: string; why: string }[];
+  /** Edits refused because their anchor text did not match exactly once. */
+  rejected: string[];
+  /** Set when the model call itself failed rather than the patch. */
+  modelError?: string;
+  testsPassed?: boolean;
+  /** Tail of the test output — enough to see the failure, not the whole log. */
+  testOutput?: string;
+  outcome: 'kept' | 'retried' | 'no-changes' | 'model-failed';
+}
+
 export interface FixResult {
   applied: boolean;
   summary: string;
@@ -113,6 +154,14 @@ export interface FixResult {
   tests: { command: string; passed: boolean; output: string };
   provesTheBug: { checked: boolean; failedOnOriginal: boolean; detail: string };
   attempts: number;
+  /** Every attempt, in order. The paper trail. */
+  trail?: FixStep[];
+  /** Whether the suite passed BEFORE anything was touched.
+   *
+   *  Load-bearing for reading the rest: a green suite after a change means
+   *  nothing if it was already red, and it means something different again if
+   *  the project has no tests at all. */
+  baseline?: { passed: boolean; note: string };
   workdir: string;
   at: string;
 }
@@ -297,7 +346,7 @@ export interface Scan {
   /** The pipeline stage that failed, when known. */
   failedStage?: Stage;
   /** What class of failure this is, so the UI can offer the right remedy. */
-  errorKind?: 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'busy' | 'other';
+  errorKind?: ErrorKind;
   profiles: Profile[];
   mentions: Mention[];
   issues: Issue[];
@@ -330,6 +379,14 @@ export interface Scan {
    *  company somebody has actually scanned hid the real run behind synthesised
    *  numbers. */
   fixture?: boolean;
+  /** How hard this run looked. Recorded because it changes what the numbers
+   *  mean: a deep run and a normal one are not comparable observations, and a
+   *  series that mixes them silently shows a jump that is only effort. */
+  depth?: Depth;
+  /** Language codes to search in as well as English. Empty or absent means
+   *  English only, which is the default because every extra language is real
+   *  requests against a paid budget. */
+  languages?: string[];
   /** A checkout in the local workspace to diagnose against, by name.
    *
    *  For closed source, where there is no public repository to clone and this
@@ -360,7 +417,7 @@ export interface Scan {
   sessionId?: string;
 }
 
-export type Stage = 'queued' | 'presence' | 'discovery' | 'feed' | 'buzz' | 'health' | 'abuse' | 'done';
+export type Stage = 'queued' | 'subject' | 'presence' | 'discovery' | 'feed' | 'buzz' | 'health' | 'abuse' | 'done';
 
 export type LogLevel = 'info' | 'tool' | 'warn' | 'error' | 'stage';
 
@@ -371,13 +428,36 @@ export interface LogLine {
   text: string;
 }
 
+/** The stages, in the order a run performs them.
+ *
+ *  `presence` sits at the end, and that is the whole point of the ordering.
+ *  Reading a company's own site for its accounts is nearly static — the answer
+ *  is the same this morning as it was last week — while the reason to run this
+ *  daily is everything downstream of it. Putting the static crawl first meant
+ *  every daily run spent its first minutes re-deriving something it already
+ *  knew before it got to the part that changes.
+ *
+ *  Working out *what was typed* is a different job and stayed first, because
+ *  discovery cannot form a single query without it. It is also cheap, and on a
+ *  re-run it is free: the stored subject is reused unless the input changed.
+ *
+ *  The one exception is a first scan, which has no footprint yet — see the
+ *  ordering in index.ts. Knowing the product's subreddit and GitHub org makes
+ *  the discovery queries much sharper, so on a first run the crawl is worth
+ *  waiting for; on every run after it is worth deferring. */
 export const STAGES: { key: Stage; label: string; blurb: string }[] = [
-  { key: 'presence',  label: 'Presence',  blurb: 'Reading the site for accounts' },
+  { key: 'subject',   label: 'Subject',   blurb: 'Working out what was typed' },
   { key: 'discovery', label: 'Discovery', blurb: 'Searching for what people said' },
   { key: 'feed',      label: 'Feed',      blurb: 'Streaming the latest videos and comments' },
   { key: 'buzz',      label: 'Buzz',      blurb: 'Scoring sentiment over time' },
   { key: 'health',    label: 'Health',    blurb: 'Cataloguing real problems' },
   { key: 'abuse',     label: 'Integrity', blurb: 'Looking for scams and impersonation' },
+  // The stage key stays `presence` while the label reads Sources: renaming the
+  // key would invalidate `failedStage`, `timings` and `pulledAt` on every scan
+  // already on disk, and the series reads those. The word people see is the one
+  // that had to change — the page stopped being a report of a footprint and
+  // became the editable list of places to look.
+  { key: 'presence',  label: 'Sources',   blurb: 'Where to look, and what is missing' },
 ];
 
 /** Server-sent event payloads. */
@@ -394,7 +474,7 @@ export type ScanEvent =
       /** The full raw error text, for the details toggle. */
       detail?: string;
       /** What class of failure this is, so the UI can offer the right remedy. */
-      kind?: 'connector' | 'model' | 'rate' | 'timeout' | 'auth' | 'busy' | 'other';
+      kind?: ErrorKind;
     };
 
 /** Which reputation a score measures. They are not interchangeable: a company
@@ -424,6 +504,11 @@ export interface ReviewScore {
  *  Resolved once at the start of a scan so nothing downstream has to interpret
  *  the raw input again. Everything after this point works from `searchTerm` and
  *  `name` rather than from whatever was in the box. */
+/** How hard a run looks. `deep` walks the whole recency ladder instead of
+ *  stopping at the first window that satisfies the target, and lifts the volume
+ *  caps with it. */
+export type Depth = 'normal' | 'deep';
+
 export interface Subject {
   /** Exactly what was typed, kept so the resolution can be second-guessed. */
   input: string;

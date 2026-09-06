@@ -25,13 +25,16 @@ Read the register, because dismissals that sound alike mean different things and
 - A rhetorical question ("why is X so slow", "who thought this was a good idea") is a complaint, not a question. Triage what it is complaining about.
 - Polite phrasing carries the same weight as profanity. "I wish it would", "it falls short", "I was disappointed" from a measured writer is the same finding as "it sucks" from an angry one; the register reflects the venue, not the severity.
 
-Merge duplicates: one issue per underlying cause, with every supporting URL in evidence. An issue raised by four people is one issue.
+Merge duplicates: one issue per underlying cause, with every supporting item's index in evidence. An issue raised by four people is one issue.
 
 Severity: critical = data loss, outage, or a security exposure; serious = a broken workflow with no workaround; warning = friction with a workaround; good = a resolved or minor nit.
 
 The draft reply is written to the people who raised it. Acknowledge the specific thing that happened, say plainly what is being done about it, and stop. No apology theatre, no gratitude padding, no promised dates, no marketing.`,
   invocation:
-    '\n\nHow you are invoked: the first message names the product, then a JSON array of items to work through, each with at least a url and some text. Process every item in the array; do not sample.',
+    '\n\nHow you are invoked: the first message names the product, then numbered items, '
+    + 'one per line, as `index: {json}`. Each has at least a url and some text. Process every '
+    + 'item; do not sample. Cite the items backing each issue by their index numbers, never by '
+    + 'their URLs — an index you were not given is a mistake and the citation is discarded.',
   schema: healthSchema,
   connectors: [],
   effort: 'medium',

@@ -35,7 +35,7 @@
 
 import { connectorConfig, loadRaw, writeRaw, reloadConfig, usableConnectors, type ConnectorConfig } from './config.ts';
 import { hasSecret } from './secrets.ts';
-import { ROLES, type ConnectorRole } from './roles.ts';
+import { guessTool, ROLES, type ConnectorRole } from './roles.ts';
 
 /** Providers that are part of this app rather than an MCP endpoint. */
 interface BuiltIn {
@@ -44,9 +44,93 @@ interface BuiltIn {
   description: string;
   roles: ConnectorRole[];
   requires: string[];
+  /** Hosts this provider can serve, when it is not general-purpose. A chain
+   *  member that only handles one site is still a chain member — it is skipped
+   *  for everything else rather than tried and failed. */
+  hosts?: string[];
 }
 
+/* A plain HTTP fetch is deliberately not in here. It is not a member of the
+ * scrape chain, it is the thing the chain rescues: content.ts tries an ordinary
+ * GET first, and reaches for a scraper only when the page is a bot challenge or
+ * a host known to block us. Listing it as a draggable provider would offer a
+ * demotion the code does not honour. The scrape chain is the escape hatches, in
+ * the order they should be tried. */
 const BUILT_INS: BuiltIn[] = [
+  {
+    id: 'perplexity',
+    label: 'Perplexity Search',
+    description:
+      'Perplexity\'s search API. Answers with up to fifty results per request where most return '
+      + 'ten or twenty, and takes a recency filter directly — so it needs far fewer requests to '
+      + 'cover the same ground. Paid per request, and paced accordingly.',
+    roles: ['search'],
+    requires: ['PERPLEXITY_API_KEY'],
+  },
+  {
+    id: 'jules',
+    label: 'Jules',
+    description:
+      'Google\'s coding agent. Given the defect and the fork, it reads the repository and opens a '
+      + 'pull request on it. Chosen over the alternatives because its whole flow is documented — '
+      + 'an explicit auto-PR mode and a structured pull request URL on the finished session, where '
+      + 'the others return an id with no documented way to resolve it. Free tier: 15 tasks a day.',
+    roles: ['fix'],
+    requires: ['JULES_API_KEY'],
+  },
+  {
+    id: 'whisperer-fix',
+    label: 'Built-in fix agent',
+    description:
+      'Reads the source against the complaint, writes a patch and runs the tests in a throwaway '
+      + 'copy, retrying up to three times against the test output. Needs no account and leaves a '
+      + 'full record of what it tried — and is the weaker option on a large unfamiliar repository, '
+      + 'which is what the services above are for.',
+    roles: ['fix'],
+    requires: [],
+  },
+  {
+    id: 'daytona',
+    label: 'Daytona',
+    description:
+      'Runs a patched checkout\'s test suite in a disposable cloud sandbox instead of on this '
+      + 'machine. The fix agent executes a stranger\'s test command against a stranger\'s '
+      + 'repository, which is arbitrary code execution by design — this is where that belongs.',
+    roles: ['exec'],
+    requires: ['DAYTONA_API_KEY'],
+  },
+  {
+    id: 'parallel',
+    label: 'Parallel Search',
+    description:
+      'Parallel\'s search API. Takes a natural-language objective alongside the queries, so it '
+      + 'ranks for "what people are complaining about" rather than for keyword overlap, and it '
+      + 'returns passages from the page with a publish date on most of them — which is what puts '
+      + 'a mention on the timeline instead of only in the count.',
+    roles: ['search'],
+    requires: ['PARALLEL_API_KEY'],
+  },
+  {
+    id: 'andi',
+    label: 'Andi Search',
+    description:
+      'Andi\'s search index over plain HTTPS. Up to a hundred results per request, real date '
+      + 'ranges and domain filters, and a deep mode a deep scan can ask for. Priced by outcome '
+      + 'rather than per request — it reports what each query cost — so it is capped by dollars '
+      + 'spent per run as well as by the shared request budget.',
+    roles: ['search'],
+    requires: ['ANDI_API_KEY'],
+  },
+  {
+    id: 'you',
+    label: 'you.com Search',
+    description:
+      'you.com\'s search index over plain HTTPS. Web and news results in one request, a recency '
+      + 'filter, and real pagination. Prepaid — a new account starts with $100 of credit — so it '
+      + 'is paced per request like any metered API.',
+    roles: ['search'],
+    requires: ['YDC_API_KEY'],
+  },
   {
     id: 'brave',
     label: 'Brave Search',
@@ -55,11 +139,15 @@ const BUILT_INS: BuiltIn[] = [
     requires: ['BRAVE_API_KEY'],
   },
   {
-    id: 'fetch',
-    label: 'Plain fetch',
-    description: 'An ordinary HTTP GET and a readability pass. Free and instant; beaten by any bot check.',
-    roles: ['scrape'],
-    requires: [],
+    id: 'reddit',
+    label: 'Reddit',
+    description:
+      "Reddit's own API. Searches the product's dedicated subreddit (hot and new) as well as the "
+      + 'site at large, and reads reddit.com threads directly instead of paying a scraper for them. '
+      + 'Rate-paced to one request a second and cached for two hours.',
+    roles: ['search', 'scrape'],
+    requires: ['REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET', 'REDDIT_USERNAME', 'REDDIT_PASSWORD'],
+    hosts: ['reddit.com'],
   },
 ];
 
@@ -72,8 +160,18 @@ export interface Provider {
   label: string;
   description: string;
   kind: ProviderKind;
-  /** Roles this provider could serve, whether or not it is enlisted in them. */
-  can: ConnectorRole[];
+  /** Hosts it is limited to, when it is not general-purpose. */
+  hosts?: string[];
+  /** Roles this provider looks like it could serve, from the tools it
+   *  advertises. A hint for the person choosing, never a gate on the choice.
+   *
+   *  Deliberately not enforced. A new MCP server is an unknown quantity — its
+   *  tool names are its own and a heuristic over them is a guess, so refusing
+   *  an assignment it does not endorse would block correct configurations to
+   *  prevent incorrect ones. The list says what it looks like; the person
+   *  decides, and owns being wrong. Being wrong is also cheap and loud: the
+   *  tool either answers usefully or it does not, and the run trace says which. */
+  likely: ConnectorRole[];
   /** Credentials it declares and does not have. */
   missing: string[];
   /** Roles it is enlisted in, and whether it can actually run in each. A
@@ -104,7 +202,8 @@ export function listProviders(): Provider[] {
     label: b.label,
     description: b.description,
     kind: 'built-in',
-    can: b.roles,
+    ...(b.hosts ? { hosts: b.hosts } : {}),
+    likely: b.roles,
     missing: b.requires.filter((name) => !hasSecret(name)),
     // A built-in needs no tool binding — the code that calls it is the binding.
     bound: enlisted(b.id),
@@ -117,14 +216,25 @@ export function listProviders(): Provider[] {
       label: c.name,
       description: c.description,
       kind: 'mcp' as const,
-      // Without a tool bound there is nothing to say it can serve a role, so
-      // anything it is already enlisted in counts as a claim.
-      can: [...new Set([...ROLES.filter((r) => c.bindings?.[r]?.tool), ...enlisted(c.name)])],
+      // Bound tools first — a binding is a statement, not a guess. Beyond
+      // those, whatever its advertised tool names resemble, when it has been
+      // dialled at least once.
+      likely: [...new Set([
+        ...ROLES.filter((r) => c.bindings?.[r]?.tool),
+        ...ROLES.filter((r) => guessTool(r, (c.tools ?? []).map((name) => ({ name })))),
+      ])],
       missing: (c.requires ?? []).filter((name) => !hasSecret(name)),
       bound: enlisted(c.name).filter((role) => Boolean(c.bindings?.[role]?.tool)),
     }));
 
-  return [...builtIns, ...mcp];
+  // A built-in wins a name collision. Brave shipped with an MCP connector row
+  // pointing at a localhost port that was never running and never dialled —
+  // Brave is a direct HTTPS call — and while that row existed it shadowed the
+  // real provider, so the search chain reported its own first choice as "no
+  // search tool bound, so it is skipped". The row is gone; this keeps the next
+  // one from doing the same thing quietly.
+  const seen = new Set(builtIns.map((p) => p.id));
+  return [...builtIns, ...mcp.filter((p) => !seen.has(p.id))];
 }
 
 /** One role's chain, in order, with everything the dashboard needs to render a
@@ -137,6 +247,10 @@ export interface ChainEntry {
   usable: boolean;
   /** Why not, when it is not. */
   problem?: string;
+  /** Hosts it is limited to. Position one in a chain implies "asked first for
+   *  everything", which for a single-site provider is not true — it is asked
+   *  first for its own site and skipped otherwise. Worth saying on the row. */
+  hosts?: string[];
 }
 
 export function chainFor(role: ConnectorRole): ChainEntry[] {
@@ -157,6 +271,7 @@ export function chainFor(role: ConnectorRole): ChainEntry[] {
       kind: provider.kind,
       usable: !problem,
       ...(problem ? { problem } : {}),
+      ...(provider.hosts ? { hosts: provider.hosts } : {}),
     };
   });
 }

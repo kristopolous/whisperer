@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import type { Scan } from '../../../shared/types.ts';
 import { VenueBars } from '../charts/VenueBars.tsx';
 import { Filter, matches } from './Filter.tsx';
+import { Coverage } from '../charts/Coverage.tsx';
 import { VENUES, fmtDate, fmtMonth, fmtScore, venueOf } from '../lib.ts';
 
 /** Discovery is the raw material for everything else: every mention and where
@@ -52,6 +53,7 @@ export function Buzz({ scan, cursor }: { scan: Scan; cursor: string | null }) {
   return (
     <div className="split">
       <div className="panel">
+        <Coverage scan={scan} />
         <header>
           <h3>Ledger</h3>
           <span style={{ font: '400 11px var(--mono)', color: 'var(--ink-3)' }}>

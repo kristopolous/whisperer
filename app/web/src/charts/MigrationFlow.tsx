@@ -116,11 +116,21 @@ export function MigrationFlow({ migrations }: { migrations: Migration[] }) {
                     </div>
                     {/* Verbatim: the direction call is only as good as the words
                         it was drawn from, so they stay readable. */}
+                    {/* Verbatim, and always openable.
+                        The link used to be anchored on the author, and most of
+                        these have none — a search result rarely carries one —
+                        so the anchor rendered with no text and the quote was a
+                        dead end. It matters more here than elsewhere because
+                        these quotes arrive already truncated: the ellipsis is
+                        in the search snippet the model was given, so the link
+                        is the only way to read the rest of the sentence. */}
                     <blockquote>
                       {move.quote}
                       <cite>
                         {' — '}
-                        <a href={move.url} target="_blank" rel="noreferrer">{move.author}</a>
+                        <a href={move.url} target="_blank" rel="noreferrer">
+                          {move.author ?? `read it on ${venueOf(move.venue).label}`}
+                        </a>
                       </cite>
                     </blockquote>
                   </li>

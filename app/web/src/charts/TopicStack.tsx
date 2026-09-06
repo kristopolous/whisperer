@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
 import type { TopicPoint } from '../../../shared/types.ts';
-import { fmtMonth } from '../lib.ts';
+import { fmtBucket, grainOf } from '../lib.ts';
 import { useTooltip } from './tooltip.tsx';
 
 /** Discussion volume per topic, stacked over time.
@@ -29,6 +29,9 @@ const SLOTS = [
 export function TopicStack({ topics }: { topics: TopicPoint[] }) {
   const W = 1000, H = 200, PAD = { t: 16, r: 12, b: 26, l: 40 };
   const svgRef = useRef<SVGSVGElement>(null);
+  // Read from the buckets themselves — days, weeks or months depending on
+  // what the scan actually covered.
+  const grain = grainOf(topics.map((p) => p.bucket));
   const [hover, setHover] = useState<number | null>(null);
   const [muted, setMuted] = useState<string | null>(null);
   const tip = useTooltip();
@@ -112,7 +115,7 @@ export function TopicStack({ topics }: { topics: TopicPoint[] }) {
     tip.show(
       event,
       <>
-        <div className="k">{fmtMonth(point.bucket)}</div>
+        <div className="k">{fmtBucket(point.bucket, grain)}</div>
         <div><span className="v">{total}</span> {total === 1 ? 'mention' : 'mentions'}</div>
         <div className="tip-topics">
           {rows.map((row) => (
@@ -176,7 +179,7 @@ export function TopicStack({ topics }: { topics: TopicPoint[] }) {
           // Only label a few buckets, or the axis turns into a smear.
           i % Math.max(1, Math.round(topics.length / 6)) === 0 ? (
             <text key={point.bucket} x={x(i)} y={H - 8} textAnchor="middle" className="tick">
-              {fmtMonth(point.bucket)}
+              {fmtBucket(point.bucket, grain)}
             </text>
           ) : null,
         )}

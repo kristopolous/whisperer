@@ -15,8 +15,11 @@ import { cleanText } from '../shared/html.ts';
 import { cached, DAY, HOUR } from './cache.ts';
 import { usableConnectors } from './config.ts';
 import { unwrapUntrusted } from './content.ts';
-import { bindingFor, connectorsForRole } from './roles.ts';
-import { abortable, throwIfCancelled } from './run-context.ts';
+import { bindingFor } from './roles.ts';
+import { chainFor, connectorsForRole } from './providers.ts';
+import { abortable, isDeep, throwIfCancelled } from './run-context.ts';
+import { anyComplaintWord } from './languages.ts';
+import { noteSpend, outOfCredit, resetRunSpend, spentItsTurn } from './credits.ts';
 import { callTool } from './mcp.ts';
 import { secret } from './secrets.ts';
 import type { Venue } from '../shared/types.ts';
@@ -155,10 +158,31 @@ const COMPLAINT_LANGUAGE = new RegExp([
   String.raw`\bwish (it|they|the)\b`, String.raw`\bneeds? (better|fixing|work|improvement)\b`,
   String.raw`\bstruggl(ed|ing) with\b`, String.raw`\bgave up on\b`, String.raw`\bgiving up on\b`,
   String.raw`\bswitched away\b`, String.raw`\bnot a fan\b`,
+  // the fault stated flatly, which is how people write in a support forum
+  //
+  // Everything above is somebody venting in public, and that is genuinely what
+  // a web search surfaces. A product's own subreddit reads completely
+  // differently: people describe the fault and ask how to fix it, without a
+  // cross word anywhere. Measured on 159 posts and comments from r/GIMP, the
+  // vocabulary above matched four of them — "black border appears when i
+  // rotate" and "Layers got merged when I tried to save" are defect reports by
+  // any reading and matched nothing. These patterns take the same corpus to 49.
+  String.raw`\b(appears?|disappears?|vanishe[sd]|shows? up)\b.{0,30}\bwhen\b`,
+  String.raw`\bgot (merged|reset|corrupted|deleted|lost|scrambled)\b`,
+  String.raw`\b(won'?t|can'?t|cannot|unable to)\s+\w+`,
+  String.raw`\berror\b.{0,40}\b(decoding|parsing|loading|saving|opening)\b`,
+  String.raw`\bfail(s|ed|ing)? to\b`,
+  String.raw`\bno way to\b`, String.raw`\bstill no\b`,
+  String.raw`\bnot supported\b`, String.raw`\bcannot continue\b`,
+  String.raw`\bhow (do|can) i (fix|stop|get rid of|undo)\b`,
+  String.raw`\bwhy (does|is|are|do)\b.{0,50}\b(happen|happening|doing|do that)\b`,
+  String.raw`\bproblem with\b`, String.raw`\bissue with\b`, String.raw`\bbug\b`,
+  String.raw`\bcrash\b`, String.raw`\bfreez(e|es|ing)\b`, String.raw`\bstuck\b`,
+  String.raw`\bbroken\b`, String.raw`\bglitch\b`,
 ].join('|'), 'i');
 
 export const looksLikeComplaint = (hit: SearchHit): boolean =>
-  COMPLAINT_LANGUAGE.test(`${hit.title} ${hit.description}`);
+  complaintLanguage(`${hit.title} ${hit.description}`);
 
 /** The same test against plain text, for sources that are not search hits.
  *
@@ -167,7 +191,13 @@ export const looksLikeComplaint = (hit: SearchHit): boolean =>
  *  drift, and the corpus would then mean something slightly different depending
  *  on which source a mention came from — which is exactly the kind of thing
  *  nobody notices until a count looks wrong. */
-export const complaintLanguage = (text: string): boolean => COMPLAINT_LANGUAGE.test(text);
+export const complaintLanguage = (text: string): boolean =>
+  // The non-English words are checked too, and unconditionally. A result is
+  // judged before anybody has asked what language it is in, and the English
+  // patterns are `\b`-anchored — which cannot match CJK text at all, because
+  // there are no word boundaries in it. Without this a Chinese thread saying
+  // the product keeps crashing is fetched, kept, and filed as neutral chatter.
+  COMPLAINT_LANGUAGE.test(text) || anyComplaintWord(text);
 
 /** A bare domain root is a homepage, never a specific post or thread. */
 export function isHomepage(url: string): boolean {
@@ -314,7 +344,7 @@ function readSearchPayload(text: string): SearchHit[] {
  *  MCP search server and marking it `search` is the whole of putting it into
  *  discovery. Nothing here names a server. */
 async function mcpSearch(
-  query: string, freshness?: Freshness,
+  query: string, freshness?: Freshness, only?: string,
 ): Promise<SearchHit[] | null> {
   const since = freshness === 'pd' ? 1 : freshness === 'pw' ? 7 : freshness === 'pm' ? 31 : freshness === 'py' ? 365 : 0;
   // Freshness becomes Google's `after:` operator — coarser than Brave's
@@ -324,6 +354,7 @@ async function mcpSearch(
     : query;
 
   for (const connector of connectorsForRole('search')) {
+    if (only && connector.name !== only) continue;
     const binding = bindingFor(connector, 'search');
     if (!binding) continue;
     try {
@@ -333,12 +364,523 @@ async function mcpSearch(
       if (result.isError) continue;
       const hits = readSearchPayload(result.text);
       if (hits.length) return hits;
-    } catch {
-      // Try the next one. A search connector that is down is a reason to use
-      // another, not a reason to fail the query.
+    } catch (error) {
+      // Try the next one — a search connector that is down is a reason to use
+      // another, not a reason to fail the query. But record WHY it failed, or
+      // the caller cannot tell a provider that answered "nothing" from one that
+      // hung for the full timeout, and will keep paying that timeout on every
+      // remaining query of the run.
+      noteOutcome(connector.name, error);
     }
   }
   return null;
+}
+
+/* ---------------------------------------------------- request budget ----- */
+
+/** A hard ceiling on paid search requests per run.
+ *
+ *  This exists because the pipeline's appetite is genuinely unreasonable. One
+ *  scan issues 31 general plus 24 complaint queries, each re-run across up to
+ *  four freshness windows and paginated up to ten pages — a measured 1,948
+ *  requests across 720 distinct queries in this project's cache. On a free tier
+ *  that was rude; against a metered API it is a bill.
+ *
+ *  A pacer alone does not fix it. Pacing decides how FAST the requests go out,
+ *  and the problem is how MANY. So this counts them, and when the budget is
+ *  gone the remaining queries return nothing rather than being charged for.
+ *  Degrading is the right failure here: a scan with two hundred results instead
+ *  of a thousand is still a scan, and it is a great deal better than an
+ *  unbounded spend nobody authorised.
+ *
+ *  Cached queries never reach here — the cache is consulted before any of this
+ *  — so the budget is spent only on genuinely new questions.
+ */
+const SEARCH_BUDGET = Number(process.env.SEARCH_BUDGET ?? 240);
+
+/** A deep run is allowed to spend more. Without this the budget simply becomes
+ *  the new ceiling and the extra rungs are refused one by one — the cap would
+ *  have moved, not lifted. */
+const budget = () => (isDeep() ? SEARCH_BUDGET * Number(process.env.DEEP_FACTOR ?? 4) : SEARCH_BUDGET);
+
+const spent = new Map<string, number>();
+
+/** Providers that have stopped answering, and are skipped for the rest of the
+ *  run.
+ *
+ *  A provider that fails fast is cheap to keep trying. One that HANGS is not:
+ *  Bright Data's endpoint accepted every request and then never replied, so
+ *  each of a scan's queries sat out the full timeout before moving on — turning
+ *  a dead provider into fifteen seconds of dead time per query, several hours
+ *  across a run. Two consecutive timeouts is enough to conclude it is not
+ *  answering today. */
+const stalled = new Map<string, number>();
+const STALL_LIMIT = 2;
+
+let warned = false;
+
+/** Start a fresh budget. Called at the top of a run. */
+export function resetSearchBudget(): void {
+  andiSpend = 0;
+  andiCapped = false;
+  resetRunSpend();
+  spent.clear();
+  stalled.clear();
+  stallAnnounced.clear();
+  warned = false;
+}
+
+const isStalled = (provider: string) => (stalled.get(provider) ?? 0) >= STALL_LIMIT;
+
+function noteOutcome(provider: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  // A timeout or an aborted request is the shape that costs time. A 429 or a
+  // 500 came back promptly and says nothing about whether the next one will.
+  if (/timed out|timeout|aborted|AbortError|fetch failed/i.test(message)) {
+    stalled.set(provider, (stalled.get(provider) ?? 0) + 1);
+  } else {
+    stalled.delete(provider);
+  }
+}
+
+export const searchSpend = (): Record<string, number> => Object.fromEntries(spent);
+
+const totalSpend = () => [...spent.values()].reduce((a, b) => a + b, 0);
+
+/** Record one paid request. */
+function spend(provider: string): void {
+  spent.set(provider, (spent.get(provider) ?? 0) + 1);
+  // The per-run tally above answers "what did this scan cost". The ledger
+  // answers "can I afford to run it again", which is the question that decides
+  // whether the demo still works tomorrow.
+  noteSpend(provider, { requests: 1 });
+}
+
+/** True when there is no budget left. */
+function overBudget(emit?: (level: 'warn', text: string) => void): boolean {
+  if (totalSpend() < budget()) return false;
+  if (!warned) {
+    warned = true;
+    emit?.('warn', `search budget of ${budget()} paid requests is spent — the rest of this run reads what is cached and what the free sources return`);
+  }
+  return true;
+}
+
+const stallAnnounced = new Set<string>();
+
+/** Said once per provider per run, because the alternative is one line per
+ *  query for the rest of the scan. */
+function emitStall(provider: string): void {
+  if (stallAnnounced.has(provider)) return;
+  stallAnnounced.add(provider);
+  console.warn(
+    `[search] ${provider} timed out ${STALL_LIMIT} times in a row — skipping it for the rest of this run`,
+  );
+}
+
+/* ------------------------------------------------------- perplexity ----- */
+
+const PERPLEXITY_ENDPOINT = 'https://api.perplexity.ai/search';
+
+/** Perplexity is paid per request, so it gets its own pacer.
+ *
+ *  Slower than Brave's, and deliberately. Brave's was set by a published rate
+ *  limit; this one is set by the fact that somebody is being charged, and a
+ *  runaway loop against a metered API is a bill rather than a 429. */
+let perplexityGate: Promise<unknown> = Promise.resolve();
+const PERPLEXITY_INTERVAL_MS = Number(process.env.PERPLEXITY_INTERVAL_MS ?? 1_200);
+
+function pacePerplexity<T>(fn: () => Promise<T>): Promise<T> {
+  const next = perplexityGate.then(fn, fn);
+  perplexityGate = next.then(
+    () => new Promise((r) => setTimeout(r, PERPLEXITY_INTERVAL_MS)),
+    () => new Promise((r) => setTimeout(r, PERPLEXITY_INTERVAL_MS)),
+  );
+  return next;
+}
+
+/** Recency as Perplexity states it, rather than as a `site:`-style operator. */
+const RECENCY: Record<string, string> = { pd: 'day', pw: 'week', pm: 'month', py: 'year' };
+
+/** One Perplexity search.
+ *
+ *  Returns null rather than throwing when it is not configured, so it can sit
+ *  in the chain harmlessly until a key exists.
+ *
+ *  No pagination: the API answers with up to fifty results in one request where
+ *  Brave gave twenty, so a second page is both unavailable and unnecessary. An
+ *  offset past the first page returns nothing rather than paying for the same
+ *  fifty again. */
+async function perplexitySearch(
+  query: string, count: number, freshness?: Freshness, offset = 0,
+): Promise<SearchHit[] | null> {
+  const key = secret('PERPLEXITY_API_KEY');
+  if (!key) return null;
+  if (offset > 0) return [];
+
+  return pacePerplexity(async () => {
+    spend('perplexity');
+    const response = await fetch(PERPLEXITY_ENDPOINT, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        max_results: Math.min(Math.max(count, 10), 50),
+        ...(freshness && RECENCY[freshness] ? { search_recency_filter: RECENCY[freshness] } : {}),
+      }),
+      signal: abortable(30_000),
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      if (response.status === 429 || response.status >= 500) {
+        throw new RecoverableSearchError(`perplexity ${response.status}: ${detail.slice(0, 120)}`);
+      }
+      throw new Error(`perplexity ${response.status}: ${detail.slice(0, 160)}`);
+    }
+
+    const body = (await response.json()) as {
+      results?: { title?: string; url?: string; snippet?: string; date?: string | null }[];
+    };
+    return (body.results ?? [])
+      .filter((r): r is typeof r & { url: string } => Boolean(r.url))
+      .map((r) => ({
+        title: cleanText(r.title ?? ''),
+        url: r.url,
+        description: cleanText(r.snippet ?? ''),
+        age: r.date ?? null,
+        date: r.date ? parseAge(r.date, undefined) : null,
+      }));
+  });
+}
+
+/* ---------------------------------------------------------- you.com ----- */
+
+const YOU_ENDPOINT = process.env.YDC_ENDPOINT ?? 'https://ydc-index.io/v1/search';
+
+/** Metered like Perplexity, so paced like Perplexity, and for the same reason:
+ *  the failure mode of a runaway loop here is an invoice, not a 429. */
+let youGate: Promise<unknown> = Promise.resolve();
+const YOU_INTERVAL_MS = Number(process.env.YDC_INTERVAL_MS ?? 1_200);
+
+function paceYou<T>(fn: () => Promise<T>): Promise<T> {
+  const next = youGate.then(fn, fn);
+  youGate = next.then(
+    () => new Promise((r) => setTimeout(r, YOU_INTERVAL_MS)),
+    () => new Promise((r) => setTimeout(r, YOU_INTERVAL_MS)),
+  );
+  return next;
+}
+
+/** Move `site:` out of the query string and into the parameters.
+ *
+ *  This is not a nicety. you.com does not honour `site:` — it treats it as
+ *  words to match on, so `site:reddit.com bolt.new bug` comes back as threads
+ *  about the Bolt Pistol in Helldivers and an auto repair shop in Lexington.
+ *  Every discovery query in this app is `site:`-shaped, so left alone this
+ *  provider would answer all of them with plausible-looking noise, which is
+ *  worse than answering none of them: the corpus fills up and nothing says the
+ *  results are unrelated.
+ *
+ *  It does have real domain parameters, so the operator is translated rather
+ *  than dropped. `-site:` becomes an exclusion the same way. What is left is
+ *  the actual search terms. */
+export function splitDomains(query: string): { query: string; include: string[]; exclude: string[] } {
+  const include: string[] = [];
+  const exclude: string[] = [];
+  const rest = query.replace(/(-?)site:(\S+)/gi, (_match, negated: string, host: string) => {
+    (negated ? exclude : include).push(host.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/.*$/, ''));
+    return '';
+  });
+  return { query: rest.replace(/\s+/g, ' ').trim(), include, exclude };
+}
+
+/** One you.com search.
+ *
+ *  Returns null when it is not configured, so it can sit in the chain
+ *  harmlessly until a key exists — same contract as Perplexity.
+ *
+ *  Unlike Perplexity this one does paginate, so `offset` is passed through and
+ *  a second page is a real second page rather than the first one billed twice.
+ *  Web and news results come back in separate arrays; both are ordinary hits
+ *  here, because a complaint written up as a news item is still a complaint.
+ */
+async function youSearch(
+  query: string, count: number, freshness?: Freshness, offset = 0,
+): Promise<SearchHit[] | null> {
+  const key = secret('YDC_API_KEY');
+  if (!key) return null;
+
+  const asked = splitDomains(query);
+  // A query that was nothing but `site:host` has no terms left to search for.
+  // Brave answers that with "the recent pages on this host"; you.com has no
+  // equivalent, and sending an empty query would spend a request on whatever it
+  // decided to return. Declining — null, the same as "not configured" — hands
+  // the query to the next provider without claiming to have answered it.
+  if (!asked.query) return null;
+
+  return paceYou(async () => {
+    spend('you');
+    const response = await fetch(YOU_ENDPOINT, {
+      method: 'POST',
+      headers: { 'X-API-Key': key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: asked.query,
+        count: Math.min(Math.max(count, 10), 20),
+        ...(offset ? { offset } : {}),
+        ...(asked.include.length ? { include_domains: asked.include } : {}),
+        ...(asked.exclude.length ? { exclude_domains: asked.exclude } : {}),
+        ...(freshness && RECENCY[freshness] ? { freshness: RECENCY[freshness] } : {}),
+      }),
+      signal: abortable(30_000),
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      // 402 is the one that matters on a prepaid account: the credits are gone.
+      // Treated as recoverable so the chain moves on to the next provider
+      // rather than failing the whole query, which is what "out of allowance"
+      // should mean everywhere.
+      if (response.status === 402 || response.status === 429 || response.status >= 500) {
+        throw new RecoverableSearchError(`you.com ${response.status}: ${detail.slice(0, 120)}`);
+      }
+      throw new Error(`you.com ${response.status}: ${detail.slice(0, 160)}`);
+    }
+
+    interface YouResult {
+      title?: string; url?: string; description?: string;
+      snippets?: string[]; page_age?: string | null;
+    }
+    const body = (await response.json()) as {
+      results?: { web?: YouResult[]; news?: YouResult[] };
+    };
+
+    return [...(body.results?.web ?? []), ...(body.results?.news ?? [])]
+      .filter((r): r is YouResult & { url: string } => Boolean(r.url))
+      .map((r) => ({
+        title: cleanText(r.title ?? ''),
+        url: r.url,
+        // The description is a one-liner; the snippets are the passages that
+        // actually matched. Complaint detection reads this text, so the
+        // passages are worth more than the summary and both are kept.
+        description: cleanText([r.description ?? '', ...(r.snippets ?? [])].join(' ').trim()),
+        age: r.page_age ?? null,
+        date: r.page_age ? parseAge(r.page_age, undefined) : null,
+      }));
+  });
+}
+
+/* ---------------------------------------------------------- parallel ----- */
+
+const PARALLEL_ENDPOINT = process.env.PARALLEL_ENDPOINT ?? 'https://api.parallel.ai/v1/search';
+
+let parallelGate: Promise<unknown> = Promise.resolve();
+const PARALLEL_INTERVAL_MS = Number(process.env.PARALLEL_INTERVAL_MS ?? 1_000);
+
+function paceParallel<T>(fn: () => Promise<T>): Promise<T> {
+  const next = parallelGate.then(fn, fn);
+  parallelGate = next.then(
+    () => new Promise((r) => setTimeout(r, PARALLEL_INTERVAL_MS)),
+    () => new Promise((r) => setTimeout(r, PARALLEL_INTERVAL_MS)),
+  );
+  return next;
+}
+
+/** Page furniture that leads a scraped excerpt.
+ *
+ *  Parallel returns passages taken from the page rather than a search-engine
+ *  snippet, which is better material — and it means the navigation comes with
+ *  it. Every Reddit excerpt begins "Skip to main content Open menu Open
+ *  navigation". Left in, this text is what the complaint vocabulary and the
+ *  disambiguation pass read, so it is noise in the one place noise costs most. */
+const CHROME = /^(?:skip to (?:main )?content|open (?:menu|navigation)|go to \w+ home|ir al contenido principal|expand (?:user )?menu|\[\]\([^)]*\))\s*/gi;
+
+/** One Parallel search.
+ *
+ *  Null when unconfigured or when asked for a second page: there is no offset
+ *  parameter, so paging would re-buy the first page. Declining hands the query
+ *  to the next provider instead of charging for a duplicate.
+ *
+ *  `site:` is passed through rather than translated — the probe that verified
+ *  this endpoint used `site:reddit.com` and got reddit threads back, so the
+ *  operator is honoured. Unlike you.com, which reads it as words to match.
+ */
+async function parallelSearch(
+  query: string, count: number, freshness?: Freshness, offset = 0,
+): Promise<SearchHit[] | null> {
+  const key = secret('PARALLEL_API_KEY');
+  if (!key) return null;
+  if (offset > 0) return null;
+
+  return paceParallel(async () => {
+    spend('parallel');
+    const response = await fetch(PARALLEL_ENDPOINT, {
+      method: 'POST',
+      headers: { 'x-api-key': key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        // The objective is the part no keyword engine has. It says what the
+        // results are for, which is how a ranker tells a complaint thread from
+        // a launch announcement that uses the same words.
+        objective: 'Complaints, bug reports and problems people are having, in their own words',
+        search_queries: [query],
+        // Latency is the trade, and a scan issues dozens of these in sequence.
+        // A deep run has already accepted that it takes longer.
+        mode: isDeep() ? 'advanced' : 'fast',
+      }),
+      signal: abortable(60_000),
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      if (response.status === 402 || response.status === 429 || response.status >= 500) {
+        throw new RecoverableSearchError(`parallel ${response.status}: ${detail.slice(0, 120)}`);
+      }
+      throw new Error(`parallel ${response.status}: ${detail.slice(0, 160)}`);
+    }
+
+    const body = (await response.json()) as {
+      results?: { url?: string; title?: string; publish_date?: string | null; excerpts?: string[] }[];
+    };
+
+    return (body.results ?? [])
+      .filter((r): r is typeof r & { url: string } => Boolean(r.url))
+      .slice(0, Math.max(count, 10))
+      .map((r) => ({
+        title: cleanText(r.title ?? ''),
+        url: r.url,
+        description: cleanText((r.excerpts ?? []).map((e) => e.replace(CHROME, '')).join(' ').trim()).slice(0, 1_200),
+        age: r.publish_date ?? null,
+        // Parallel dates most of what it returns, which the others mostly do
+        // not — and a dated mention is the difference between a point on the
+        // timeline and a row that can only be counted.
+        date: r.publish_date ? parseAge(r.publish_date, undefined) : null,
+      }));
+  });
+}
+
+/* -------------------------------------------------------------- andi ----- */
+
+const ANDI_ENDPOINT = process.env.ANDI_ENDPOINT ?? 'https://api.andiai.com/api/v1/search';
+
+let andiGate: Promise<unknown> = Promise.resolve();
+const ANDI_INTERVAL_MS = Number(process.env.ANDI_INTERVAL_MS ?? 1_200);
+
+function paceAndi<T>(fn: () => Promise<T>): Promise<T> {
+  const next = andiGate.then(fn, fn);
+  andiGate = next.then(
+    () => new Promise((r) => setTimeout(r, ANDI_INTERVAL_MS)),
+    () => new Promise((r) => setTimeout(r, ANDI_INTERVAL_MS)),
+  );
+  return next;
+}
+
+/** Andi's own recency vocabulary. */
+const DATE_RANGE: Record<string, string> = { pd: 'day', pw: 'week', pm: 'month', py: 'year' };
+
+/** What this run has actually been charged, in dollars.
+ *
+ *  Andi returns `metrics.cost_dollars` on every response, which no other
+ *  provider here does. Worth keeping: the per-run request count says how many
+ *  times we asked, and this says what asking cost — and "these queries aren't
+ *  free" is a great deal more actionable when the number is real money rather
+ *  than a tally of requests against an allowance nobody can see. */
+let andiSpend = 0;
+export const searchCostDollars = (): number => andiSpend;
+
+/** What one run may spend at Andi, in dollars.
+ *
+ *  A separate cap from the request budget, and it has to be, because Andi
+ *  prices by outcome rather than by request: "easy lookups cost less,
+ *  hard-to-find content costs more". A count of requests therefore does not
+ *  bound the bill, and the whole reason to search deeper is to ask for
+ *  hard-to-find content. Fifty cents a run against a five-dollar balance is ten
+ *  runs, which is enough to find out whether the provider earns its place. */
+const ANDI_MAX_DOLLARS = Number(process.env.ANDI_MAX_DOLLARS ?? 0.5);
+let andiCapped = false;
+
+/** One Andi search.
+ *
+ *  Null when unconfigured, so it sits in the chain harmlessly until a key
+ *  exists — same contract as the others.
+ *
+ *  `site:` is translated rather than passed through. Andi does parse operators
+ *  out of the query string by default, but `includeDomains` is a parameter
+ *  rather than a convention, and a parameter cannot be turned off by a setting
+ *  or reinterpreted by a ranker. The translation is already written and tested
+ *  for you.com, so this costs nothing.
+ */
+async function andiSearch(
+  query: string, count: number, freshness?: Freshness, offset = 0,
+): Promise<SearchHit[] | null> {
+  const key = secret('ANDI_API_KEY');
+  if (!key) return null;
+  if (andiSpend >= ANDI_MAX_DOLLARS) {
+    if (!andiCapped) {
+      andiCapped = true;
+      console.warn(`[search] andi has spent $${andiSpend.toFixed(3)} this run — at its cap, falling through to the rest of the chain`);
+    }
+    return null;
+  }
+
+  const asked = splitDomains(query);
+  if (!asked.query) return null;
+
+  return paceAndi(async () => {
+    spend('andi');
+    const params = new URLSearchParams({
+      q: asked.query,
+      // Up to a hundred, where Brave gives twenty. Fewer requests for the same
+      // corpus is the whole reason this is worth having.
+      limit: String(Math.min(Math.max(count, 10), 50)),
+      // Cost is outcome-based, so the mode is the spend dial. A daily run takes
+      // whatever Andi judges sufficient; a deep run pays for the deep index.
+      searchMode: isDeep() ? 'deep' : 'auto',
+    });
+    if (offset) params.set('offset', String(offset));
+    if (freshness && DATE_RANGE[freshness]) params.set('dateRange', DATE_RANGE[freshness]);
+    if (asked.include.length) params.set('includeDomains', asked.include.join(','));
+    if (asked.exclude.length) params.set('excludeDomains', asked.exclude.join(','));
+
+    const response = await fetch(`${ANDI_ENDPOINT}?${params}`, {
+      headers: { 'x-api-key': key },
+      signal: abortable(30_000),
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      // 402 is an empty balance and 429 is going too fast. Both mean "ask
+      // somebody else", which is what the chain is for — so both are
+      // recoverable here even though neither is worth retrying against Andi.
+      // 401 is a bad key and fails identically forever; it stops the query.
+      if (response.status === 402 || response.status === 429 || response.status >= 500) {
+        throw new RecoverableSearchError(`andi ${response.status}: ${detail.slice(0, 120)}`);
+      }
+      throw new Error(`andi ${response.status}: ${detail.slice(0, 160)}`);
+    }
+
+    const body = (await response.json()) as {
+      results?: { title?: string; link?: string; url?: string; desc?: string; snippet?: string; date?: string }[];
+      metrics?: { cost_dollars?: number };
+    };
+    const charged = Number(body.metrics?.cost_dollars) || 0;
+    andiSpend += charged;
+    // Recorded in dollars because Andi prices by outcome, so the request count
+    // this provider also files is not what it will be billed for.
+    noteSpend('andi', { dollars: charged });
+
+    return (body.results ?? [])
+      .map((r) => ({ ...r, href: r.link ?? r.url }))
+      .filter((r): r is typeof r & { href: string } => Boolean(r.href))
+      .map((r) => ({
+        title: cleanText(r.title ?? ''),
+        url: r.href,
+        // `desc` is the page's own description and `snippet` is the part that
+        // matched. Complaint detection reads this text, so both go in.
+        description: cleanText([r.snippet ?? '', r.desc ?? ''].filter(Boolean).join(' ')),
+        age: r.date ?? null,
+        date: r.date ? parseAge(r.date, undefined) : null,
+      }));
+  });
 }
 
 export async function braveSearch(
@@ -359,34 +901,108 @@ export async function braveSearch(
     // at the next stage boundary could be four minutes away — long enough that
     // the button would read as broken.
     throwIfCancelled();
-    // Nothing is left to ask Brave with, so do not spend a round trip finding
-    // that out again. The cache is still consulted above, which is the point —
-    // an exhausted quota does not make already-fetched results worthless.
-    if (braveQuotaSpent) {
-      const backup = await mcpSearch(query, freshness);
-      if (backup && backup.length) return backup;
-      throw new Error(`brave's monthly quota is spent and no search connector answered "${query}"`);
+
+    // Walk the configured chain, first choice first.
+    //
+    // Which provider leads is a setting now, not a fact about this function.
+    // It used to be "Brave, and Bright Data if Brave errors", which was exactly
+    // wrong the day Brave ran out of its monthly allowance: the dead provider
+    // kept its position at the front and every query paid a round trip to
+    // discover that again. The order is data, so demoting Brave is a drag
+    // rather than an edit here.
+    const chain = chainFor('search').filter((entry) => entry.usable);
+    if (chain.length === 0) {
+      throw new Error('no search provider is configured — add one under Settings → Roles');
+    }
+    // Checked after the cache, so a spent budget still serves everything
+    // already fetched.
+    if (overBudget()) return [];
+
+    let lastError: unknown;
+    // Did anybody actually run the query? An empty result from a provider that
+    // searched is an answer — "nothing out there matches" — and must not be
+    // reported as a broken chain. The two were conflated, and it showed the
+    // moment a provider that legitimately returns nothing for a narrow
+    // `site:` query led the chain: every such query logged
+    // `no search provider answered`, which reads as a configuration fault.
+    let answered = false;
+    for (const entry of chain) {
+      // `reddit` sits in the search chain because it really does search — but
+      // only reddit.com, and this is the general web search path. It was being
+      // walked anyway, spending a budget unit to find no MCP connector by that
+      // name and return nothing. Reddit is queried directly by its own source.
+      if (entry.id === 'reddit') continue;
+      if (isStalled(entry.id)) continue;
+      // Out of its free allowance. Skipped rather than asked: a provider whose
+      // grant is spent answers with a 402 that costs a round trip to receive,
+      // and the next provider in the chain was always going to serve this
+      // query anyway.
+      if (outOfCredit(entry.id)) continue;
+      // Had its share of this run. Not a failure and not a shortage — the
+      // provider is fine and will lead the next run too. It is how a scan is
+      // spread across several free grants instead of emptying whichever one
+      // happens to be at the top of the chain.
+      if (spentItsTurn(entry.id)) continue;
+      try {
+        if (entry.id === 'perplexity') {
+          const hits = await perplexitySearch(query, count, freshness, offset);
+          if (hits) answered = true;
+          if (hits && hits.length) return hits;
+          continue;
+        }
+        if (entry.id === 'parallel') {
+          const hits = await parallelSearch(query, count, freshness, offset);
+          if (hits) answered = true;
+          if (hits && hits.length) return hits;
+          continue;
+        }
+        if (entry.id === 'andi') {
+          const hits = await andiSearch(query, count, freshness, offset);
+          if (hits) answered = true;
+          if (hits && hits.length) return hits;
+          continue;
+        }
+        if (entry.id === 'you') {
+          const hits = await youSearch(query, count, freshness, offset);
+          if (hits) answered = true;
+          if (hits && hits.length) return hits;
+          continue;
+        }
+        if (entry.id === 'brave') {
+          // Nothing left to ask Brave with, so do not spend a round trip
+          // finding that out again — but the cache above was still consulted,
+          // because a spent quota does not make fetched results worthless.
+          if (braveQuotaSpent) continue;
+          if (!key) continue;
+          spend('brave');
+          // Only Brave goes through the pacer. The others have no reason to
+          // queue behind a rate limit that is not theirs — when the fallback
+          // ran inside this gate, every Bright Data request waited 1.1s for a
+          // turn and then held the gate for its own round trip, so the escape
+          // hatch inherited the exact limit it exists to escape.
+          return await serialize(() => braveCall(query, key, count, freshness, offset));
+        }
+        spend(entry.id);
+        const hits = await mcpSearch(query, freshness, entry.id);
+        if (hits) answered = true;
+        if (hits && hits.length) return hits;
+      } catch (error) {
+        // A provider that is rate limited, down or unreachable is a reason to
+        // try the next one. Anything else — a rejected key, a malformed query —
+        // would fail the same way everywhere, so it stops here.
+        noteOutcome(entry.id, error);
+        if (isStalled(entry.id)) {
+          emitStall(entry.id);
+        }
+        if (!(error instanceof RecoverableSearchError)) throw error;
+        lastError = error;
+      }
     }
 
-    try {
-      return await serialize(() => braveCall(query, key, count, freshness, offset));
-    } catch (error) {
-      // The backup runs OUTSIDE the gate, which is the whole point of it.
-      //
-      // It used to run inside: the fallback was invoked from within the
-      // serialized Brave call, so every Bright Data request queued behind
-      // Brave's one-per-1.1s pacer AND held that pacer for its own round trip.
-      // The escape hatch inherited the exact rate limit it exists to escape,
-      // and a run that was 429ing on every query — which is what a large scan
-      // does — paid 1.1s of dead time before each backup call and blocked every
-      // other query while it ran. Out here the two providers are independent,
-      // and Brave being throttled costs nothing but Brave.
-      if (error instanceof RecoverableSearchError) {
-        const backup = await mcpSearch(query, freshness);
-        if (backup && backup.length) return backup;
-      }
-      throw error;
-    }
+    // A provider ran it and found nothing. That is a result, not a failure.
+    if (answered) return [];
+    if (lastError) throw lastError;
+    throw new Error(`no search provider answered "${query}"`);
   });
 }
 
@@ -499,11 +1115,21 @@ export interface WideningResult {
  */
 export async function searchWidening(
   queries: string[],
-  options: { count?: number; target?: number; ladder?: Freshness[]; pages?: number },
+  options: {
+    count?: number; target?: number; ladder?: Freshness[]; pages?: number;
+    /** Walk every rung regardless of the target.
+     *
+     *  Stopping early is right for a daily check and wrong for "go and look
+     *  properly": on an active product the first rung satisfies the target
+     *  inside the last month, so the years before it are never queried at all.
+     *  The target still bounds the normal path; this is what a deep run turns
+     *  off. */
+    exhaustive?: boolean;
+  },
   onError?: (query: string, message: string) => void,
   onStep?: (window: Freshness, total: number) => void,
 ): Promise<WideningResult> {
-  const { count = 20, target = 60, ladder = FRESHNESS_LADDER, pages = 1 } = options;
+  const { count = 20, target = 60, ladder = FRESHNESS_LADDER, pages = 1, exhaustive = false } = options;
   const merged = new Map<string, SearchHit>();
   const steps: { window: Freshness; hits: number }[] = [];
   let window: Freshness | undefined;
@@ -515,7 +1141,7 @@ export async function searchWidening(
     }
     steps.push({ window: rung, hits: merged.size });
     onStep?.(rung, merged.size);
-    if (merged.size >= target) break;
+    if (!exhaustive && merged.size >= target) break;
   }
 
   return { hits: [...merged.values()], window, steps };

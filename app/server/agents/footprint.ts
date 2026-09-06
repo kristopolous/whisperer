@@ -37,5 +37,6 @@ One row per real account: use x.com not twitter.com, the canonical YouTube URL (
   schema: profilesSchema,
   connectors: ['x', 'exa', 'youtube', 'tiktok', 'bright-data', 'brave'],
   effort: 'high',
+  needsTools: true,
   inPipeline: false,
 };

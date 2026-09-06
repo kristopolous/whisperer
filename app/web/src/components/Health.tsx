@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import type { Issue, Scan, Tracker } from '../../../shared/types.ts';
-import { api, fmtDate, venueOf } from '../lib.ts';
+import type { FixStep, Issue, Mention, Scan, Tracker } from '../../../shared/types.ts';
+import { api, apiUrl, fmtDate, venueOf } from '../lib.ts';
+import type { DefectHistory, Series } from '../../../server/series.ts';
 import { Filter, matches } from './Filter.tsx';
 import { ResolutionLoop } from './ResolutionLoop.tsx';
 
@@ -16,6 +17,30 @@ const SEVERITY_ORDER: Issue['severity'][] = ['critical', 'serious', 'warning', '
 /** Health is a docket: the catalogue on the left, the incident report on the
  *  right. One issue is selected at all times so the report is never an empty
  *  frame waiting for a click. */
+/** What moved since the last run.
+ *
+ *  One line, because that is what a daily check is: the numbers themselves are
+ *  already on the screen and in the rail. Absent until there is a second run to
+ *  compare against — a delta of one observation is not a delta. */
+function Delta({ series }: { series: Series | null }) {
+  const d = series?.delta;
+  if (!d) return null;
+
+  const signed = (n: number, digits = 0) => `${n > 0 ? '+' : n < 0 ? '\u2212' : ''}${Math.abs(n).toFixed(digits)}`;
+  const when = new Date(d.since).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+
+  return (
+    <div className="delta">
+      since {when}:{' '}
+      {d.newDefects > 0 && <b>{d.newDefects} new</b>}
+      {d.newDefects > 0 && d.goneDefects > 0 && ', '}
+      {d.goneDefects > 0 && <span>{d.goneDefects} gone</span>}
+      {(d.newDefects > 0 || d.goneDefects > 0) && ' · '}
+      mentions {signed(d.mentions)} · net {signed(d.net, 2)}
+    </div>
+  );
+}
+
 export function Health({ scan, onChange, onScan }: {
   scan: Scan;
   onChange: (issue: Issue) => void;
@@ -29,10 +54,30 @@ export function Health({ scan, onChange, onScan }: {
   const [selected, setSelected] = useState(issues[0]?.id);
   const issue = issues.find((i) => i.id === selected) ?? issues[0];
 
+  // What this company's earlier runs said. A defect list is a snapshot; the
+  // reason to look at it every morning is what moved, and that only exists
+  // across runs.
+  const [series, setSeries] = useState<Series | null>(null);
+  useEffect(() => {
+    let live = true;
+    api<Series>(`api/scans/${scan.id}/series`)
+      .then((data) => { if (live) setSeries(data); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [scan.id]);
+  const history: Record<string, DefectHistory> = Object.fromEntries(
+    (series?.defects ?? []).filter((d) => d.state !== 'gone').map((d) => [d.id, d]),
+  );
+
   useEffect(() => { if (issues.length && !issues.some((i) => i.id === selected)) setSelected(issues[0].id); },
     [scan.id, issues.length]);
 
-  if (issues.length === 0) {
+  // `all`, not `issues`. Testing the filtered list meant a search that matched
+  // nothing unmounted the search box along with the rows, so there was no way
+  // to clear the query that emptied the panel — and the empty state then
+  // explained at length why triage had found no defects, about a run that had
+  // found plenty.
+  if (all.length === 0) {
     // Three different situations produce an empty list, and calling all of them
     // "nothing to fix" is a lie in two of them. Claiming a company has no
     // complaints when the triage step never executed is the worst thing this
@@ -110,6 +155,7 @@ export function Health({ scan, onChange, onScan }: {
       <WriteTarget scan={scan} onScan={onScan} />
       <div className="docket">
         <div className="docket-list" role="listbox" aria-label="Issue catalogue">
+          <Delta series={series} />
           <Filter
             value={query}
             onChange={setQuery}
@@ -117,6 +163,7 @@ export function Health({ scan, onChange, onScan }: {
             showing={issues.length}
             total={all.length}
           />
+          {issues.length === 0 && <div className="dash-empty">Nothing matches “{query}”.</div>}
           {issues.map((i) => (
             <button
               key={i.id}
@@ -131,6 +178,12 @@ export function Health({ scan, onChange, onScan }: {
                 <span style={{ font: '400 10.5px var(--mono)', color: 'var(--ink-3)' }}>
                   {i.evidence.length} {i.evidence.length === 1 ? 'report' : 'reports'}
                 </span>
+                {/* How long this has been true, which is the only thing on the
+                    row that a second run can tell you and a first cannot. */}
+                {history[i.id]?.state === 'new' && <span className="tag warning">new</span>}
+                {(history[i.id]?.streak ?? 0) > 1 && (
+                  <span className="tag plain">{history[i.id]!.streak} runs running</span>
+                )}
                 {i.loop?.some((e) => e.step === 'closed') && <span className="tag good">closed by reporter</span>}
                 {i.loop?.length && !i.loop.some((e) => e.step === 'closed')
                   ? <span className="tag warning">awaiting reporter</span>
@@ -141,6 +194,54 @@ export function Health({ scan, onChange, onScan }: {
         </div>
         <Report scan={scan} issue={issue} onChange={onChange} onScan={onScan} />
       </div>
+    </div>
+  );
+}
+
+/** The mentions an issue was built from, resolved against the scan.
+ *
+ *  The ids that resolved to nothing are returned too. An issue cites mention
+ *  ids; if one is not in the corpus there is no link to give, and rendering one
+ *  fewer row without saying so makes an unsupported claim look identical to a
+ *  supported one. */
+function sourcesFor(scan: Scan, issue: Issue) {
+  const found: Mention[] = [];
+  const missing: string[] = [];
+  for (const id of issue.evidence) {
+    const mention = scan.mentions.find((m) => m.id === id);
+    if (mention) found.push(mention);
+    else missing.push(id);
+  }
+  return { found, missing };
+}
+
+/** Where a defect came from: the links, directly under its title.
+ *
+ *  Links and nothing else. Every issue here is a model's reading of what
+ *  strangers wrote, and checking that reading means opening the thread — so
+ *  what this owes the reader is the URL. Venue, author, engagement, score and
+ *  themes all sat here at one point and were furniture: none of them is
+ *  evidence that the link is good, and all of them cost attention on the way
+ *  to it. */
+function Provenance({ scan, issue }: { scan: Scan; issue: Issue }) {
+  const { found, missing } = sourcesFor(scan, issue);
+
+  return (
+    <div className="prov">
+      <h5>Source</h5>
+      <ul className="prov-list">
+        {found.map((m) => (
+          <li key={m.id}>
+            <a href={m.url} target="_blank" rel="noreferrer">{m.url}</a>
+          </li>
+        ))}
+        {found.length === 0 && <li className="q">No source in this scan can be opened for this.</li>}
+      </ul>
+      {missing.length > 0 && found.length > 0 && (
+        <p className="q">
+          {missing.length} cited {missing.length === 1 ? 'source is' : 'sources are'} not in this scan.
+        </p>
+      )}
     </div>
   );
 }
@@ -161,6 +262,38 @@ function Report({ scan, issue, onChange, onScan }: {
   // here is per-issue and the buttons say which phase they are in rather than
   // just spinning.
   const [working, setWorking] = useState<'diagnose' | 'fix' | null>(null);
+  const [steps, setSteps] = useState<{ step: string; note: string }[]>([]);
+  const [investigating, setInvestigating] = useState(false);
+  const busyNow = working !== null || investigating;
+
+  /** Fork, clone, read, patch, publish — streamed, so the wait is legible. */
+  const investigate = () => {
+    setSteps([]);
+    setSourceError(null);
+    setInvestigating(true);
+    const stream = new EventSource(apiUrl(`api/scans/${scan.id}/issues/${issue.id}/investigate/stream`));
+    stream.onmessage = (message) => {
+      const event = JSON.parse(message.data) as
+        { type: 'log'; line: { text: string } } | { type: 'done'; scan: Scan } | { type: 'error'; message: string };
+      if (event.type === 'log') {
+        const m = event.line.text.match(/^\[(\w+)\]\s*(.*)$/);
+        if (m) setSteps((prev) => [...prev, { step: m[1]!, note: m[2] ?? '' }]);
+      }
+      if (event.type === 'done') {
+        const fresh = event.scan.issues.find((i) => i.id === issue.id);
+        if (fresh) onChange(fresh);
+        onScan({ fork: event.scan.fork });
+        setInvestigating(false);
+        stream.close();
+      }
+      if (event.type === 'error') {
+        setSourceError(event.message);
+        setInvestigating(false);
+        stream.close();
+      }
+    };
+    stream.onerror = () => { setInvestigating(false); stream.close(); };
+  };
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [repos, setRepos] = useState<{ company: string }[] | null>(null);
 
@@ -239,9 +372,23 @@ function Report({ scan, issue, onChange, onScan }: {
     return () => { live = false; };
   }, [scan.id, issue.id]);
 
-  const evidence = issue.evidence
-    .map((id) => scan.mentions.find((m) => m.id === id))
-    .filter((m): m is NonNullable<typeof m> => Boolean(m));
+  /** Draft the reply and put it in the outbox. Never sends: `send` is not
+   *  passed, so this produces something to read and approve, which is the only
+   *  thing that should happen without a person looking at it. */
+  const [reply, setReply] = useState<{ message: string; destination: string } | null>(null);
+  const sendReply = async (phase: 'acknowledge' | 'fix-notify') => {
+    setBusy(true);
+    setFileError(null);
+    try {
+      const result = await api<{ draft: { message: string; destination: string } }>(
+        `api/scans/${scan.id}/issues/${issue.id}/reply`,
+        { method: 'POST', body: JSON.stringify({ phase }) },
+      );
+      setReply(result.draft);
+    } catch (error) {
+      setFileError(String(error).replace(/^Error:\s*/, '').slice(0, 300));
+    } finally { setBusy(false); }
+  };
 
   const preview = async (tracker: Tracker) => {
     setBusy(true);
@@ -292,7 +439,7 @@ function Report({ scan, issue, onChange, onScan }: {
         <span className={`tag ${issue.severity}`}>{issue.severity}</span>
         <span className="tag plain">{issue.kind}</span>
         <span style={{ font: '400 11px var(--mono)', color: 'var(--ink-3)' }}>
-          {issue.firstSeen ? `first reported ${fmtDate(issue.firstSeen)}` : 'undated'}
+          {issue.firstSeen ? `reported on ${fmtDate(issue.firstSeen)}` : 'undated'}
           {issue.lastSeen && issue.lastSeen !== issue.firstSeen ? ` · last ${fmtDate(issue.lastSeen)}` : ''}
         </span>
         {issue.filedTo && (
@@ -300,27 +447,8 @@ function Report({ scan, issue, onChange, onScan }: {
         )}
       </div>
 
-      <p>{issue.summary}</p>
+      <Provenance scan={scan} issue={issue} />
 
-      <h5>Impact</h5>
-      <p>{issue.impact}</p>
-
-      <h5>Reported in</h5>
-      <ul className="evidence">
-        {evidence.map((m) => (
-          <li key={m.id}>
-            <a href={m.url} target="_blank" rel="noreferrer">{m.title}</a>
-            <div className="q">
-              {venueOf(m.venue).label} · {fmtDate(m.date)} — “{m.excerpt.slice(0, 200)}{m.excerpt.length > 200 ? '…' : ''}”
-            </div>
-          </li>
-        ))}
-        {evidence.length === 0 && <li className="q">The supporting threads are no longer in this scan.</li>}
-      </ul>
-
-      <ResolutionLoop issue={issue} />
-
-      <h5>Go into the source</h5>
       <WorkspacePicker scan={scan} onScan={onScan} />
       {!hasRepo ? (
         <p className="q">
@@ -329,24 +457,62 @@ function Report({ scan, issue, onChange, onScan }: {
           repository to <code>config/repos.json</code>.
         </p>
       ) : (
-        <>
-          <div className="actions">
-            <button className="primary" onClick={tryToFix} disabled={working !== null}>
-              {working === 'diagnose' ? 'Reading the source…'
-                : working === 'fix' ? 'Patching and running tests…'
-                  : issue.fix ? 'Try again' : 'Try to fix it'}
-            </button>
-            <button onClick={() => runSource('diagnose')} disabled={working !== null}>
-              {issue.diagnosis ? 'Diagnose again' : 'Diagnose only'}
-            </button>
-          </div>
-          <p className="q">
+        /* Its own block, not a row of buttons.
+         * This is the thing the product is for — reading a stranger's complaint
+         * against real code and coming back with a patch — and it was rendering
+         * as two ordinary buttons in the same generic row used for "Discard".
+         * The explanation sits above the action rather than below it, because
+         * it says what is about to happen, and that is worth reading first. */
+        <div className="source-action">
+          {/* The heading lives inside the block now. As a quiet <h5> above it,
+              it read as a section label for a form; the block is the first
+              thing on the report and needs to announce itself. */}
+          <h4 className="source-action-title">Go into the source</h4>
+          <p className="source-action-what">
             Reads the project's source, then writes a patch and runs the test suite in a throwaway
             copy. Nothing is committed or pushed, and a fix is only reported as working if the new
             regression test fails against the original code.
           </p>
-          {sourceError && <p className="conn-err">{sourceError}</p>}
-        </>
+          <div className="source-action-go">
+            <button className="primary big" onClick={investigate} disabled={busyNow}>
+              {busyNow ? 'Investigating…' : issue.fix || issue.diagnosis ? 'Investigate again' : 'Investigate'}
+            </button>
+            <button className="ghost" onClick={() => runSource('diagnose')} disabled={busyNow}>
+              {issue.diagnosis ? 'Read the source again' : 'Just read the source'}
+            </button>
+          </div>
+
+          {/* The steps, so minutes of work are legible while they take them.
+              Forking, cloning, reading, patching and publishing were five
+              controls in four places; this is the same work as one story. */}
+          {(busyNow || steps.length > 0) && (
+            <ol className="steps-run">
+              {STEP_ORDER.map((key) => {
+                const hit = steps.find((s) => s.step === key);
+                const last = steps.at(-1)?.step === key;
+                // The step that died is the last one reached. Without this every
+                // step rendered as done and the error sat under the whole
+                // ladder, so the one thing the list is for — saying how far it
+                // got — was the one thing it did not say.
+                const state = !hit ? 'idle'
+                  : last && sourceError ? 'failed'
+                    : last && busyNow ? 'active'
+                      : 'done';
+                return (
+                  <li key={key} className="steps-run-item" data-state={state}>
+                    <span className="steps-run-dot" />
+                    <span className="steps-run-label">{STEP_LABEL[key]}</span>
+                    {hit?.note && state === 'active' && <span className="conn-meta">{hit.note}</span>}
+                    {state === 'failed' && <span className="conn-err">{sourceError}</span>}
+                  </li>
+                );
+              })}
+            </ol>
+          )}
+          {/* Only when no step owns it — an error during forking belongs on
+              the forking row, not repeated at the bottom of the list. */}
+          {sourceError && steps.length === 0 && <p className="conn-err">{sourceError}</p>}
+        </div>
       )}
 
       {issue.diagnosis && <DiagnosisView diagnosis={issue.diagnosis} />}
@@ -403,8 +569,35 @@ function Report({ scan, issue, onChange, onScan }: {
         </>
       )}
 
+      <p>{issue.summary}</p>
+
+      <h5>Impact</h5>
+      <p>{issue.impact}</p>
+
+      <ResolutionLoop
+        issue={issue}
+        busy={busyNow || busy}
+        onAction={(action) => {
+          if (action === 'investigate') return investigate();
+          if (action === 'file') return void preview('github');
+          // Filing first is enforced by the ladder, so by the time this fires
+          // there is a ticket for the reply to hand over.
+          return void sendReply(action === 'reply' ? 'acknowledge' : 'fix-notify');
+        }}
+      />
+
       <h5>Reply to the people who raised it</h5>
-      <p className="reply">{issue.draftReply}</p>
+      {/* The drafted reply once one has been asked for, because it carries the
+          real ticket link and the triage-time draft cannot. Nothing is sent
+          from here — it goes to the outbox to be read first. */}
+      {reply
+        ? (
+          <>
+            <p className="reply">{reply.message}</p>
+            <p className="conn-meta">Would go to: {reply.destination}. Nothing has been sent.</p>
+          </>
+        )
+        : <p className="reply">{issue.draftReply}</p>}
 
       <h5>File it</h5>
       <div className="actions">
@@ -547,6 +740,16 @@ function FixView({ fix }: { fix: NonNullable<Issue['fix']> }) {
       <p className="q">{fix.summary}</p>
       {!proven && <p className="conn-err">{fix.provesTheBug.detail}</p>}
 
+      {/* The baseline, first. Everything below it is read differently
+          depending on whether the suite was green before anything was touched. */}
+      {fix.baseline && (
+        <p className={fix.baseline.passed ? 'q' : 'conn-err'}>
+          <b>Before any change:</b> {fix.baseline.note}
+        </p>
+      )}
+
+      {(fix.trail?.length ?? 0) > 0 && <WorkLog trail={fix.trail!} />}
+
       <dl className="agent-detail">
         <dt>tests</dt><dd><code>{fix.tests.command}</code></dd>
         <dt>working copy</dt><dd><code>{fix.workdir}</code> — nothing was committed or pushed</dd>
@@ -597,10 +800,10 @@ function WriteTarget({ scan, onScan }: { scan: Scan; onScan: (changes: Partial<S
   return (
     <div className="notice">
       <span className="tag warning">nowhere to file</span>
-      <span>
-        This scan's project is <code>{short}</code>, which is not yours to write to. Fork it and
-        everything from here — tickets, comments, pull requests — goes to your copy instead.
-      </span>
+      {/* The button beside this says "Fork it", and `assertWritable` is what
+          actually stops a write reaching somebody else's repository — the
+          paragraph explaining both was reassurance, not information. */}
+      <span>This scan's project is <code>{short}</code>, fork it</span>
       <button
         disabled={busy}
         onClick={async () => {
@@ -682,11 +885,6 @@ function WorkspacePicker({ scan, onScan }: { scan: Scan; onScan: (changes: Parti
         <button onClick={() => { setOpen(!open); if (!open) void load(); }}>
           {open ? 'Cancel' : 'Use a local checkout…'}
         </button>
-        {!open && (
-          <span className="conn-meta">
-            for private code — clone it yourself, nothing here holds a key to it
-          </span>
-        )}
       </div>
 
       {open && (
@@ -732,3 +930,86 @@ function WorkspacePicker({ scan, onScan }: { scan: Scan; onScan: (changes: Parti
     </div>
   );
 }
+
+const OUTCOME_LABEL: Record<FixStep['outcome'], string> = {
+  kept: 'kept — tests passed',
+  retried: 'tests failed, tried again',
+  'no-changes': 'no usable change produced',
+  'model-failed': 'the model call failed',
+};
+
+/** Every attempt at the patch, including the ones that did not work.
+ *
+ *  "Fixed in 3 attempts" is a number you either trust or you don't. What the
+ *  first two tried, which edits the file refused, and what the suite actually
+ *  said is the difference between a patch somebody can review and one they have
+ *  to take on faith. All of this was being written to the run log and thrown
+ *  away when the run ended.
+ *
+ *  Shown expanded when the fix failed and collapsed when it worked: a working
+ *  patch is read by looking at the diff, a failed one is read by looking at why.
+ */
+function WorkLog({ trail }: { trail: FixStep[] }) {
+  const worked = trail.some((step) => step.outcome === 'kept');
+  const [open, setOpen] = useState(!worked);
+
+  return (
+    <div className="worklog">
+      <button className="worklog-head" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <span className="worklog-title">Work log</span>
+        <span className="conn-meta">
+          {trail.length} attempt{trail.length === 1 ? '' : 's'}
+          {worked ? '' : ' · none landed'}
+        </span>
+        <span className="conn-meta">{open ? '−' : '+'}</span>
+      </button>
+
+      {open && (
+        <ol className="worklog-list">
+          {trail.map((step) => (
+            <li key={`${step.n}-${step.at}`} className="worklog-step" data-outcome={step.outcome}>
+              <div className="worklog-step-head">
+                <span className="worklog-n">attempt {step.n}</span>
+                <span className={`tag ${step.outcome === 'kept' ? 'good' : step.outcome === 'retried' ? 'warning' : 'plain'}`}>
+                  {OUTCOME_LABEL[step.outcome]}
+                </span>
+                <span className="conn-meta">{fmtDate(step.at)}</span>
+              </div>
+
+              {step.edits.length > 0 && (
+                <ul className="evidence">
+                  {step.edits.map((e) => (
+                    <li key={e.path}><code>{e.path}</code>{e.why && <div className="q">{e.why}</div>}</li>
+                  ))}
+                </ul>
+              )}
+
+              {/* An edit refused because its anchor text did not match exactly
+                  once. Worth showing: it is the most common reason an attempt
+                  produces nothing, and it is the model's mistake rather than
+                  the code's. */}
+              {step.rejected.length > 0 && (
+                <p className="conn-err">{step.rejected.length} edit(s) refused — {step.rejected[0]}</p>
+              )}
+              {step.modelError && <p className="conn-err">{step.modelError}</p>}
+              {step.testOutput && !step.testsPassed && (
+                <pre className="payload">{step.testOutput}</pre>
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+const STEP_ORDER = ['forking', 'cloning', 'reading', 'patching', 'pushing', 'publishing'] as const;
+
+const STEP_LABEL: Record<(typeof STEP_ORDER)[number], string> = {
+  forking: 'Fork it, so nothing touches the real project',
+  cloning: 'Check out the code',
+  reading: 'Read the source against the complaint',
+  patching: 'Write a patch and run the tests',
+  pushing: 'Push the patch and open a pull request',
+  publishing: 'Publish the record to the fork',
+};
