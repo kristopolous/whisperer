@@ -16,12 +16,15 @@ import { fetchAll } from './content.ts';
 import { runAgent } from './agents/runtime.ts';
 import { digging, isDeep, runLanguages } from './run-context.ts';
 import { resolveReporter } from './reporter.ts';
+import { mentionId } from './mention-id.ts';
+import { describeError } from './errors.ts';
 import { enabledLanguages, queriesFor } from './languages.ts';
 import { abuseAgent } from './agents/abuse.ts';
 import { buzzAgent } from './agents/buzz.ts';
 import { healthAgent } from './agents/health.ts';
 import { complaintsAgent } from './agents/complaints.ts';
 import { subjectMatchAgent } from './agents/subject-match.ts';
+import { feedQualityAgent } from './agents/feed-quality.ts';
 import { migrationsAgent } from './agents/migrations.ts';
 import { topicsAgent } from './agents/topics.ts';
 import { verdictAgent } from './agents/verdict.ts';
@@ -1133,7 +1136,12 @@ export async function findMentions(
   ]);
 
   const searched = ordered.map((hit) => ({
-      id: randomUUID().slice(0, 8),
+      // Derived from the URL, never minted. An issue cites its evidence by
+      // mention id, so a random one made every citation good only until the
+      // next discovery run — and "search this source harder" IS a discovery
+      // run, so using that feature blanked the Source panel on every defect
+      // already triaged.
+      id: mentionId(hit.url),
       venue: venueOf(hit.url),
       title: hit.title,
       url: hit.url,
@@ -1221,6 +1229,74 @@ export async function findMentions(
 /** Pull the latest things to surface about a company — new videos, comments and
  *  posts, newest first — by running the attached search connectors (YouTube
  *  search first). */
+const FEED_QUALITY_BATCH = 20;
+
+/** Drop the items nobody said anything in.
+ *
+ *  The feed was the only stage with no judgement in it — search, a URL filter,
+ *  then the screen — and what that produced on a real run was a page of
+ *  furniture: X's sign-in wall, a subreddit's standing welcome message five
+ *  times over, and a footer of Terms/Privacy/Cookies links. Every one of them
+ *  is recent, names the company and is not a homepage, so no test a URL can
+ *  answer would ever catch them. Only reading them settles it, which is what
+ *  the model is for.
+ *
+ *  Never throws, and on failure keeps everything: a feed with some chrome in it
+ *  is worse than a clean one and far better than an empty one.
+ */
+async function keepDatapoints(company: string, items: FeedItem[], emit: Emit): Promise<FeedItem[]> {
+  if (items.length === 0) return items;
+
+  const dropped = new Set<FeedItem>();
+  let read = 0;
+  let unquoted = 0;
+
+  for (let start = 0; start < items.length; start += FEED_QUALITY_BATCH) {
+    const batch = items.slice(start, start + FEED_QUALITY_BATCH);
+    try {
+      const result = await runAgent<{ verdict: { index: number; quote?: string; isDatapoint: boolean }[] }>(
+        feedQualityAgent,
+        {
+          prompt: `Product: "${company}".\n\n`
+            + batch.map((item, index) =>
+              `${index}: ${item.headline}\n${(item.snippet ?? '').slice(0, 500).replace(/\s+/g, ' ')}`).join('\n\n'),
+          items: batch.length,
+          note: `feed ${start + 1}–${start + batch.length}`,
+          timeoutMs: 180_000,
+        },
+      );
+      read += batch.length;
+
+      for (const verdict of result.verdict ?? []) {
+        const item = batch[verdict.index];
+        if (!item) continue;
+        if (verdict.isDatapoint) {
+          // The quote has to be real. Without checking it, "quote first" buys
+          // nothing — it is a field the model can fill with anything.
+          if (!quotesTheSource(verdict.quote, `${item.headline} ${item.snippet ?? ''}`)) {
+            unquoted += 1;
+          }
+          continue;
+        }
+        dropped.add(item);
+      }
+    } catch (error) {
+      emit('warn', `feed triage batch failed — ${describeError(error).slice(0, 100)}`);
+    }
+  }
+
+  if (dropped.size === 0) {
+    emit('info', `feed: read ${read} items, none of them were page furniture`);
+    return items;
+  }
+  emit(
+    'info',
+    `feed: dropped ${dropped.size} of ${read} — sign-in walls, sidebars and navigation that name the product`
+    + (unquoted ? `, and ${unquoted} kept whose quote was not in the text` : ''),
+  );
+  return items.filter((item) => !dropped.has(item));
+}
+
 /** How many items the feed wants before it stops widening its window. */
 const FEED_TARGET = Number(process.env.FEED_TARGET ?? 120);
 const FEED_CAP = Number(process.env.FEED_CAP ?? 200);
@@ -1305,7 +1381,7 @@ export async function findFeed(
   };
 
   const items = relevant.map((hit) => ({
-    id: randomUUID().slice(0, 8),
+    id: mentionId(hit.url),
     venue: venueOf(hit.url),
     kind: kindOf(hit.url),
     headline: hit.title,
@@ -1318,9 +1394,11 @@ export async function findFeed(
 
   emit('info', `feed: ${items.length} items, ${items.filter((item) => item.date).length} dated`);
 
+  const worthShowing = await keepDatapoints(company, items, emit);
+
   // Dated items first, newest to oldest; undated ones keep search order behind
   // them rather than being dropped.
-  return items
+  return worthShowing
     .sort((a, b) => {
       if (a.date && b.date) return b.date.localeCompare(a.date);
       if (a.date) return -1;

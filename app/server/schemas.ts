@@ -237,6 +237,38 @@ export const migrationsSchema = {
 
 /** Whether each item reports a fault. Index-keyed for the same reason the
  *  topics schema is: copying text back is slow and the copy is never exact. */
+export const feedQualitySchema = {
+  name: 'feed_quality',
+  schema: {
+    type: 'object',
+    required: ['verdict'],
+    properties: {
+      verdict: {
+        type: 'array',
+        items: {
+          type: 'object',
+          // Quote first, as everywhere else here: a verdict generated before
+          // its evidence is a guess the model then justifies.
+          required: ['index', 'quote', 'isDatapoint'],
+          properties: {
+            index: { type: 'integer', description: 'The index of the item being judged' },
+            quote: {
+              type: 'string',
+              description:
+                'The words from the item that say something specific about the product, copied '
+                + 'exactly. Empty string when there are none.',
+            },
+            isDatapoint: {
+              type: 'boolean',
+              description: 'True when somebody said something specific about the product',
+            },
+          },
+        },
+      },
+    },
+  },
+} as const;
+
 export const subjectMatchSchema = {
   name: 'subject_match',
   schema: {

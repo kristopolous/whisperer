@@ -17,6 +17,8 @@
  */
 
 import type { ReviewKind, ReviewScore } from '../shared/types.ts';
+import { readReviews } from './review-text.ts';
+import { fetchRawHtml } from './content.ts';
 import { braveSearch, type SearchHit } from './search.ts';
 
 interface Site {
@@ -162,6 +164,49 @@ function readScore(hit: SearchHit, site: Site, brand: string, domain: string): R
 /** One search per review site, and the best score each one yields.
  *
  *  Deterministic and cheap: six searches, no page fetches, no model call. */
+/** The page on a review site that actually holds the reviews.
+ *
+ *  A search result for "Indeed Replit reviews" is as likely to be the company's
+ *  interview page or its seller profile as the reviews themselves — and those
+ *  pages carry the rating in their header, so the score reads correctly while
+ *  the reviews behind it are somewhere else entirely. Measured on one scan:
+ *  Indeed pointed at `/cmp/Replit/interviews` and G2 at `/sellers/replit`, and
+ *  both returned a page with no reviews on it.
+ *
+ *  Rewritten only within the same host, and only where the site's own URL shape
+ *  is unambiguous. Anything unrecognised is left exactly as found — guessing a
+ *  path is how you turn a working link into a 404.
+ */
+export function reviewPageFor(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.replace(/^www\./, '');
+    const path = parsed.pathname.replace(/\/+$/, '');
+
+    // Indeed: /cmp/<company>/<section> — the section is what varies.
+    const indeed = /^indeed\.com$/i.test(host) && /^\/cmp\/([^/]+)/.exec(path);
+    if (indeed) return `https://www.indeed.com/cmp/${indeed[1]}/reviews`;
+
+    // G2: a seller profile is not the product's reviews.
+    const seller = /^g2\.com$/i.test(host) && /^\/sellers\/([^/]+)/.exec(path);
+    if (seller) return `https://www.g2.com/products/${seller[1]}/reviews`;
+    const g2product = /^g2\.com$/i.test(host) && /^\/products\/([^/]+)$/.exec(path);
+    if (g2product) return `https://www.g2.com/products/${g2product[1]}/reviews`;
+
+    // Product Hunt: the product page carries the score, /reviews carries the text.
+    const ph = /^producthunt\.com$/i.test(host) && /^\/products\/([^/]+)$/.exec(path);
+    if (ph) return `https://www.producthunt.com/products/${ph[1]}/reviews`;
+
+    // Capterra: same shape.
+    const capterra = /^capterra\.com$/i.test(host) && /^\/p\/(\d+)\/([^/]+)$/.exec(path);
+    if (capterra) return `https://www.capterra.com/p/${capterra[1]}/${capterra[2]}/reviews/`;
+
+    return url;
+  } catch {
+    return url;
+  }
+}
+
 export async function findReviewScores(
   brand: string,
   /** The company's own site, when known. Lets pages keyed on the domain be
@@ -190,6 +235,45 @@ export async function findReviewScores(
       found.push(scores[0]!);
     } catch (error) {
       emit('warn', `${reviewSite.name} lookup failed — ${error instanceof Error ? error.message.slice(0, 80) : 'error'}`);
+    }
+  }
+
+  // Then the reviews behind every number.
+  //
+  // Every one, with no threshold and no first-party filter. Both were my
+  // inventions to save requests, and they defeated the point of the panel: a
+  // score with no reviews under it is a number to take on trust, which is the
+  // one thing this whole product exists not to ask of anybody. A 4.5 needs its
+  // reviews as much as a 1.0 — that is how you find out the 4.5 is four years
+  // old, or that the recent ones are all 1s.
+  for (const score of found) {
+    try {
+      score.url = reviewPageFor(score.url);
+      // The raw document, not the extracted text. Reviews are read out of
+      // JSON-LD, and text extraction strips `<script>` — so reading the
+      // prose version would find nothing and look like a site that publishes
+      // no reviews.
+      let html = await fetchRawHtml(score.url);
+      let recent = readReviews(html ?? '');
+
+      // Nothing readable on the page we were served? Try the scraper before
+      // concluding the site has no reviews. Glassdoor, Indeed and G2 answer a
+      // plain request with a sign-in or consent page — a real document, not a
+      // bot challenge, so it passes every "is this a challenge" test and the
+      // reviews simply are not in it.
+      if (recent.length === 0) {
+        html = await fetchRawHtml(score.url, true);
+        recent = readReviews(html ?? '');
+      }
+
+      if (recent.length) {
+        score.recent = recent;
+        emit('info', `${score.site}: ${recent.length} recent reviews behind ${score.rating}/${score.scale}`);
+      } else {
+        emit('info', `${score.site}: no readable reviews on the page behind ${score.rating}/${score.scale}`);
+      }
+    } catch {
+      // A missing review body never costs the score it belongs to.
     }
   }
 

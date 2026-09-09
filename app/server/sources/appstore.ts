@@ -27,6 +27,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { mentionId } from '../mention-id.ts';
 import type { Mention } from '../../shared/types.ts';
 import { cached, DAY, HOUR } from '../cache.ts';
 import { complaintLanguage } from '../search.ts';
@@ -144,7 +145,7 @@ export async function findAppReviews(
       if (!title && !text) continue;
 
       collected.push({
-        id: randomUUID().slice(0, 8),
+        id: mentionId(app.trackViewUrl ?? `https://apps.apple.com/us/app/id${app.trackId}`),
         venue: 'review',
         title: title || `${rating}★ review`,
         url: app.trackViewUrl ?? `https://apps.apple.com/us/app/id${app.trackId}`,

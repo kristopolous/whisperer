@@ -25,6 +25,67 @@ const KIND_ORDER: ReviewKind[] = ['software', 'customer', 'app', 'employer'];
  *  Scores are grouped rather than averaged. A company can be loved by software
  *  buyers and hated by its own staff, and one number across the two describes
  *  nobody. */
+/** The reviews behind the scores, from every site at once, newest first.
+ *
+ *  Its own card because it answers a different question. The scorecard says
+ *  where the company stands; this says which way it is going and why — and the
+ *  "why" only exists in what people wrote.
+ *
+ *  Amalgamated rather than grouped by site, because the trend is the point. A
+ *  1-star on Trustpilot in July and a 1-star on Product Hunt in August are the
+ *  same story continuing, and reading them in two separate lists is how you
+ *  miss that. Sorted by date across all of them, with the site named on each
+ *  row so the source is never in doubt.
+ */
+function RecentReviews({ reviews }: { reviews: ReviewScore[] }) {
+  const all = reviews
+    .flatMap((score) => (score.recent ?? []).map((r) => ({ ...r, site: score.site, url: score.url })))
+    .sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''));
+
+  if (all.length === 0) return null;
+
+  // Where the recent ones sit against the published average. A run of 1s under
+  // a 4.2 is the thing worth acting on, and it is invisible in either number
+  // alone.
+  const rated = all.filter((r) => typeof r.rating === 'number');
+  const mean = rated.length
+    ? rated.reduce((sum, r) => sum + (r.rating ?? 0), 0) / rated.length
+    : null;
+
+  return (
+    <div className="panel">
+      <div className="set-head">
+        <strong>What people are writing</strong>
+        <span className="tag plain">{all.length} recent</span>
+        {mean !== null && (
+          <span className={`tag ${mean < 3 ? 'critical' : mean < 4 ? 'warning' : 'good'}`}>
+            {mean.toFixed(1)} avg across these
+          </span>
+        )}
+      </div>
+
+      <ul className="revs">
+        {all.map((r, i) => (
+          <li key={`${r.site}-${i}`}>
+            <div className="revs-head">
+              {typeof r.rating === 'number' && (
+                <span className={`tag ${r.rating <= 2 ? 'critical' : r.rating <= 3 ? 'warning' : 'good'}`}>
+                  {r.rating}/5
+                </span>
+              )}
+              <a href={r.url} target="_blank" rel="noreferrer">{r.site}</a>
+              <span className="conn-meta">{r.date ? fmtDate(r.date) : 'undated'}</span>
+              {r.author && <span className="conn-meta">{r.author}</span>}
+            </div>
+            {r.title && <div className="revs-title">{r.title}</div>}
+            <p className="revs-body">{r.body}</p>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
   if (reviews.length === 0) return null;
 
@@ -60,17 +121,23 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
               href={r.url}
               target="_blank"
               rel="noreferrer"
-              title={r.quote}
+              title={[
+                KIND_LABEL[r.kind],
+                r.count ? `${r.count.toLocaleString()} reviews` : 'review count not stated',
+                r.firstParty ? 'from the site itself' : 'quoted second-hand',
+                r.quote,
+              ].filter(Boolean).join(' · ')}
               data-tone={share >= 0.8 ? 'good' : share >= 0.6 ? 'mid' : 'bad'}
             >
-              <span className="score-kind">{KIND_LABEL[r.kind]}</span>
+              {/* One row: name, then score. The four stacked lines made each
+                  site a card three lines tall for two facts — and this panel is
+                  read by scanning down the numbers, which a column of blocks
+                  actively prevents. The audience and the review count moved to
+                  the title, where they are there when questioned and cost no
+                  height when not. */}
               <span className="score-site">{r.site}</span>
               <span className="score-value">
                 {r.rating}<span className="score-scale">/{r.scale}</span>
-              </span>
-              <span className="score-meta">
-                {r.count ? `${r.count.toLocaleString()} reviews` : 'count not stated'}
-                {!r.firstParty && ' · quoted'}
               </span>
             </a>
           );
@@ -99,6 +166,7 @@ export function Abuse({ scan, onStatus }: { scan: Scan; onStatus: (finding: Abus
     return (
       <>
         <Scorecard reviews={scan.reviews ?? []} />
+        <RecentReviews reviews={scan.reviews ?? []} />
         <div className="panel">
           <div className="empty">
             <h3>Nothing abusing the brand</h3>
@@ -115,6 +183,7 @@ export function Abuse({ scan, onStatus }: { scan: Scan; onStatus: (finding: Abus
   return (
     <>
     <Scorecard reviews={scan.reviews ?? []} />
+    <RecentReviews reviews={scan.reviews ?? []} />
     <div className="panel">
       <div className="docket">
         <div className="docket-list" role="listbox" aria-label="Integrity findings">

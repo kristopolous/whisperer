@@ -883,11 +883,23 @@ async function andiSearch(
   });
 }
 
+/** Run a query through the search chain.
+ *
+ *  Named `braveSearch` for historical reasons and no longer anything of the
+ *  sort — it walks whatever the `search` role holds, in the configured order,
+ *  and Brave is one entry among six.
+ *
+ *  It used to throw when `BRAVE_API_KEY` was missing, before the chain was
+ *  consulted at all. That made one provider's absence fail every search in the
+ *  app while Parallel, you.com, Andi and Perplexity sat configured and idle —
+ *  the exact situation the chain exists to survive, and the reason Brave's
+ *  quota running out was a crisis instead of a shrug. A provider without its
+ *  credential is skipped by the loop below, like any other unusable entry.
+ */
 export async function braveSearch(
   query: string, count = 10, freshness?: Freshness, offset = 0,
 ): Promise<SearchHit[]> {
   const key = secret('BRAVE_API_KEY');
-  if (!key) throw new Error('BRAVE_API_KEY is not set — add it in Settings, or export it, or search has nothing to query');
 
   // The cache is checked outside the rate-limit gate on purpose. A cached query
   // should cost nothing at all — queueing it behind the 1.1s pacer would make a

@@ -19,6 +19,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { mentionId } from '../mention-id.ts';
 import type { Mention } from '../../shared/types.ts';
 import { cached, HOUR } from '../cache.ts';
 import { complaintLanguage } from '../search.ts';
@@ -115,7 +116,7 @@ export async function searchGithubIssues(
 
       const body = (item.body ?? '').replace(/\s+/g, ' ').trim();
       collected.push({
-        id: randomUUID().slice(0, 8),
+        id: mentionId(item.html_url),
         venue: 'github',
         title: `${repo}: ${item.title}`.slice(0, 200),
         url: item.html_url,

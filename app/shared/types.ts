@@ -483,6 +483,16 @@ export type ScanEvent =
 export type ReviewKind = 'software' | 'customer' | 'app' | 'employer';
 
 /** A public score on a review site, as read out of a search result. */
+/** One review, as its author wrote it. */
+export interface ReviewSnippet {
+  author: string | null;
+  /** Normalised to 5, whatever scale the site uses. */
+  rating: number | null;
+  date: string | null;
+  title: string | null;
+  body: string;
+}
+
 export interface ReviewScore {
   site: string;
   rating: number;
@@ -497,6 +507,12 @@ export interface ReviewScore {
   /** The sentence it was read out of, so a wrong number is traceable. */
   quote: string;
   kind: ReviewKind;
+  /** What people actually wrote, newest first.
+   *
+   *  A low score is the beginning of a question. These are the answer, and
+   *  making somebody open a tab to read them is the difference between a
+   *  dashboard and a link collection. */
+  recent?: ReviewSnippet[];
 }
 
 /** What the person typed, worked out into something the pipeline can use.

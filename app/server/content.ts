@@ -387,6 +387,27 @@ async function fetchContentUncached(url: string, snippet: string, limit: number)
  *
  *  Bounded because these are other people's servers and this runs on every
  *  scan; unbounded parallel fetching is how you get rate limited or blocked. */
+/** The page's markup, cached, for readers that need the document rather than
+ *  the prose — JSON-LD lives in `<script>` tags that text extraction strips.
+ *
+ *  Falls through to the scraper on a bot check, because a review site is
+ *  exactly the kind of page that serves one. */
+export async function fetchRawHtml(url: string, viaScraper = false): Promise<string | null> {
+  return cached<string | null>(viaScraper ? 'html-scraped' : 'html', url, CONTENT_TTL, async () => {
+    // `viaScraper` skips the direct fetch entirely. Needed because a login wall
+    // and a consent page are not bot challenges — they return a real, ordinary
+    // document that is simply not the page — so `isChallenge` passes them
+    // through and the caller gets 11KB of Glassdoor asking you to sign in. The
+    // caller knows it got nothing useful; this is how it says so.
+    if (!viaScraper) {
+      const html = await get(url, 20_000);
+      if (html && !isChallenge(html)) return html;
+    }
+    const scraped = await brightDataScrape(url);
+    return scraped ?? null;
+  });
+}
+
 /** Does this item still need a date? */
 const isDateless = (item: { date?: string | null }) => !item.date;
 

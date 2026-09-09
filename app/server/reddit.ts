@@ -4,6 +4,7 @@ import type { Mention } from '../shared/types.ts';
 import { secret } from './secrets.ts';
 import { complaintLanguage } from './search.ts';
 import { cached, DAY, HOUR } from './cache.ts';
+import { mentionId } from './mention-id.ts';
 import { hostOf } from '../shared/name.ts';
 
 const SCRIPT = path.resolve(import.meta.dirname, '../../skills/reddit-search/scripts/reddit_search.py');
@@ -131,7 +132,6 @@ interface RawMention {
   listing?: string;
 }
 
-let seq = 0;
 
 /** Search Reddit for every alias of the company and normalise the hits into
  *  `Mention`s. Returns `null` when Reddit isn't configured so callers keep
@@ -286,7 +286,10 @@ export async function searchReddit(
       seen.add(raw.url);
       const excerpt = raw.commentText ? `${raw.excerpt} — comment: ${raw.commentText}` : raw.excerpt;
       mentions.push({
-        id: `rdt${++seq}`,
+        // From the URL, not a counter. A sequence number depends on the order
+        // results came back in, so the same thread was `rdt1626` one run and
+        // something else the next — and every issue citing it lost its source.
+        id: mentionId(raw.url),
         venue: 'reddit',
         title: raw.title,
         url: raw.url,

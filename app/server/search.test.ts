@@ -194,3 +194,62 @@ test('a cause cycle does not hang', () => {
   a.cause = b;
   assert.match(describeError(Object.assign(new Error('a'), { cause: b })), /b/);
 });
+
+/* ------------------------------------------------------- mention identity */
+
+import { canonicalUrl, mentionId } from './mention-id.ts';
+
+test('the same thread is the same id however it is spelled', () => {
+  const variants = [
+    'https://www.reddit.com/r/replit/comments/1abc/title/',
+    'https://old.reddit.com/r/replit/comments/1abc/title',
+    'http://reddit.com/r/replit/comments/1abc/title?utm_source=share&utm_medium=web',
+  ];
+  const ids = new Set(variants.map(mentionId));
+  assert.equal(ids.size, 1, `one thread, one id — got ${[...ids].join(', ')}`);
+});
+
+test('a parameter that identifies the page is kept', () => {
+  // Hacker News puts the item in `?id=`; dropping it would collapse every
+  // thread on the site into one id.
+  assert.notEqual(
+    mentionId('https://news.ycombinator.com/item?id=111'),
+    mentionId('https://news.ycombinator.com/item?id=222'),
+  );
+  assert.equal(canonicalUrl('https://news.ycombinator.com/item?id=111&ref=hn'), 'news.ycombinator.com/item?id=111');
+});
+
+test('different threads keep different ids', () => {
+  assert.notEqual(
+    mentionId('https://www.reddit.com/r/replit/comments/1abc/one/'),
+    mentionId('https://www.reddit.com/r/replit/comments/1xyz/two/'),
+  );
+});
+
+test('the id is stable across runs, which is the whole point', () => {
+  const url = 'https://dev.to/someone/why-it-broke-123';
+  assert.equal(mentionId(url), mentionId(url));
+  assert.match(mentionId(url), /^[0-9a-f]{8}$/);
+});
+
+/* -------------------------------------------------- the chain, not Brave */
+
+test('a missing Brave key does not fail the search', async () => {
+  // The regression this guards: `braveSearch` is the chain dispatcher, and it
+  // threw on a missing BRAVE_API_KEY before consulting the chain — so one
+  // provider's absent credential took down every search in the app while five
+  // configured providers sat idle.
+  const source = await import('node:fs').then((fs) =>
+    fs.readFileSync(new URL('./search.ts', import.meta.url), 'utf8'));
+
+  const dispatcher = source.slice(source.indexOf('export async function braveSearch('));
+  const body = dispatcher.slice(0, dispatcher.indexOf('const chain = chainFor('));
+  assert.ok(
+    !/throw new Error\([^)]*BRAVE_API_KEY/.test(body),
+    'the dispatcher must not throw on a missing Brave key before the chain is walked',
+  );
+  assert.ok(
+    /if \(!key\) continue;/.test(dispatcher),
+    'the brave branch must skip itself when it has no key',
+  );
+});

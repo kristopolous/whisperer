@@ -24,6 +24,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { mentionId } from '../mention-id.ts';
 import type { Mention } from '../../shared/types.ts';
 import { cached, HOUR } from '../cache.ts';
 import { complaintLanguage } from '../search.ts';
@@ -142,7 +143,7 @@ export async function searchHackerNews(
         if (!text && pass.tags === 'comment') continue;
 
         collected.push({
-          id: randomUUID().slice(0, 8),
+          id: mentionId(`https://news.ycombinator.com/item?id=${hit.objectID}`),
           venue: 'hackernews',
           title,
           url: `https://news.ycombinator.com/item?id=${hit.objectID}`,

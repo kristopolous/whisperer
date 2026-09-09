@@ -1843,8 +1843,10 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
    and the next. A grid puts them in columns you can read down. */
 .score-row {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  /* Narrower cards now that each is one line, so more fit per row without
+     any of them being cramped. */
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 6px 10px;
   padding: 4px 16px 16px;
 }
 @media (max-width: 720px) {
@@ -2128,3 +2130,27 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   line-height: 1;
   color: var(--ink-3);
 }
+
+/* The reviews behind the scores, amalgamated across sites and newest first. */
+.revs { list-style: none; margin: 0; padding: 0 16px 14px; display: grid; gap: 14px; }
+.revs > li { padding-left: 12px; border-left: 2px solid var(--rule); }
+.revs-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.revs-head a { font: 500 12px var(--mono); }
+.revs-title { margin-top: 3px; font-weight: 600; font-size: 13px; }
+.revs-body {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+/* One line per site: name on the left, score on the right. */
+.score {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.score .score-site { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.score .score-value { white-space: nowrap; }
