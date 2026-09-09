@@ -1298,8 +1298,8 @@ async function keepDatapoints(company: string, items: FeedItem[], emit: Emit): P
 }
 
 /** How many items the feed wants before it stops widening its window. */
-const FEED_TARGET = Number(process.env.FEED_TARGET ?? 120);
-const FEED_CAP = Number(process.env.FEED_CAP ?? 200);
+const FEED_TARGET = Number(process.env.FEED_TARGET ?? 400);
+const FEED_CAP = Number(process.env.FEED_CAP ?? 800);
 
 export async function findFeed(
   company: string, site: string, profiles: Profile[], emit: Emit, subject?: Subject,
@@ -1380,7 +1380,7 @@ export async function findFeed(
     return 'post';
   };
 
-  const items = relevant.map((hit) => ({
+  const fromSearch = relevant.map((hit) => ({
     id: mentionId(hit.url),
     venue: venueOf(hit.url),
     kind: kindOf(hit.url),
@@ -1391,6 +1391,54 @@ export async function findFeed(
     snippet: hit.description,
     engagement: null,
   })) as FeedItem[];
+
+  // The venues that will simply hand it over.
+  //
+  // The feed used to be eight web searches and nothing else, while discovery —
+  // running minutes earlier, over the same company — asked Reddit, Hacker News,
+  // GitHub and the App Store directly and got hundreds of dated items back from
+  // each. For a feed those sources are strictly better than a search engine:
+  // they are already ordered by recency, they carry real timestamps rather than
+  // a crawler's guess, and they cost no search budget. Eighty-eight items for a
+  // product with fifty million users was a description of our query list, not
+  // of the internet.
+  const brandTerm = subject?.searchTerm || brand;
+  const direct = await Promise.all([
+    searchReddit([brandTerm], emit, {
+      exclude, site, threads: 8, target: 400,
+      discovered: profiles.filter((p) => p.platform === 'reddit').map((p) => p.handle),
+    }).then((found) => found ?? []).catch(() => []),
+    // A short window, because this is a feed. Discovery reads the year.
+    searchHackerNews(brandTerm, emit, { days: 60, limit: 300 }).catch(() => []),
+    searchGithubIssues(brandTerm, emit, { ownRepo: ownRepoOf(subject), limit: 100 }).catch(() => []),
+    findAppReviews(brandTerm, site, emit).catch(() => []),
+  ]);
+
+  const asFeed = direct.flat().map((mention) => ({
+    id: mention.id,
+    venue: mention.venue,
+    kind: kindOf(mention.url),
+    headline: mention.title,
+    url: mention.url,
+    date: mention.date,
+    author: mention.author,
+    snippet: mention.excerpt,
+    engagement: mention.engagement,
+  })) as FeedItem[];
+
+  // Merged on id, which is the URL — so a thread found by both a search and its
+  // own venue is one item, and the direct version wins because its date and
+  // author came from the site rather than from a crawler.
+  const byId = new Map<string, FeedItem>();
+  for (const item of fromSearch) byId.set(item.id, item);
+  for (const item of asFeed) byId.set(item.id, item);
+  const items = [...byId.values()];
+
+  emit(
+    'info',
+    `feed: ${fromSearch.length} from search + ${asFeed.length} straight from the venues `
+    + `= ${items.length} after merging`,
+  );
 
   emit('info', `feed: ${items.length} items, ${items.filter((item) => item.date).length} dated`);
 

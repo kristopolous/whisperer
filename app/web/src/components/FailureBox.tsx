@@ -75,9 +75,11 @@ function BusyProgress({ scanId, onStop, stopping }: {
 
   const log = scan.log ?? [];
   const label = STAGES.find((s) => s.key === scan.stage)?.label ?? scan.stage;
-  // From the first line of THIS run. The record is created once and re-run for
-  // months, so `createdAt` reported a three-minute scan as "2924 min in".
-  const startedAt = log[0]?.at;
+  // The run's own stamp. `createdAt` is when the record was minted — weeks ago
+  // for a company scanned daily — and the first log line is no better, because
+  // a stage rerun keeps the previous run's log and the clock then reads in
+  // days.
+  const startedAt = scan.startedAt ?? log.at(-1)?.at;
   const seconds = startedAt ? Math.max(0, Math.round((now - new Date(startedAt).getTime()) / 1000)) : 0;
   const clock = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 

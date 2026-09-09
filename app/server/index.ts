@@ -753,6 +753,7 @@ app.get('/api/scans/:id/stream', async (req, res) => {
     company: cleanName(raw),
     site: siteOf(raw),
     createdAt: existing?.createdAt ?? new Date().toISOString(),
+    startedAt: new Date().toISOString(),
     status: 'running',
     stage: 'queued',
     depth: req.query.depth === 'deep' ? 'deep' : (existing?.depth ?? 'normal'),
@@ -838,6 +839,10 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
     scan.languages = asked;
     store.patch(req.params.id, { languages: asked });
   }
+
+  // Stamped before anything runs, so the elapsed clock measures this piece of
+  // work rather than whatever the record remembers.
+  store.patch(req.params.id, { startedAt: new Date().toISOString(), status: 'running' });
 
   if (req.query.reset === '1') {
     scan.log = [];

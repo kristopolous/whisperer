@@ -379,6 +379,14 @@ export interface Scan {
    *  company somebody has actually scanned hid the real run behind synthesised
    *  numbers. */
   fixture?: boolean;
+  /** When the work currently in flight began.
+   *
+   *  Recorded rather than inferred. The elapsed clock used to read the first
+   *  line of `scan.log`, and a stage rerun does not clear the log — so it
+   *  measured from the original run and showed a two-minute rerun as 1455:10.
+   *  `createdAt` is no better: that is when the record was minted, which for a
+   *  company scanned daily is weeks ago. */
+  startedAt?: string;
   /** How hard this run looked. Recorded because it changes what the numbers
    *  mean: a deep run and a normal one are not comparable observations, and a
    *  series that mixes them silently shows a jump that is only effort. */
