@@ -1,201 +1,205 @@
 # Whisperer
 
-Listens to what the internet says about a company, and turns the complaints into
-issues you can actually file.
+Watches the open internet for complaints about a product, confirms which ones
+are real, files them, tries to fix them, and closes the loop with the person who
+complained.
 
-Give it a company name. It reads their site for every account they run, searches
-Reddit, Hacker News and the wider web for what people said about them, draws how
-opinion moved over time, and separates the grumbling from the real defects — each
-one with the threads that back it up, a draft reply to the people who raised it,
-and a payload ready for Linear, Jira or GitHub. It also sweeps for people abusing
-the brand's name: impersonation, phishing, fake support, scams.
+Give it a company name, a website or a repository URL. It works out what the
+subject actually is, finds where people talk about it, reads what they said,
+separates grumbling from defects, gives each defect a reproduction test, and —
+where the source is reachable — reads that source, writes a patch and runs the
+test suite against it.
 
-It runs entirely against a local [TrueForge](https://trueforge.dev) instance, and
-keeps every run — this is a dashboard of scanned sites, not a one-shot report.
+**The defect list is the product.** Sentiment scores, the live feed, review
+scorecards and topic charts are context around it. A scan that produces a
+beautiful chart and no issues has failed.
 
-## Layout
+Every run is kept, and the point of keeping them is comparison: reputation is a
+series of observations, not a pile of text.
 
-```
-src/                 TrueForge control plane — one file describes what this instance has
-  registry.ts          every MCP connector and skill, as data; missing credentials skip themselves
-  setup.ts             applies the registry (idempotent) and health-checks each connector
-  run-agent.ts          a CLI for one agent turn, with the tool-approval loop
-  client.ts / hello.ts  the smallest possible streaming turn
-app/
-  shared/types.ts      the shapes the API and the dashboard agree on
-  server/               BFF: runs the five-stage scan, streams progress, builds tracker payloads
-    pipeline.ts           the agent calls: presence, discovery, buzz, health, abuse
-    schemas.ts             JSON schemas each turn is held to, normalized for OpenAI strict mode
-    store.ts               scans persisted to data/scans.json — the run history
-    trackers.ts             builds the Linear/Jira/GitHub filing payload for one issue
-    index.ts                Express routes + the SSE stream
-  web/                  the dashboard (Vite + React)
-skills/               the two skills authored here, mirrored to github.com/kristopolous/hackieskills
-docker/               Dockerfiles for the MCP servers that ship stdio-only
-compose.yml           the local MCP servers, all on network_mode: host
-data/scans.json       persisted run history
-```
+## What is actually built
+
+| | |
+|---|---|
+| **Retrieval** | Six search providers with per-role chains, per-provider pacers and a spend ledger; direct readers for Reddit (PRAW), Hacker News (Algolia), GitHub issues and the App Store; a scraper path for pages that refuse a plain fetch |
+| **Judgement** | Subject disambiguation, complaint triage, sentiment scoring, defect merging, feed quality, abuse sweep — each held to a JSON schema, each quoting its evidence before its verdict |
+| **Accounting** | Per-source coverage grid, a suppression ledger that names every dropped result and why, and a credit ledger per provider |
+| **The loop** | Diagnose against real source, patch, run the suite in a throwaway copy, open a PR, file a ticket, draft the reply — with an audit trail per defect |
+| **Operation** | A serial job queue with a visible panel, resumable stages, per-batch checkpoints, and a circuit breaker that stops a stage rather than grinding against a dead model host |
+
+## What is not
+
+- **Nothing is sent to a real person.** Every reply the system would post goes to
+  an outbox instead (`app/server/outbox.ts`). These are strangers who did not ask
+  to be contacted, and a bug in the draft logic would publish under the company's
+  name in a public thread.
+- **Filing is wired for GitHub only.** Linear and Jira build the exact payload
+  and say plainly that they did not send it.
+- **One JSON file holds every scan** (`data/scans.json`), rewritten on each
+  checkpoint. Fine for a laptop; the first thing to replace at any real volume.
 
 ## Getting it running
 
-**1. TrueForge itself.**
+**1. Inference.** Whisperer talks to any OpenAI-compatible endpoint — set it in
+the dashboard under **settings → inference**, or in `data/settings.json`. Hosts
+are per *role* (`general`, `coding`), so the model that reads a thousand Reddit
+comments need not be the one that writes a patch.
+
+Set the **context length** for each host. It defaults to 15,000 tokens, and that
+number is load-bearing: batch sizes are derived from it (`reading-budget.ts`), so
+a host with a smaller real window returns truncated JSON with its own error
+spliced into the middle, and a host with a larger one is driven at a fraction of
+what it could hold.
+
+**2. Credentials.** `cp .env.example .env`, or use **settings → connectors** in
+the dashboard. Everything is optional and a missing credential simply removes
+that path. Nothing is shown back once saved (`data/settings.json`, mode 0600) and
+no credential is ever put in a prompt.
+
+**3. Reddit, if you want it.** Discovery talks to Reddit's official API with
+PRAW, which needs a virtualenv:
 
 ```bash
-npx @truefoundry/trueforge@latest        # http://localhost:8790
+python3 -m venv .venv && .venv/bin/pip install praw
 ```
 
-Add a model under Settings → Models — an OpenAI, Anthropic or similar model with
-a large context window. The pipeline makes five agent calls per scan with large
-tool schemas in context; a small local model (the default `ollama/qwen-3-8`,
-15k context) is too small and will time out. This instance runs
-`openai/gpt-5-5` — set `TRUEFORGE_MODEL` to whatever you've configured.
+A virtualenv rather than `pip install praw`, because a Debian host refuses
+installs into its system interpreter (PEP 668) and `--user` is no better —
+`~/.local` is invisible to a process started without `HOME`. The server looks for
+`.venv/bin/python3` beside the checkout; set `WHISPERER_PYTHON` for an
+interpreter elsewhere.
 
-**2. Credentials.** `cp .env.example .env` and fill in what you want. Everything
-is optional; a connector whose credential is missing is simply not registered.
-
-**3. The MCP servers.**
+**4. Run it.**
 
 ```bash
-docker compose --env-file .env up -d reddit-mcp hn-mcp linkedin-mcp
+npm run build && npm start     # API + dashboard on :8791
+npm run dev                    # or: API on :8791, Vite on :5173, both watching
 ```
 
-Then whichever of the rest you have accounts for — each needs a one-time
-interactive login, described in `compose.yml` beside its service. Every service
-runs with `network_mode: host`: this machine's Docker bridge has no outbound
-route (its `FORWARD` chain came up `policy DROP` with Docker's own rules missing
-— `sudo systemctl restart docker` reinstalls them), so a bridged container
-registers with TrueForge fine and then fails every search it tries to make.
-
-**4. Register everything with TrueForge.**
-
-```bash
-npm run setup
-```
-
-Applies `src/registry.ts` and then dials each connector, so a container that is
-down or misconfigured shows up here rather than mid-conversation.
-
-**5. The dashboard.**
-
-```bash
-npm run dev        # API on :8791, dashboard on :5173
-```
+`:8791` serves the **built** bundle, so `npm run dev` alone does not update it —
+edit with Vite on `:5173`, or rebuild. The server says so on startup and puts a
+banner on the page when `dist` is older than `src`, because "my change did
+nothing" is otherwise indistinguishable from a bug.
 
 ## Scripts
 
 | Command | What it does |
 |---|---|
-| `npm run setup` | Apply `src/registry.ts` to TrueForge and health-check every connector |
-| `npm run dev` | Dashboard + API together |
-| `npm run api` / `npm run web` | Either half alone |
-| `npm run agent -- "prompt"` | One agent turn in the terminal, with tool approvals |
-| `npm run hello` | Smallest streaming example — good for checking the connection |
+| `npm start` | API and dashboard, no watcher — what a long scan wants |
+| `npm run dev` | Both halves with watchers. A file save restarts the API and kills any scan in flight |
+| `npm run build` | Build the dashboard into `app/web/dist` |
+| `npm test` | Node's test runner over `app/server` and `app/shared` |
 | `npm run typecheck` | `tsc` over everything |
-
-## What's connected
-
-| Connector | Source | Needs |
-|---|---|---|
-| `reddit` | [jordanburke/reddit-mcp-server](https://github.com/jordanburke/reddit-mcp-server) | nothing (anonymous, ~10 req/min); app credentials raise the limit |
-| `hn` | [erithwik/mcp-hn](https://github.com/erithwik/mcp-hn) | nothing — bridged to HTTP with supergateway, `mcp-hn` pinned to `mcp[cli]<1.3` (0.1.0 targets the 1.x SDK; 2.x drops `Server.list_tools` and it dies on startup) |
-| `linkedin` | [stickerdaniel/linkedin-mcp-server](https://github.com/stickerdaniel/linkedin-mcp-server) | a linked browser session (`--login` once) |
-| `discord` | [SaseQ/discord-mcp](https://github.com/SaseQ/discord-mcp) | a bot token |
-| `x` | [api.x.com/mcp](https://docs.x.com/tools/mcp) | an app-only bearer token |
-| `telegram` | [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp) | API id/hash and a session string |
-| `signal` | [rymurr/signal-mcp](https://github.com/rymurr/signal-mcp) | a signal-cli registered number — bridged with supergateway |
-| `whatsapp` | [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) | a phone linked by QR — bridged with supergateway |
-| `exa` | shipped with TrueForge | nothing — general web search, kept as the fallback |
-| `bright-data` | shipped with TrueForge | a Bright Data account — the **preferred** search path (see below) |
-| `github` | shipped with TrueForge | nothing |
-
-`hn`, `signal` and `whatsapp` are stdio-only upstream; the Dockerfiles in
-`docker/` front them with [supergateway](https://github.com/supercorp-ai/supergateway)
-so TrueForge can reach them over HTTP.
-
-| Skill | Source |
-|---|---|
-| `extract-social-media` | authored here → [kristopolous/hackieskills](https://github.com/kristopolous/hackieskills) |
-| `find-discussions` | authored here → same repo |
-| `brightdata-brand-listening`, `brightdata-search`, `brightdata-scrape` | [brightdata/skills](https://github.com/brightdata/skills) — 3 of its 21 skills |
-| `apple-appstore-reviewer` | [github/awesome-copilot](https://github.com/github/awesome-copilot) |
-
-Skills are pinned to a commit, not a branch, so one can't change underneath a
-running agent. They execute in the agent's sandbox, which needs a sandbox
-provider configured under Settings → Sandbox providers; until then the dashboard
-runs `extract-social-media`'s scripts locally instead of through the sandboxed
-skill.
-
-### Search preference
-
-Every stage that searches (site resolution, discovery, the abuse sweep) picks
-its connectors in this order: **Bright Data, Reddit, Hacker News, Exa** — see
-`SEARCH_PREFERENCE` in `pipeline.ts`. Bright Data is the unmetered, paid path;
-the shared Exa MCP endpoint rate-limits (`429`) under sustained use, so it's kept
-only as a fallback, never as the primary. A transient failure (429, a dropped
-transport, a 5xx) gets one retry per stage before it's allowed to fail the run.
-
-### Reddit via the official API
-
-The Reddit MCP connector is unreliable, so discovery also talks straight to
-Reddit's official API with **PRAW** when you give it keys. Paste a script-type
-Reddit app's credentials in **Settings** (the masthead → *settings*), and they're
-stored on this machine only (`data/settings.json`, mode 0600) and never shown
-back or sent to a model. With keys configured, discovery pulls real Reddit
-threads through the API and folds them into the results alongside the agent's
-own search:
-
-```
-python3 -m venv .venv && .venv/bin/pip install praw    # required once
-```
-
-A virtualenv rather than `pip install praw`, because a Debian host refuses
-installs into its system interpreter (PEP 668) and `--user` is no better. The
-server looks for `.venv/bin/python3` beside the checkout and uses it for the
-Reddit reader; set `WHISPERER_PYTHON` if the interpreter lives somewhere else.
-
-Without keys, discovery falls back to whatever search connectors are attached.
+| `npm run setup` | Apply `src/registry.ts` to a TrueForge instance, if you use one |
 
 ## How a scan works
 
-Five agent turns, each held to a JSON schema (`app/server/schemas.ts`, run
-through `strictify()` for OpenAI's structured-output rules) so the result is
-data rather than prose to scrape:
+Seven stages, each independently re-runnable, each checkpointing as it goes so a
+restart resumes rather than restarts.
 
-1. **Presence** — render the site with [Lightpanda](https://lightpanda.io) and
-   classify its outbound links. Footers are built in JavaScript on most
-   marketing sites, so a plain fetch finds nothing; this is the difference
-   between four results and zero.
-2. **Discovery** — search Reddit and Hacker News directly, Bright Data or Exa
-   for everything else, and record what was said with its date and engagement.
-   The agent is instructed to keep going when one backend fails rather than
-   abandon the whole search.
-3. **Buzz** — score each mention from −1 to +1 and write the verdict. The
-   arithmetic that follows — bucketing, the volume-weighted mean, the delta —
-   is computed in `pipeline.ts`, not asked of the model.
-4. **Health** — triage the negative half into merged issues with a severity, the
-   threads that back each one, and a reply to the people who raised it.
-5. **Abuse / Integrity** — sweep the same discussion plus fresh search for
-   impersonation, phishing, fake-support scams, counterfeit and malware trading
-   on the brand's name. Runs last: it's the slowest and least likely to find
-   anything, and every earlier stage stays useful without it.
+1. **Subject** — decide what was typed. A repository URL is read from the host's
+   API; anything else is resolved from search evidence. Settles the search term,
+   the aliases, the things it must *not* be confused with, the site, and the
+   repository.
+2. **Sources** — where this subject is discussed, and — more usefully — where it
+   is not. Editable, because a wrong entry sends every later stage somewhere
+   useless.
+3. **Discovery** — the corpus. Paginated general search plus a complaint
+   vocabulary, in several languages, alongside direct reads of Reddit, Hacker
+   News, the project's own tracker and the App Store. Every result that is
+   dropped is counted against a reason.
+4. **Feed** — the newest material, read to tell a datapoint from a sign-in wall.
+5. **Buzz** — a score per mention, from the fetched page rather than a search
+   snippet. The arithmetic that follows is computed, not asked of a model.
+6. **Health** — merge complaints into defects, each with a severity, its
+   evidence, a reproduction test, and a draft reply.
+7. **Integrity** — impersonation, phishing, fake support, and the review-site
+   scorecard. Last, because it is slowest and every earlier stage stands without
+   it.
 
-Every tool call, its result, and any warning is streamed to the client over SSE
-and kept on the scan (`scan.log`), so a finished run can still be read back —
-not just watched live.
+### Two rules the pipeline is built around
 
-## Persistence & the run history
+**Evidence before verdict.** Every classification quotes the text it relies on
+*before* it answers, and the caller checks the quote actually occurs in the
+source. A quote that cannot be found is a fabricated one, and the verdict resting
+on it is discarded.
 
-Scans are stored as one JSON file (`data/scans.json`) — a database would be
-ceremony at this volume. `GET /api/scans` returns every past run (bodies
-stripped to headline counts) for the dashboard's run rail; `GET /api/scans/:id`
-returns one in full. Every scan survives an API restart.
+**Nothing is dropped silently.** Every filter records what it removed, from which
+source, and why — with a sample of the URLs. The coverage grid shows it per
+source per month, so an empty band can be read as "nobody posted", "nobody
+looked", "the provider returned nothing" or "our own filter ate it". They demand
+opposite responses and used to look identical.
 
-## Known limits
+## The coverage grid
 
-- **A small model will struggle.** Five turns with tool schemas in context is a
-  lot to ask of an 8B model with a 15k window.
-- **No tracker actually receives an issue yet.** Filing an issue builds the real
-  payload and marks it filed, and says plainly that it did not send. Add the
-  Linear, Jira or GitHub connector to `src/registry.ts` to close the loop.
-- **Bright Data and the messaging connectors need their own accounts.** Nothing
-  above runs until the matching credential lands in `.env`.
+One row per source, one column per month, one cell per source-per-month.
+
+- **Click a source name** to see what it returned and what was dropped, by
+  reason, with examples.
+- **Click a cell** to search that source for that window specifically. The dates
+  go into the query *as text* — `"Aug 1, 2026"`, four formats per day — because
+  most providers have no parameter for an arbitrary range and silently answer
+  with everything when asked for one. A page written on a date usually prints it.
+- A cell being searched shows marching ants until the work lands.
+- A cell that has been searched and came back empty is **hatched**, because "we
+  looked and it is quiet" is a finding and "nobody looked" is a gap.
+
+## Defects
+
+Each defect carries a **reproduction test** — the concrete steps and the
+observation that decides it. It is required, and where the reports genuinely do
+not support one the model must say so rather than invent conditions.
+
+That test gates the expensive work: reading a repository and running its suite
+against "it runs like ass" cannot conclude anything, so the loop refuses to start
+until there is something that could turn out to be false.
+
+The **resolution ladder** on each defect is the interface: reported → reproduced
+→ filed → reached out → fixed → confirmed → closed. Exactly one rung is next,
+and that rung carries the only button, because what this screen owes the reader
+is the next move rather than a menu.
+
+## Layout
+
+```
+app/
+  shared/          types, HTML and markdown handling shared by both halves
+  server/
+    pipeline.ts      the stages themselves
+    stages.ts        stage dispatch, checkpointing, the retrieval audit
+    queue.ts         one worker, serial by design — see below
+    search.ts        the provider chain, pacers, pagination, widening
+    providers.ts     which connector serves which role, and in what order
+    reading-budget.ts batch sizes derived from the host's context window
+    suppression.ts   what was dropped, from where, and why
+    date-queries.ts  searching a window by writing its dates into the query
+    own-site.ts      whose page is whose — path-aware on shared hosts
+    rescue.ts        ask the model when a parser fails, then verify its answer
+    upstream-trouble.ts  stop a stage rather than grind against a dead host
+    agents/          every agent as a first-class definition, with run history
+    sources/         direct readers: Hacker News, GitHub issues, the App Store
+    channels/        GitHub: forking, and filing to a fork
+  web/               the dashboard
+skills/reddit-search  the PRAW reader
+data/                scans, settings, credits — none of it in git
+```
+
+**The queue is serial on purpose.** One search budget, one set of provider
+pacers, one content cache, one inference endpoint — all per process. Two scans at
+once spend each other's allowance and both come back thin, with nothing in either
+report saying why. A second ask is queued, never refused, and the queue panel
+shows what is running and what is waiting.
+
+## Known problems
+
+- **`data/scans.json` is rewritten whole on every checkpoint.** Hundreds of
+  rewrites per scan. Per-scan files are the fix.
+- **A file save during `npm run dev` kills the running scan.** `tsx --watch`
+  restarts the API. Use `npm start` for anything long.
+- **The queue is in memory.** A restart loses what was waiting; the scans
+  themselves survive.
+- **Model stages run their batches in sequence.** `pool.ts` exists and is not
+  yet wired in.
+- **Providers differ on date ranges.** Brave takes an explicit range and Google
+  takes `after:`/`before:`; the rest take day/week/month/year and quietly ignore
+  anything else. The dated-query text is what makes a window work everywhere.

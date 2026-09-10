@@ -181,6 +181,11 @@ export async function resolveSubject(
         emit('info', `no homepage listed, so the repository page is the site: ${page}`);
       }
       if (!resolved.repo && clone) resolved.repo = clone;
+      // This metadata came back from an unauthenticated request, so the
+      // repository is readable without a credential unless the host says
+      // otherwise. That is what decides whether a local checkout is worth
+      // offering.
+      resolved.repoPublic = facts.private !== true && facts.visibility !== 'private';
       if (resolved.site && homepage && resolved.site !== homepage) {
         emit('info', `note: the repository lists ${homepage} as its homepage, resolved as ${resolved.site}`);
       }

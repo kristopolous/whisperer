@@ -1175,6 +1175,21 @@ function WorkspacePicker({ scan, onScan }: { scan: Scan; onScan: (changes: Parti
 
   const rows = data?.workspaces ?? [];
 
+  // Nothing to offer when the source is public and we know where it is.
+  //
+  // A local checkout is the answer to ONE problem: the code is closed, or
+  // behind a credential this app deliberately does not hold, so it cannot be
+  // cloned here. For `microsoft/markitdown` — public, resolved, and clonable by
+  // anyone — the button offers a worse version of what already happens
+  // automatically, and puts a "your setup is incomplete" prompt under a scan
+  // where nothing is missing. An option that is never the right answer is
+  // clutter at best and a wrong turn at worst.
+  //
+  // The scan's own repo is the test, not the presence of a workspace: somebody
+  // may keep a checkout of a public project for other reasons, and that is not
+  // a reason to ask them about it here.
+  if (scan.subject?.repo && scan.subject.repoPublic) return null;
+
   return (
     <div style={{ marginBottom: 12 }}>
       <div className="actions">

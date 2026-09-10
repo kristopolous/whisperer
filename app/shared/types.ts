@@ -626,6 +626,14 @@ export interface Subject {
   /** Source repository, when known — this is what makes diagnose and fix
    *  available without anyone editing a config file. */
   repo: string;
+  /** Whether that repository can be read without a credential.
+   *
+   *  Decides whether the local-checkout option is worth offering at all: a
+   *  workspace is the answer to code this app cannot clone, and offering it for
+   *  a public repository puts a "your setup is incomplete" prompt under a scan
+   *  where nothing is missing. Set from the host's own API — an unauthenticated
+   *  read that succeeds is itself the proof. */
+  repoPublic?: boolean;
   kind: 'open-source project' | 'commercial product' | 'company' | 'service' | 'unknown';
   summary: string;
   confidence: 'high' | 'medium' | 'low';
