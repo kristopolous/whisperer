@@ -85,7 +85,9 @@ export async function investigate(
   result.diagnosed = true;
   issue.loop = [...(issue.loop ?? []), {
     id: randomUUID().slice(0, 8),
-    step: 'reproduced',
+    // Reading is not reproducing. This used to write `reproduced`, which let an
+    // issue nobody had demonstrated pass the gate in front of filing.
+    step: 'diagnosed',
     actor: 'agent',
     at: diagnosis.at,
     human: false,
@@ -104,16 +106,37 @@ export async function investigate(
     issue.fix = fix;
     result.patched = fix.applied && fix.tests.passed;
     const proven = fix.provesTheBug.checked && fix.provesTheBug.failedOnOriginal;
+
+    // Two separate claims, recorded separately because they can come apart.
+    //
+    //   the bug is real  = a new test FAILS against the original code
+    //   the fix works    = the suite PASSES with the patch applied
+    //
+    // A patch whose test passes both before and after proves nothing: it is
+    // green against a bug that was never demonstrated. Writing `fixed` for that
+    // is how a scan reports work it did not do.
+    if (proven) {
+      issue.loop = [...(issue.loop ?? []), {
+        id: randomUUID().slice(0, 8),
+        step: 'reproduced',
+        actor: 'agent',
+        at: fix.at,
+        human: false,
+        summary: label(`A new test fails against the original code: ${fix.provesTheBug.detail}`),
+      }];
+    }
+
     issue.loop = [...(issue.loop ?? []), {
       id: randomUUID().slice(0, 8),
-      step: result.patched ? 'fixed' : 'reproduced',
+      step: result.patched && proven ? 'fixed' : 'diagnosed',
       actor: 'agent',
       at: fix.at,
       human: false,
       summary: label(result.patched
         ? `Patched ${fix.files.length} file(s) in ${fix.attempts} attempt(s); \`${fix.tests.command}\` passes. `
           + (proven ? 'The new test fails against the original code, so it catches the bug.'
-            : 'The new test does not fail against the original code, so it proves nothing yet.')
+            : 'The new test passes against the original code too, so it demonstrates nothing — '
+              + 'the suite being green here does not mean the reported defect was fixed.')
         : `Tried ${fix.attempts} time(s) without landing a working patch. ${fix.notes.slice(0, 160)}`),
       ref: { label: `${fix.attempts} attempt(s)` },
     }];

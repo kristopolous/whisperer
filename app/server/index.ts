@@ -1301,7 +1301,8 @@ app.post('/api/scans/:id/issues/:issueId/diagnose', async (req, res) => {
     // bottom as what was done, when, and what it concluded.
     issue.loop = [...(issue.loop ?? []), {
       id: randomUUID().slice(0, 8),
-      step: 'reproduced',
+      // Reading, not reproducing — see the LoopStep comments.
+      step: 'diagnosed',
       actor: 'agent',
       at: issue.diagnosis.at,
       human: false,

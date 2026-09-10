@@ -235,7 +235,12 @@ export type Tracker = 'linear' | 'jira' | 'github' | 'clipboard';
  *  reported it can move it to `confirmed`. */
 export type LoopStep =
   | 'discovered'     // the complaint was found in public discussion
-  | 'reproduced'     // the defect was confirmed against a real build
+  | 'diagnosed'      // the source was read and the defect located in it
+  // Reproduced means a TEST, and a test that fails against the unpatched code.
+  // It used to be written the moment the source had been read, which is a much
+  // weaker claim wearing a much stronger word — and it let an unproven report
+  // reach the filing step as though somebody had confirmed it.
+  | 'reproduced'     // a regression test exists and FAILS against the original
   | 'filed'          // opened in the tracker, with the report attached
   | 'contact-found'  // a way to reach the reporter was established
   | 'outreach'       // reporter was told it is real, and apologised to

@@ -32,7 +32,8 @@ import { fmtDate } from '../lib.ts';
 
 const STEP_LABEL: Record<LoopStep, string> = {
   discovered: 'Reported in public',
-  reproduced: 'Reproduced',
+  diagnosed: 'Located in the code',
+  reproduced: 'Reproduced by a failing test',
   filed: 'Filed in tracker',
   'contact-found': 'Contact route established',
   outreach: 'Reached out',
@@ -76,7 +77,7 @@ const LADDER: {
 }[] = [
   { step: 'discovered', pending: 'Not yet seen in public discussion' },
   {
-    step: 'reproduced',
+    step: 'diagnosed',
     pending: 'Nobody has checked this against the source yet',
     action: 'investigate',
     actionLabel: 'Read the source and patch it',
@@ -90,10 +91,25 @@ const LADDER: {
       + 'regression test fails against the original code.',
   },
   {
+    // A test that fails against the unpatched code. Written by the patch run,
+    // never by reading alone.
+    step: 'reproduced',
+    pending: 'No test yet that fails against the current code',
+    theirs: false,
+  },
+  {
     step: 'filed',
     pending: 'Not filed anywhere — there is nothing to point the reporter at',
     action: 'file',
     actionLabel: 'File it',
+    // Filing needs a demonstrated bug, not a report of one.
+    //
+    // A ticket saying "somebody on Reddit said this is broken" is a rumour with
+    // a severity attached; a ticket carrying a test that fails on the current
+    // code is a bug. The whole point of reading the source first is to be able
+    // to hand over the second kind, and without this gate the ladder let the
+    // first kind straight through.
+    needs: 'reproduced',
   },
   {
     step: 'outreach',
@@ -143,6 +159,22 @@ export function ResolutionLoop({ issue, onAction, busy, progress }: {
   const loop = issue.loop ?? [];
   const done = new Map<LoopStep, LoopEvent>();
   for (const event of loop) if (!done.has(event.step)) done.set(event.step, event);
+
+  // A `reproduced` event only counts if a test actually backs it.
+  //
+  // Records written before this distinction existed used `reproduced` for
+  // having read the source, so replaying them now claims a demonstration that
+  // never happened — and worse, opens the gate in front of filing. The proof
+  // lives on `issue.fix`, so it can be checked rather than trusted: no failing
+  // test against the original code, no reproduction.
+  const provenBug = Boolean(issue.fix?.provesTheBug?.checked && issue.fix.provesTheBug.failedOnOriginal);
+  if (done.has('reproduced') && !provenBug) {
+    const stale = done.get('reproduced')!;
+    done.delete('reproduced');
+    // Not discarded — it was a real step somebody took, and it is what the
+    // `diagnosed` rung means. Kept there if nothing better already fills it.
+    if (!done.has('diagnosed')) done.set('diagnosed', { ...stale, step: 'diagnosed' });
+  }
 
   // `discovered` is true by construction and nothing ever writes it.
   //
@@ -260,7 +292,14 @@ export function ResolutionLoop({ issue, onAction, busy, progress }: {
                             + 'check a fix against. Re-run triage to give it one.'}
                       </span>
                     )}
-                    {blocked && !untestable && rung.needs && (
+                    {blocked && !untestable && rung.needs === 'reproduced' && (
+                      <span className="conn-meta">
+                        Nothing yet fails against the current code. A ticket saying somebody
+                        complained is a report; one carrying a test that fails is a bug. Patch it
+                        first and the failing test comes with it.
+                      </span>
+                    )}
+                    {blocked && !untestable && rung.needs && rung.needs !== 'reproduced' && (
                       <span className="conn-meta">
                         {STEP_LABEL[rung.needs]} has to happen first — otherwise the reply has
                         nowhere to point them.
