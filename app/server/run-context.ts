@@ -40,6 +40,14 @@ export interface RunContext {
    *  only the 60 newest issues, and lifting both on every run would re-fetch
    *  years of history nightly to find the handful of rows that changed. */
   dig?: string;
+  /** The window to dig in, as `YYYY-MM-DD` bounds.
+   *
+   *  Set when somebody clicks a cell on the coverage grid rather than a row: a
+   *  dark band is a source AND a month, and searching that source across all
+   *  time to fill one month is both slower and less likely to surface the thing
+   *  that is actually missing. */
+  digFrom?: string;
+  digTo?: string;
   /** Aborted when someone cancels this scan. */
   signal?: AbortSignal;
 }
@@ -59,6 +67,12 @@ export const runLanguages = (): string[] => context.getStore()?.languages ?? [];
 
 /** The source this run was asked to dig into, if any. */
 export const digging = (): string | undefined => context.getStore()?.dig;
+
+/** The window a dig was aimed at, when it was aimed at one. */
+export const digWindow = (): { from: string; to: string } | undefined => {
+  const run = context.getStore();
+  return run?.digFrom && run?.digTo ? { from: run.digFrom, to: run.digTo } : undefined;
+};
 
 /** Thrown at a checkpoint so a cancelled run unwinds like any other failure,
  *  then is recognised and reported as a cancellation rather than an error. */

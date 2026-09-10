@@ -1,5 +1,6 @@
 import type { Scan } from '../../../shared/types.ts';
 import { Tape } from '../charts/Tape.tsx';
+import { Behind } from '../charts/Behind.tsx';
 import { MigrationFlow } from '../charts/MigrationFlow.tsx';
 import { TopicStack } from '../charts/TopicStack.tsx';
 import { fmtMonth, fmtScore } from '../lib.ts';
@@ -72,8 +73,8 @@ export function Overview({
             <div className="tape-foot">
               <span>
                 {cursor
-                  ? `Filtered to ${fmtMonth(cursor)} — click the trace again to clear`
-                  : 'Click the trace to filter the ledger to one month'}
+                  ? `${fmtMonth(cursor)} — what it is made of is below`
+                  : 'Click the trace to see what any point is made of'}
               </span>
               <span style={{ display: 'inline-flex', gap: 14, alignItems: 'center' }}>
                 <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
@@ -87,6 +88,7 @@ export function Overview({
                 </span>
               </span>
             </div>
+            <Behind mentions={mentions} buzz={buzz} cursor={cursor} onClear={() => onScrub(null)} />
           </div>
         </section>
       )}

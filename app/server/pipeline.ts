@@ -14,11 +14,12 @@ import { searchReddit } from './reddit.ts';
 import { crawlSite } from './agents/crawl-run.ts';
 import { fetchAll } from './content.ts';
 import { runAgent } from './agents/runtime.ts';
-import { digging, isDeep, runLanguages } from './run-context.ts';
+import { digging, digWindow, isDeep, runLanguages } from './run-context.ts';
 import { resolveReporter } from './reporter.ts';
 import { mentionId } from './mention-id.ts';
 import { audit, dropped as noteDrop, droppedAll as noteDrops, retrieved } from './suppression.ts';
 import { UpstreamTrouble } from './upstream-trouble.ts';
+import { windowQueries } from './date-queries.ts';
 import { readingBudget } from './reading-budget.ts';
 import { describeError, why } from './errors.ts';
 import { enabledLanguages, queriesFor } from './languages.ts';
@@ -1021,7 +1022,20 @@ export async function findMentions(
   // means aiming queries at the sites that make up that venue and taking them
   // unwindowed — which is a real lever, and leaving those rows unclickable was
   // an artefact of how the code was organised rather than an answer.
-  if (dig) {
+  const window = digWindow();
+  if (dig && window) {
+    // A cell on the coverage grid, not a row: one source, one bucket.
+    //
+    // The window goes in as query TEXT rather than as a freshness parameter,
+    // because most providers have no parameter for an arbitrary range and
+    // silently answer with everything when asked for one. A page written in
+    // August almost always prints its own date, so `"Aug 1, 2026"` as a quoted
+    // phrase is a filter every engine honours — it is just a word to match.
+    const hosts = venueHosts(dig, profiles);
+    const dated = windowQueries(brand, hosts, window.from, window.to);
+    complaintQueries.push(...dated.queries);
+    emit('info', `digging ${dig} for ${window.from} → ${window.to}: ${dated.note}`);
+  } else if (dig) {
     const hosts = venueHosts(dig, profiles);
     if (hosts.length) {
       const aimed = hosts.flatMap((host) => [

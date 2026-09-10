@@ -20,6 +20,10 @@ export interface StageCtx {
   signal?: AbortSignal;
   /** One source to go deep on for this run — see RunContext.dig. */
   dig?: string;
+  /** The window to dig in, `YYYY-MM-DD` bounds, when the ask came from a cell
+   *  on the coverage grid rather than a whole row. */
+  digFrom?: string;
+  digTo?: string;
   /** False when the subject must be resolved from scratch rather than reused.
    *  Set when somebody reruns the subject stage deliberately — the only reason
    *  to do that is that the stored answer is wrong. */
@@ -130,7 +134,8 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
   return withRunContext(
     {
       scanId: scan.id, stage: next, depth: scan.depth,
-      languages: scan.languages, dig: ctx.dig, signal: ctx.signal,
+      languages: scan.languages, dig: ctx.dig,
+      digFrom: ctx.digFrom, digTo: ctx.digTo, signal: ctx.signal,
     },
     async () => {
     try {

@@ -32,7 +32,7 @@ export interface Job {
   company: string;
   /** Empty means a full scan. */
   stages: Stage[];
-  options: { depth?: 'deep' | 'normal'; languages?: string[]; dig?: string };
+  options: { depth?: 'deep' | 'normal'; languages?: string[]; dig?: string; digFrom?: string; digTo?: string };
   state: JobState;
   queuedAt: string;
   startedAt?: string;

@@ -427,9 +427,12 @@ section { margin-top: 44px; }
 }
 
 /* Anything that can outgrow its panel scrolls inside itself.
-   Applied by element rather than by class so a table added later is handled
-   without anybody having to remember this rule. */
-.panel table,
+   NOT applied to `table`. `display: block` on a table discards table layout —
+   cells stop sharing column widths and start wrapping independently, which took
+   the ledger's rows from 30px to 129px each and made a 1,107-row table 135,024
+   pixels tall. Measured in the browser, not guessed. A wide table belongs in a
+   scrolling wrapper (`.scroll.wide`), which is where this one already was; the
+   element itself must keep `display: table`. */
 .panel pre,
 .panel .scroll-x {
   display: block;
@@ -2168,7 +2171,19 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   color: var(--ink-2);
 }
 .cover-scroll { overflow-x: auto; overflow-y: hidden; padding-bottom: 4px; }
-.cover-grid { display: grid; gap: 2px; align-items: center; width: max-content; }
+.cover-grid {
+  display: grid;
+  gap: 2px;
+  align-items: center;
+  width: max-content;
+  /* One height per source row, so the columns of squares are evenly spaced.
+     Kept after the real cause of the unevenness was fixed — a stray global
+     `.empty` rule adding 40px of padding to zero-total rows — because a row
+     height here is genuinely a property of the chart rather than of whatever
+     its longest label happens to be, and leaving it implicit is what let a
+     six-pixel difference go unnoticed in the first place. */
+  grid-auto-rows: 20px;
+}
 /* The source column stays put while time scrolls under it — a row of cells with
    no name against it says nothing. */
 .cover-row-name, .cover-corner {
@@ -2217,7 +2232,7 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 .cover-row-open[aria-expanded='true'] { color: var(--signal); }
 /* A source with nothing at all is the actionable row, so it is legible rather
    than faded into the background like an ordinary empty cell. */
-.cover-row-name.empty { color: var(--warning); }
+.cover-row-name.cover-empty { color: var(--warning); }
 .cover-swatch { width: 7px; height: 7px; border-radius: 2px; flex: none; }
 .cover-cell { height: 14px; border-radius: 2px; }
 .cover-cell.none { background: color-mix(in srgb, var(--ink-3) 12%, transparent); }
@@ -2584,3 +2599,67 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   background: color-mix(in srgb, var(--ink) 8%, transparent);
 }
 @media (max-width: 640px) { .stale-build { padding: 8px 14px; } }
+
+/* The mentions behind one point on the tape. */
+.behind { border-top: 1px solid var(--rule); padding: 12px 16px 14px; }
+.behind-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.behind-head strong { font: 600 16px var(--mono); font-variant-numeric: tabular-nums; }
+.behind-head button { margin-left: auto; }
+.behind-none { margin: 0; max-width: 70ch; }
+.behind-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; max-height: 420px; overflow-y: auto; }
+.behind-list > li { display: flex; gap: 12px; align-items: baseline; }
+.behind-score {
+  flex: none; width: 5ch;
+  font: 600 12px var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+  text-align: right;
+}
+.behind-score.pos { color: var(--pos); }
+.behind-score.neg { color: var(--neg); }
+.behind-body { display: grid; gap: 2px; min-width: 0; }
+.behind-body a { font-size: 13px; }
+.behind-quote { font-size: 12.5px; line-height: 1.55; color: var(--ink-2); overflow-wrap: anywhere; }
+
+/* The ledger row, at one height. ------------------------------------------
+   Every row holds a title, a quote and some tags, each of which wraps to a
+   different number of lines depending on its content — so row heights ran
+   90/109/111/129/130/150 down the first forty. Fixing the line count of each
+   part is what gives the column a rhythm; the alternative, letting each row
+   size itself, is what made three narrow columns look like they had random
+   gaps in them. */
+.led-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.led-quote {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  /* A floor as well as a ceiling, so a one-line quote does not make a short
+     row. Two lines at the quote's own line-height. */
+  min-height: calc(2 * 1.55em);
+}
+.led-tags {
+  /* One line. A fourth tag that wrapped added 24px to that row alone. */
+  flex-wrap: nowrap;
+  overflow: hidden;
+  height: 18px;
+}
+
+/* A cell you can act on. The affordance is deliberately quiet — fourteen
+   hundred of these are on screen at once and a hover ring on each would be
+   noise — but it has to exist, or the fact that a dark band is clickable is
+   something you can only find by accident. */
+.cover-cell.hit { cursor: pointer; }
+.cover-cell.hit:hover {
+  outline: 1px solid var(--signal);
+  outline-offset: 1px;
+}
+.cover-cell.hit:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 1px;
+}

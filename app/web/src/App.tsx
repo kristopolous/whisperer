@@ -86,6 +86,17 @@ function fmtElapsed(ms: number): string {
   return h ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
 }
 
+export /** What a rerun can be aimed at. */
+interface DigOptions {
+  depth?: 'deep' | 'normal';
+  languages?: string[];
+  dig?: string;
+  /** `YYYY-MM-DD` bounds, when the ask came from one cell of the coverage grid
+   *  rather than a whole row. */
+  digFrom?: string;
+  digTo?: string;
+}
+
 export function App() {
   const [input, setInput] = useState('');
   const [runs, setRuns] = useState<RunSummary[]>([]);
@@ -114,6 +125,9 @@ export function App() {
   const [rerunningStage, setRerunningStage] = useState<Stage | null>(null);
   /** What was just put in the queue, so a click that enqueues is not silent. */
   const [queuedNote, setQueuedNote] = useState<string | null>(null);
+  /** Bumped by "Patch bugs". A counter, not a flag: pressing it twice should
+   *  start twice, which a boolean cannot say. */
+  const [patchSignal, setPatchSignal] = useState(0);
   /** The queue, polled. Declared here because both the header indicator and
    *  the per-button disabled test read it, and both run during render. */
   const [jobs, setJobs] = useState<{ scanId: string; stages: Stage[]; state: string; company?: string; stage?: Stage }[]>([]);
@@ -551,7 +565,7 @@ useEffect(() => {
   /** Put an ask in the queue and say so. */
   const queueInstead = useCallback(async (
     stages: Stage[],
-    options?: { depth?: 'deep' | 'normal'; languages?: string[]; dig?: string },
+    options?: DigOptions,
     because?: string,
   ) => {
     const target = scanIdRef.current;
@@ -573,7 +587,7 @@ useEffect(() => {
     }
   }, [scan.company]);
 
-  const rerun = useCallback(async (stages: Stage[], options?: { depth?: 'deep' | 'normal'; languages?: string[]; dig?: string }) => {
+  const rerun = useCallback(async (stages: Stage[], options?: DigOptions) => {
     const target = scanIdRef.current;
     if (!target || stages.length === 0) return;
 
@@ -946,8 +960,8 @@ useEffect(() => {
                 </button>
                 <button
                   className="headline"
-                  onClick={() => setTab('defects')}
-                  title="Read the source against a defect, write a patch, and run the tests"
+                  onClick={() => { setTab('defects'); setPatchSignal((n) => n + 1); }}
+                  title="Read the source against the worst open defect, write a patch, and run the tests"
                 >
                   ⚒ Patch bugs
                   {scan.issues.length > 0 && <span className="headline-n">{scan.issues.length}</span>}
@@ -1121,6 +1135,8 @@ useEffect(() => {
                       scan={scan}
                       cursor={cursor}
                       onDig={(venue) => rerun(['discovery', 'buzz'], { dig: venue })}
+                      onDigWindow={(venue, digFrom, digTo) =>
+                        rerun(['discovery', 'buzz'], { dig: venue, digFrom, digTo })}
                     />
                   </section>
                 )}
@@ -1161,6 +1177,7 @@ useEffect(() => {
                       onScan={(changes) => setScan((s) => ({ ...s, ...changes }))}
                       onRerun={(stages, deep) => rerun(stages, deep ? { depth: 'deep' } : undefined)}
                       busy={running || rerunningStage !== null}
+                      patchSignal={patchSignal}
                     />
                   </section>
                 )}

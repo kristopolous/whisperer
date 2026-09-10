@@ -339,14 +339,15 @@ app.get('/api/jobs', (_req, res) => {
 });
 
 app.post('/api/jobs', (req, res) => {
-  const { scanId, stages, depth, languages, dig } = (req.body ?? {}) as {
-    scanId?: string; stages?: Stage[]; depth?: 'deep' | 'normal'; languages?: string[]; dig?: string;
+  const { scanId, stages, depth, languages, dig, digFrom, digTo } = (req.body ?? {}) as {
+    scanId?: string; stages?: Stage[]; depth?: 'deep' | 'normal'; languages?: string[];
+    dig?: string; digFrom?: string; digTo?: string;
   };
   const scan = scanId ? store.get(scanId) : undefined;
   if (!scan) return res.status(404).json({ error: 'no such scan' });
 
   const wanted = (stages ?? []).filter((stage) => (STAGE_KEYS as string[]).includes(stage));
-  const job = enqueue(scan.id, scan.company, wanted, { depth, languages, dig });
+  const job = enqueue(scan.id, scan.company, wanted, { depth, languages, dig, digFrom, digTo });
   res.status(202).json({ job, waiting: queueDepth() });
 });
 
@@ -391,6 +392,7 @@ setRunner(async (job: Job, onStage) => {
       onStage(stage);
       await runStage({
         scan, log, send: () => {}, dig: job.options.dig,
+        digFrom: job.options.digFrom, digTo: job.options.digTo,
       }, stage);
     }
     scan.status = 'done';

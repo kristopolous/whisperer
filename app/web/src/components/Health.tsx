@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FixStep, Issue, Mention, Scan, Stage, Tracker } from '../../../shared/types.ts';
 import { api, apiUrl, fmtAgo, fmtDate, plain, venueOf } from '../lib.ts';
 import type { DefectHistory, Series } from '../../../server/series.ts';
@@ -41,10 +41,13 @@ function Delta({ series }: { series: Series | null }) {
   );
 }
 
-export function Health({ scan, onChange, onScan, onRerun, busy }: {
+export function Health({ scan, onChange, onScan, onRerun, busy, patchSignal }: {
   scan: Scan;
   onChange: (issue: Issue) => void;
   onScan: (changes: Partial<Scan>) => void;
+  /** Bumped when "Patch bugs" is pressed. A counter rather than a boolean so
+   *  pressing it twice starts twice, which a boolean cannot express. */
+  patchSignal?: number;
   /** Go and look again — from the empty state, where "nothing is wrong" and
    *  "we did not read enough" are indistinguishable from the outside. */
   onRerun?: (stages: Stage[], deep?: boolean) => void;
@@ -120,6 +123,28 @@ export function Health({ scan, onChange, onScan, onRerun, busy }: {
   const issues = all.filter((i) => matches(query, i.title, i.summary, i.impact, i.kind, i.severity));
   const [selected, setSelected] = useState(issues[0]?.id);
   const issue = issues.find((i) => i.id === selected) ?? issues[0];
+
+  /** "Patch bugs" used to switch to this tab and stop.
+   *
+   *  The tab was already reachable from the tab strip, so the headline control
+   *  for the feature this product is named around did nothing you could not do
+   *  by clicking a word. It now picks the defect worth patching first and
+   *  starts on it: unfixed before fixed, critical before serious, and among
+   *  equals the one with the most evidence behind it, because that is the one
+   *  whose diagnosis has the most to work from.
+   */
+  const [autoStart, setAutoStart] = useState(0);
+  useEffect(() => {
+    if (!patchSignal) return;
+    const rank = (i: Issue) =>
+      (i.fix?.tests.passed && i.fix.provesTheBug.failedOnOriginal ? 900 : 0)
+      + ({ critical: 0, serious: 1, warning: 2, good: 3 }[i.severity] ?? 4) * 10
+      - Math.min(9, i.evidence.length);
+    const target = [...all].sort((a, b) => rank(a) - rank(b))[0];
+    if (!target) return;
+    setSelected(target.id);
+    setAutoStart((n) => n + 1);
+  }, [patchSignal]);
 
   useEffect(() => { if (issues.length && !issues.some((i) => i.id === selected)) setSelected(issues[0].id); },
     [scan.id, issues.length]);
@@ -264,7 +289,7 @@ export function Health({ scan, onChange, onScan, onRerun, busy }: {
             </button>
           ))}
         </div>
-        <Report scan={scan} issue={issue} onChange={onChange} onScan={onScan} />
+        <Report scan={scan} issue={issue} onChange={onChange} onScan={onScan} autoStart={autoStart} />
       </div>
     </div>
   );
@@ -445,8 +470,11 @@ function CodeSource({ scan, onScan }: { scan: Scan; onScan: (changes: Partial<Sc
 
 interface Payload { tracker: Tracker; title: string; body: string; labels: string[]; endpoint: string }
 
-function Report({ scan, issue, onChange, onScan }: {
+function Report({ scan, issue, onChange, onScan, autoStart }: {
   scan: Scan; issue: Issue; onChange: (issue: Issue) => void; onScan: (changes: Partial<Scan>) => void;
+  /** Bumped by "Patch bugs" to start this defect's investigation without a
+   *  second click. Zero on every other render, so nothing starts by accident. */
+  autoStart?: number;
 }) {
   const [fileError, setFileError] = useState<string | null>(null);
   const [pr, setPr] = useState<{ number: number; url: string } | null>(null);
@@ -464,7 +492,7 @@ function Report({ scan, issue, onChange, onScan }: {
   const busyNow = working !== null || investigating;
 
   /** Fork, clone, read, patch, publish — streamed, so the wait is legible. */
-  const investigate = () => {
+  const investigate = useCallback(() => {
     setSteps([]);
     setSourceError(null);
     setInvestigating(true);
@@ -490,7 +518,17 @@ function Report({ scan, issue, onChange, onScan }: {
       }
     };
     stream.onerror = () => { setInvestigating(false); stream.close(); };
-  };
+  }, [scan.id, issue.id, onChange, onScan]);
+
+  // Started by "Patch bugs". Guarded on the counter so it fires once per press
+  // and never on an ordinary render.
+  const started = useRef(0);
+  useEffect(() => {
+    if (!autoStart || autoStart === started.current) return;
+    started.current = autoStart;
+    investigate();
+  }, [autoStart, investigate]);
+
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [repos, setRepos] = useState<{ company: string }[] | null>(null);
 

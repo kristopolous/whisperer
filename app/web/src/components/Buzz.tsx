@@ -7,11 +7,13 @@ import { VENUES, fmtDate, fmtMonth, fmtScore, plain, venueOf } from '../lib.ts';
 
 /** Discovery is the raw material for everything else: every mention and where
  *  it lives. The ledger shows the remarks; the venue bars show the mix. */
-export function Buzz({ scan, cursor, onDig }: {
+export function Buzz({ scan, cursor, onDig, onDigWindow }: {
   scan: Scan;
   cursor: string | null;
   /** Search one source harder — the coverage grid's row click. */
   onDig?: (venue: string) => void;
+  /** One source, one bucket — the cell rather than the row. */
+  onDigWindow?: (venue: string, from: string, to: string) => void;
 }) {
   const [venue, setVenue] = useState<string>('all');
   const [query, setQuery] = useState('');
@@ -66,7 +68,7 @@ export function Buzz({ scan, cursor, onDig }: {
     // glance.
     <div className="stack">
       <div className="panel">
-        <Coverage scan={scan} onDig={onDig} />
+        <Coverage scan={scan} onDig={onDig} onDigWindow={onDigWindow} />
         <header>
           <h3>Ledger</h3>
           <span style={{ font: '400 11px var(--mono)', color: 'var(--ink-3)' }}>
@@ -122,10 +124,19 @@ export function Buzz({ scan, cursor, onDig }: {
                     <span className="tag" style={{ color: venueOf(m.venue).slot }}>{venueOf(m.venue).label}</span>
                   </td>
                   <td>
-                    <a href={m.url} target="_blank" rel="noreferrer">{m.title}</a>
-                    <div className="quote">{plain(m.excerpt).slice(0, 190)}{plain(m.excerpt).length > 190 ? '…' : ''}</div>
+                    {/* One line for the title, two for the quote, one for the
+                        tags — fixed, so every row is the same height.
+                        Measured before: the first forty rows came in at six
+                        different heights between 90px and 150px, because a
+                        title wraps to one line or two, a quote to two or three
+                        and the tags to one or two. Each row was correct on its
+                        own; together they had no rhythm, and the venue, date
+                        and score columns each held one short item pinned at the
+                        top of whatever height happened to result. */}
+                    <a className="led-title" href={m.url} target="_blank" rel="noreferrer">{m.title}</a>
+                    <div className="quote led-quote">{plain(m.excerpt).slice(0, 190)}{plain(m.excerpt).length > 190 ? '…' : ''}</div>
                     {m.themes.length > 0 && (
-                      <div style={{ marginTop: 6, display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                      <div className="led-tags" style={{ marginTop: 6, display: 'flex', gap: 5 }}>
                         {m.themes.slice(0, 4).map((t) => (
                           <span className="tag plain" key={t}>{t}</span>
                         ))}
