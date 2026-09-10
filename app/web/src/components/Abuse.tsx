@@ -87,6 +87,15 @@ function RecentReviews({ reviews }: { reviews: ReviewScore[] }) {
 }
 
 function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
+  // Every hook before the first return, without exception.
+  //
+  // `useState` sat below the `reviews.length === 0` guard, so this component
+  // rendered one hook when it had scores and none when it did not. React counts
+  // hooks per render and throws when the count changes — error #310, which in a
+  // production build is a minified stack and a link. It only fired once scores
+  // could arrive after an empty first render, which is now the normal case: the
+  // scorecard renders before the integrity stage has run.
+  const [open, setOpen] = useState<string | null>(null);
   if (reviews.length === 0) return null;
 
   // One grid, ordered by audience rather than split into a section per
@@ -98,7 +107,6 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
   // a company can be loved by software buyers and hated by its own staff —
   // but it belongs on the card, not in the page structure.
   const ordered = KIND_ORDER.flatMap((kind) => reviews.filter((r) => r.kind === kind));
-  const [open, setOpen] = useState<string | null>(null);
 
   return (
     <div className="panel">

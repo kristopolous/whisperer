@@ -304,7 +304,10 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
       scan.error = message;
       scan.errorDetail = raw;
       scan.errorKind = kind;
-      scan.failedStage = next;
+      // Only a real step. `queued` and `done` are markers for where a run got
+      // to, and recording one here produces "done didn't finish" downstream —
+      // a sentence about something that cannot fail.
+      scan.failedStage = next === 'queued' || next === 'done' ? undefined : next;
     }
 
     scan.timings[next] = Date.now() - started;

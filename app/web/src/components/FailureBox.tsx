@@ -144,7 +144,16 @@ export function FailureBox({
   const [connectors, setConnectors] = useState<ConnectorStatus[] | null>(null);
   const [checking, setChecking] = useState(false);
 
-  const label = stage ? (STAGES.find((s) => s.key === stage)?.label ?? stage) : 'pipeline';
+  /** The failed step, only when it really is one.
+   *
+   *  `STAGES` deliberately excludes `queued` and `done` — they are markers for
+   *  where a run got to, not steps it performs. Falling back to the raw key
+   *  when the lookup missed printed "done didn't finish", which names a thing
+   *  that cannot fail and tells the reader nothing about what did. A marker in
+   *  this field means the failure was recorded without a step attached, and the
+   *  honest rendering of that is the scan-level message. */
+  const step = STAGES.find((s) => s.key === stage);
+  const label = step?.label ?? 'pipeline';
   const hasConnectorRemedy = kind === 'connector' || kind === 'auth';
 
   // Being busy is not a failure, and dressing it as one is actively misleading:
@@ -186,12 +195,12 @@ export function FailureBox({
     <div className="panel fail">
       <div className="fail-head">
         <span className="tag critical">Failed</span>
-        <h3>{stage ? `${label} didn't finish` : "This scan didn't finish"}</h3>
+        <h3>{step ? `${label} didn't finish` : "This scan didn't finish"}</h3>
         <div className="fail-actions">
           <button className="rerun primary-rerun" onClick={onRerunAll} disabled={running || checking}>
             {running ? 'Rerunning…' : '↻ Rerun scan'}
           </button>
-          {stage && (
+          {step && (
             <button className="rerun" onClick={onRetry} disabled={running || checking}>
               {running ? 'Retrying…' : '↻ Retry this step'}
             </button>
