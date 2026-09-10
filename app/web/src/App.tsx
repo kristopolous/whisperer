@@ -15,7 +15,7 @@ import { OutboxPanel } from './components/OutboxPanel.tsx';
 import { QueuePanel } from './components/QueuePanel.tsx';
 import { SettingsPanel } from './components/SettingsPanel.tsx';
 import { StatCards, type OverviewTab } from './components/StatCards.tsx';
-import { api, apiUrl, cleanName, normalize, siteOf } from './lib.ts';
+import { api, apiUrl, cleanName, fmtAgo, normalize, siteOf } from './lib.ts';
 
 /** `defects` was called `health`, and sat fifth. Finding a real complaint,
  *  reading it against real code and patching it is what this product is for —
@@ -104,12 +104,19 @@ export function App() {
   const [stage, setStage] = useState<Stage>('queued');
   const [log, setLog] = useState<LogLine[]>([]);
   const [running, setRunning] = useState(false);
-  const [rig, setRig] = useState<{ servers: string[]; model: string } | null>(null);
+  const [rig, setRig] = useState<{
+    servers: string[];
+    model: string;
+    dist?: { stale: boolean; builtAt: string | null; editedAt: string | null };
+  } | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('defects');
   const [rerunningStage, setRerunningStage] = useState<Stage | null>(null);
   /** What was just put in the queue, so a click that enqueues is not silent. */
   const [queuedNote, setQueuedNote] = useState<string | null>(null);
+  /** The queue, polled. Declared here because both the header indicator and
+   *  the per-button disabled test read it, and both run during render. */
+  const [jobs, setJobs] = useState<{ scanId: string; stages: Stage[]; state: string; company?: string; stage?: Stage }[]>([]);
   /** Whether anything is running, readable synchronously inside a callback —
    *  the state closure is a render behind, and this decides whether a click
    *  starts work or joins the line. */
@@ -458,14 +465,44 @@ useEffect(() => {
    *
    *  A job with no stages is a full scan and therefore covers everything. */
   const askedFor = (stages: Stage[]): boolean => {
-    if (rerunningStage !== null && stages.includes(rerunningStage)) return true;
+    // `rerunningStage` is this PAGE's direct run, and it carries no scan of its
+    // own — so testing it unqualified disabled the same buttons on every
+    // property. Starting a run on GIMP left it set, and switching to Bolt then
+    // read as "this work is already in flight here", which is exactly the
+    // global shading this was meant to remove. `ownRun` is the run this page
+    // started and it knows which scan that was.
+    if (ownRun?.id === scan.id && rerunningStage !== null && stages.includes(rerunningStage)) {
+      return true;
+    }
     return jobs.some((job) =>
       job.scanId === scan.id
       && (job.state === 'queued' || job.state === 'running')
       && (job.stages.length === 0 || stages.every((stage) => job.stages.includes(stage))));
   };
 
-  const busyRuns = (runs ?? []).filter((run) => run.status === 'running');
+  /** Everything in flight, from both places that know about it.
+   *
+   *  The scans list flips a record to `running` when its stage handler writes,
+   *  which can lag; the job list knows the moment the queue picks one up. Either
+   *  alone leaves a gap — a queue-started run is invisible in the first for a
+   *  while, and a run started directly from this page never appears in the
+   *  second at all. */
+  const busyRuns = (() => {
+    const byId = new Map<string, { id: string; company: string; stage: Scan['stage'] }>();
+    for (const job of jobs) {
+      if (job.state !== 'running') continue;
+      byId.set(job.scanId, {
+        id: job.scanId,
+        company: job.company ?? runs?.find((r) => r.id === job.scanId)?.company ?? '',
+        stage: (job.stage ?? 'queued') as Scan['stage'],
+      });
+    }
+    for (const run of runs ?? []) {
+      if (run.status !== 'running') continue;
+      if (!byId.has(run.id)) byId.set(run.id, { id: run.id, company: run.company, stage: run.stage });
+    }
+    return [...byId.values()];
+  })();
   busyRef.current = busyRuns.length > 0 || running || rerunningStage !== null;
 
   useEffect(() => {
@@ -485,22 +522,31 @@ useEffect(() => {
    *  That is the same failure the queue was built to end: a job that starts in
    *  four minutes and a job that silently never started must not look alike,
    *  and the rail is where somebody looks for a property. */
-  const [jobs, setJobs] = useState<{ scanId: string; stages: Stage[]; state: string }[]>([]);
+
   useEffect(() => {
     let live = true;
     const read = () => {
-      api<{ waiting: number; jobs: { scanId: string; stages: Stage[]; state: string }[] }>('api/jobs')
+      api<{ waiting: number; jobs: { scanId: string; stages: Stage[]; state: string; company?: string; stage?: Stage }[] }>('api/jobs')
         .then((data) => {
           if (!live) return;
           setWaiting(data.waiting);
           setJobs(data.jobs ?? []);
         })
         .catch(() => {});
+      // The scans list on the same tick.
+      //
+      // It was fetched once on mount and then only when something happened to
+      // call refresh() — so the "running" indicator, which reads from it, did
+      // not appear until you navigated away and back, because navigating is
+      // what happened to refresh it. A run starting on the server is not an
+      // event this page receives unless it opened the stream itself, and a
+      // queued run never opens one here at all.
+      refresh();
     };
     read();
     const timer = setInterval(read, 5_000);
     return () => { live = false; clearInterval(timer); };
-  }, []);
+  }, [refresh]);
 
   /** Put an ask in the queue and say so. */
   const queueInstead = useCallback(async (
@@ -723,6 +769,15 @@ useEffect(() => {
         );
       })()}
 
+      {rig?.dist?.stale && (
+        <div className="stale-build" role="status">
+          <b>These assets are stale.</b> This port serves the built bundle in
+          {' '}<code>app/web/dist</code>, last built {rig.dist.builtAt ? fmtAgo(rig.dist.builtAt) : 'at some point'}
+          {' '}— the source changed since. Run <code>npm run build</code>, or use the Vite dev
+          server on <code>:5173</code> for live reload.
+        </div>
+      )}
+
       <header className="masthead">
         <div className="wordmark">Whis<span>·</span>perer</div>
         <div className="masthead-tag">reputation forensics</div>
@@ -892,7 +947,6 @@ useEffect(() => {
                 <button
                   className="headline"
                   onClick={() => setTab('defects')}
-                  disabled={running}
                   title="Read the source against a defect, write a patch, and run the tests"
                 >
                   ⚒ Patch bugs

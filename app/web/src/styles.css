@@ -2523,3 +2523,23 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   .mnav-g { font-size: 15px; }
   .mnav-sep { margin: 0 3px; }
 }
+
+/* Served-code-is-older-than-source. Loud on purpose: every minute spent looking
+   for a bug that was already fixed starts here. */
+.stale-build {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  padding: 8px 28px;
+  background: color-mix(in srgb, var(--warning) 20%, var(--paper));
+  border-bottom: 1px solid var(--warning);
+  font: 500 12px var(--body);
+  color: var(--ink);
+}
+.stale-build code {
+  font: 500 11.5px var(--mono);
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+}
+@media (max-width: 640px) { .stale-build { padding: 8px 14px; } }

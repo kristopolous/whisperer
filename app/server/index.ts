@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import cors from 'cors';
 import express from 'express';
@@ -65,6 +65,10 @@ app.get('/api/health', (_req, res) => {
     // product", which is the one conclusion this tool must never reach by
     // accident.
     search: { braveQuotaSpent: braveExhausted() },
+    // So the dashboard can say it too. A warning only in the terminal is a
+    // warning for whoever started the process, not for whoever is looking at
+    // the screen and wondering why their change is not there.
+    dist: staleDist(),
   });
 });
 
@@ -1502,12 +1506,60 @@ app.post('/api/scans/:id/issues/:issueId/confirm', async (req, res) => {
 });
 
 const DIST = path.resolve(import.meta.dirname, '../web/dist');
+const WEB_SRC = path.resolve(import.meta.dirname, '../web/src');
+
+/** Are the built assets older than the source they were built from?
+ *
+ *  This port serves `app/web/dist` — the output of `npm run build`. `npm run
+ *  dev` does not write to it; it starts Vite on 5173 with its own hot reload.
+ *  So editing a stylesheet and reloading this port shows the previous build,
+ *  with nothing anywhere saying so, and the obvious conclusion is that the edit
+ *  did not work. That is the same failure as a long-lived process serving code
+ *  from whenever it started: the fix is applied, the screen disagrees, and the
+ *  time goes into looking for a bug that is not there.
+ *
+ *  Compared by modification time, deepest file wins. Cheap enough to do at
+ *  startup and on every health check, which is what lets the dashboard say it
+ *  rather than only the terminal.
+ */
+function newestMtime(dir: string, depth = 0): number {
+  if (depth > 6 || !existsSync(dir)) return 0;
+  let newest = 0;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+    const full = path.join(dir, entry.name);
+    const at = entry.isDirectory() ? newestMtime(full, depth + 1) : statSync(full).mtimeMs;
+    if (at > newest) newest = at;
+  }
+  return newest;
+}
+
+export function staleDist(): { stale: boolean; builtAt: string | null; editedAt: string | null } {
+  const index = path.join(DIST, 'index.html');
+  if (!existsSync(index)) return { stale: false, builtAt: null, editedAt: null };
+  const built = newestMtime(DIST);
+  const edited = newestMtime(WEB_SRC);
+  return {
+    stale: edited > built,
+    builtAt: built ? new Date(built).toISOString() : null,
+    editedAt: edited ? new Date(edited).toISOString() : null,
+  };
+}
+
 if (existsSync(DIST)) {
   app.use(express.static(DIST));
   // The dashboard routes on the hash, but a deep link or a refresh still has
   // to land on index.html rather than a 404.
   app.get(/^(?!\/api\/).*/, (_req, res) => res.sendFile(path.join(DIST, 'index.html')));
   console.log(`serving dashboard from ${DIST}`);
+  const dist = staleDist();
+  if (dist.stale) {
+    console.warn(
+      `WARNING: app/web/dist is older than app/web/src — this port serves the BUILT assets, and\n`
+      + `         they were built at ${dist.builtAt}, while the source changed at ${dist.editedAt}.\n`
+      + `         Run \`npm run build\`, or use the Vite dev server on :5173 for live reload.`,
+    );
+  }
 }
 
 const port = Number(process.env.PORT ?? 8791);
