@@ -33,6 +33,15 @@ export interface RepoConfig {
    *  GitLab mirror of a GitHub repo. Include the query that selects the right
    *  product: `https://bugs.kde.org/rest/bug?product=krita`. */
   tracker?: string;
+  /** Set when somebody has established there is no source to read.
+   *
+   *  A real answer, and one that has to be storable. Most products people
+   *  complain about are closed, and without this the resolve step's guess keeps
+   *  coming back: bolt.new resolves to `stackblitz/bolt.new`, which exists, is
+   *  public, and is not the product — so every visit offers to read a codebase
+   *  that cannot contain the defect. Recording "no" stops the offer and stops
+   *  it being re-guessed. */
+  noSource?: boolean;
 }
 
 /** What is known about a company's project, and where each part came from.
@@ -54,6 +63,21 @@ export interface Project {
   discovered: { url?: string; tracker?: string };
   /** What will actually be used, field by field. */
   effective: { url?: string; tracker?: string; path?: string; testCommand?: string };
+  /** Whether there is code to read, where it is, and how sure we are.
+   *
+   *  The thing the defect screen has to know before offering to read the
+   *  source. `discovered` is the case that matters: the resolve step found a
+   *  repository with the right name, which for a closed product is routinely
+   *  something adjacent — an SDK, an open-source predecessor, a community
+   *  client — and reading it produces a confident diagnosis of the wrong
+   *  codebase. */
+  code: {
+    state: 'workspace' | 'specified' | 'discovered' | 'declared-none' | 'unknown';
+    /** The checkout directory or repository URL, when there is one. */
+    at?: string;
+    /** Said in the interface, so nobody has to infer it from a badge. */
+    why: string;
+  };
   /** Where each effective value came from.
    *
    *  Three origins, not two, and the third is the one that was being
@@ -87,9 +111,30 @@ export function projectFor(company: string, discovered: { repo?: string } = {}):
     return fallback ? 'default' : 'none';
   };
 
+  const code = ((): Project['code'] => {
+    if (specified.path) {
+      return { state: 'workspace', at: specified.path, why: 'a checkout you pointed at' };
+    }
+    if (specified.noSource) {
+      return { state: 'declared-none', why: 'you recorded that this product has no source to read' };
+    }
+    if (specified.url) {
+      return { state: 'specified', at: specified.url, why: 'the repository you set' };
+    }
+    if (discovered.repo) {
+      return {
+        state: 'discovered',
+        at: discovered.repo,
+        why: 'found by name, and not confirmed — check it is this product and not something adjacent',
+      };
+    }
+    return { state: 'unknown', why: 'no repository was found and none was set' };
+  })();
+
   return {
     company,
     specified,
+    code,
     discovered: { url: discovered.repo || undefined, tracker: undefined },
     effective: {
       url,
@@ -118,9 +163,17 @@ export function patchProject(company: string, changes: Partial<Omit<RepoConfig, 
   );
   const entry: RepoConfig = index === -1 ? { company: company.trim() } : raw.value.repos[index]!;
 
-  const fields = entry as unknown as Record<string, string | undefined>;
+  const fields = entry as unknown as Record<string, string | boolean | undefined>;
   for (const [key, value] of Object.entries(changes)) {
     if (key === 'company') continue;
+    // Booleans are stored as booleans. Passing `noSource` through the trim
+    // below would turn `false` into the string "false", which is truthy — so
+    // un-declaring "no source" would have declared it harder.
+    if (typeof value === 'boolean') {
+      if (value) fields[key] = true;
+      else delete fields[key];
+      continue;
+    }
     const trimmed = String(value ?? '').trim();
     if (trimmed) fields[key] = trimmed;
     else delete fields[key];

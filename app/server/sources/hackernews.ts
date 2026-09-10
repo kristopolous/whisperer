@@ -106,12 +106,15 @@ export interface HnOptions {
 export async function searchHackerNews(
   brand: string, emit: (level: 'info' | 'warn', text: string) => void, options: HnOptions = {},
 ): Promise<Mention[]> {
-  const days = options.days === undefined ? 365 : options.days;
+  // Callers pass the window; the default is the caller's problem to set. The
+  // index goes back to 2007 and returns all of it for nothing, which is a
+  // different question from what belongs in a brand watch.
+  const days = options.days === undefined ? 550 : options.days;
   const since = days ? Math.floor(Date.now() / 1000) - days * 86_400 : null;
   // Everything the window holds, rather than a slice of it. A busy subject
   // yields several hundred; a quiet one yields what it yields, and asking for
   // more costs nothing extra.
-  const limit = options.limit ?? 1_000;
+  const limit = options.limit ?? 3_000;
 
   const collected: Mention[] = [];
   const seen = new Set<string>();

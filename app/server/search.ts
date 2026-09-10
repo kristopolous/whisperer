@@ -396,7 +396,7 @@ async function mcpSearch(
  *  Cached queries never reach here — the cache is consulted before any of this
  *  — so the budget is spent only on genuinely new questions.
  */
-const SEARCH_BUDGET = Number(process.env.SEARCH_BUDGET ?? 240);
+const SEARCH_BUDGET = Number(process.env.SEARCH_BUDGET ?? 900);
 
 /** A deep run is allowed to spend more. Without this the budget simply becomes
  *  the new ceiling and the extra rungs are refused one by one — the cap would

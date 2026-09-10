@@ -175,10 +175,24 @@ export function StatCards({
       // complaint-biased queries — not a random draw from everyone who has an
       // opinion. Printing "+0.03" alone invites reading it as "the public feels
       // slightly positive", which it cannot support at any N.
+      // "not scored yet" is what every one of these situations looked like, and
+      // they are not the same situation: a stage that never ran, one that ran
+      // and died, one that ran over an empty corpus, and one still going. Only
+      // the first is "yet". The scan already records which — `timings.buzz` is
+      // written whether the stage succeeded or failed, and `failedStage` says
+      // which way — so the card can say it instead of shrugging.
       line: scored === 0
-        ? 'not scored yet'
+        ? (scan.failedStage === 'buzz'
+          ? `scoring failed — ${(scan.error ?? 'no reason recorded').slice(0, 60)}`
+          : mentions.length === 0
+            ? 'nothing was found to score'
+            : done('buzz')
+              ? `scoring ran over ${mentions.length} mentions and returned nothing`
+              : stage === 'buzz'
+                ? `scoring ${mentions.length} mentions now…`
+                : `${mentions.length} mentions collected, not scored yet`)
         : `${direction === 'flat' ? 'holding' : direction} · n=${scored}`,
-      tone: scored === 0 ? 'mid' : scan.net.now >= 0 ? 'pos' : 'neg',
+      tone: scored === 0 ? (scan.failedStage === 'buzz' ? 'neg' : 'mid') : scan.net.now >= 0 ? 'pos' : 'neg',
       from: 'buzz',
       ready: scored > 0,
     },

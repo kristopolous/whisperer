@@ -189,19 +189,22 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
         break;
       }
       case 'discovery': {
-        scan.mentions = await findMentions(scan.company, scan.site, scan.profiles, log, scan.subject);
+        scan.mentions = await findMentions(
+          scan.company, scan.site, scan.profiles, log, scan.subject,
+          (corpus) => { scan.mentions = corpus; store.put(scan); },
+        );
         log('info', `${scan.mentions.length} mentions, ${scan.mentions.filter((m) => m.date).length} of them dated`);
         send({ type: 'patch', scan: { mentions: scan.mentions } });
         break;
       }
       case 'feed': {
-        scan.feed = await findFeed(scan.company, scan.site, scan.profiles, log, scan.subject);
+        scan.feed = await findFeed(scan.company, scan.site, scan.profiles, log, scan.subject, () => store.put(scan));
         log('info', `feed: ${scan.feed.length} latest items, newest first`);
         send({ type: 'patch', scan: { feed: scan.feed } });
         break;
       }
       case 'buzz': {
-        const buzz = await scoreBuzz(scan.company, scan.mentions, log);
+        const buzz = await scoreBuzz(scan.company, scan.mentions, log, () => store.put(scan));
         scan.mentions = buzz.mentions;
         scan.verdict = buzz.verdict;
         scan.buzz = buildBuzz(scan.mentions);
@@ -234,7 +237,14 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
         break;
       }
       case 'health': {
-        scan.issues = await findIssues(scan.company, scan.mentions, log);
+        // Appended, not replaced: triage now reads only the complaints it has
+        // not seen, so a rerun adds to the docket rather than rebuilding it.
+        const found = await findIssues(scan.company, scan.mentions, log, () => store.put(scan));
+        const known = new Set((scan.issues ?? []).map((i) => i.title.toLowerCase()));
+        scan.issues = [
+          ...(scan.issues ?? []),
+          ...found.filter((issue) => !known.has(issue.title.toLowerCase())),
+        ];
         log('info', `${scan.issues.length} issues catalogued`);
         send({ type: 'patch', scan: { issues: scan.issues } });
         break;

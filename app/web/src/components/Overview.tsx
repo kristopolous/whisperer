@@ -8,11 +8,17 @@ import { fmtMonth, fmtScore } from '../lib.ts';
  *  sentiment read. The headline figures live above the tabs in <StatCards/>,
  *  so they stay on screen whatever tab is open. */
 export function Overview({
-  scan, cursor, onScrub,
+  scan, cursor, onScrub, onSearchDeeper, busy,
 }: {
   scan: Scan;
   cursor: string | null;
   onScrub: (bucket: string | null) => void;
+  /** Widen the corpus every panel here reads. Offered from the empty states,
+   *  where "nothing was said" and "not enough was collected" are
+   *  indistinguishable from the outside. */
+  onSearchDeeper?: () => void;
+  /** True while a run is in flight. */
+  busy?: boolean;
 }) {
   const { mentions = [], issues = [] } = scan;
   const buzz = scan.buzz ?? [];
@@ -88,7 +94,7 @@ export function Overview({
                   : 'stated moves · none'}
               </span>
             </div>
-            <MigrationFlow migrations={scan.migrations} />
+            <MigrationFlow migrations={scan.migrations} onSearchDeeper={onSearchDeeper} busy={busy} />
           </div>
         </section>
       )}

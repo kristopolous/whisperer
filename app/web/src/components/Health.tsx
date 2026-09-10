@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
-import type { FixStep, Issue, Mention, Scan, Tracker } from '../../../shared/types.ts';
-import { api, apiUrl, fmtDate, venueOf } from '../lib.ts';
+import { useCallback, useEffect, useState } from 'react';
+import type { FixStep, Issue, Mention, Scan, Stage, Tracker } from '../../../shared/types.ts';
+import { api, apiUrl, fmtAgo, fmtDate, venueOf } from '../lib.ts';
 import type { DefectHistory, Series } from '../../../server/series.ts';
 import { Filter, matches } from './Filter.tsx';
 import { ResolutionLoop } from './ResolutionLoop.tsx';
@@ -41,19 +41,16 @@ function Delta({ series }: { series: Series | null }) {
   );
 }
 
-export function Health({ scan, onChange, onScan }: {
+export function Health({ scan, onChange, onScan, onRerun, busy }: {
   scan: Scan;
   onChange: (issue: Issue) => void;
   onScan: (changes: Partial<Scan>) => void;
+  /** Go and look again — from the empty state, where "nothing is wrong" and
+   *  "we did not read enough" are indistinguishable from the outside. */
+  onRerun?: (stages: Stage[], deep?: boolean) => void;
+  busy?: boolean;
 }) {
   const [query, setQuery] = useState('');
-  const all = [...scan.issues].sort(
-    (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity),
-  );
-  const issues = all.filter((i) => matches(query, i.title, i.summary, i.impact, i.kind, i.severity));
-  const [selected, setSelected] = useState(issues[0]?.id);
-  const issue = issues.find((i) => i.id === selected) ?? issues[0];
-
   // What this company's earlier runs said. A defect list is a snapshot; the
   // reason to look at it every morning is what moved, and that only exists
   // across runs.
@@ -68,6 +65,61 @@ export function Health({ scan, onChange, onScan }: {
   const history: Record<string, DefectHistory> = Object.fromEntries(
     (series?.defects ?? []).filter((d) => d.state !== 'gone').map((d) => [d.id, d]),
   );
+
+  /** What a defect's severity is worth now, as opposed to when it was written.
+   *
+   *  Severity is assigned once, by a model reading complaints, and then never
+   *  revisited — so a "critical" sits at the top of the list forever on the
+   *  strength of a week that has long passed. If it were critical and still
+   *  unfixed, people would still be saying so; silence for two months is
+   *  evidence about the claim, not just about the calendar.
+   *
+   *  Recurrence overrides age. A defect the series has seen in consecutive runs
+   *  is being hit repeatedly, and that is the opposite of stale — it keeps
+   *  whatever it was given no matter how long it has been going on.
+   */
+  const standing = (issue: Issue): { severity: Issue['severity']; why?: string } => {
+    const declared = issue.severity;
+    const recurring = (history[issue.id]?.streak ?? 0) > 1;
+    const at = issue.lastSeen ?? issue.firstSeen;
+    if (recurring || !at || declared === 'good') return { severity: declared };
+
+    const weeks = Math.floor((Date.now() - new Date(at).getTime()) / (7 * 86_400_000));
+    const steps = weeks >= 12 ? 2 : weeks >= 6 ? 1 : 0;
+    if (steps === 0) return { severity: declared };
+
+    const rank = Math.min(
+      SEVERITY_ORDER.indexOf(declared) + steps,
+      SEVERITY_ORDER.indexOf('warning'),
+    );
+    const now = SEVERITY_ORDER[rank] ?? declared;
+    if (now === declared) return { severity: declared };
+    return {
+      severity: now,
+      why: `filed ${declared}, but nobody has mentioned it in ${weeks} weeks — `
+        + 'still unfixed and still quiet is evidence it is not ' + declared,
+    };
+  };
+
+  // Freshest first, severity second.
+  //
+  // Sorting by severity alone put a critical from last spring above an outage
+  // reported yesterday, which is the wrong way round for a screen somebody
+  // opens to find out what is happening now — an old bug is either fixed,
+  // known, or nobody cares. Severity still decides between two things reported
+  // the same week, which is what it is actually good at.
+  const week = (issue: Issue) => {
+    const at = issue.lastSeen ?? issue.firstSeen;
+    if (!at) return 0;
+    return Math.floor((Date.now() - new Date(at).getTime()) / (7 * 86_400_000));
+  };
+  const all = [...scan.issues].sort(
+    (a, b) => week(a) - week(b)
+      || SEVERITY_ORDER.indexOf(standing(a).severity) - SEVERITY_ORDER.indexOf(standing(b).severity),
+  );
+  const issues = all.filter((i) => matches(query, i.title, i.summary, i.impact, i.kind, i.severity));
+  const [selected, setSelected] = useState(issues[0]?.id);
+  const issue = issues.find((i) => i.id === selected) ?? issues[0];
 
   useEffect(() => { if (issues.length && !issues.some((i) => i.id === selected)) setSelected(issues[0].id); },
     [scan.id, issues.length]);
@@ -135,16 +187,23 @@ export function Health({ scan, onChange, onScan }: {
         <div className="empty">
           <h3>No defects found in {scan.mentions.length} mentions</h3>
           <p>
-            Triage read the highest-ranked complaints and none pointed at a reproducible defect — what
-            came up was opinion or preference rather than something that can be fixed.
+            Nothing triage read pointed at a reproducible defect
+            {complaints > 0
+              ? ` — though ${complaints} mention${complaints === 1 ? '' : 's'} read as a complaint, `
+                + 'which is worth disbelieving this for.'
+              : '.'}
           </p>
-          {complaints > 0 && (
-            <p>
-              {complaints} mention{complaints === 1 ? '' : 's'} did read as a complaint, so that is
-              worth a second look rather than taking at face value. They are listed under Discovery,
-              complaints first.
-            </p>
-          )}
+          {/* The action, not just the caveat. "Worth a second look" with no way
+              to take one is a shrug — and triage runs on what discovery
+              collected, so looking again means widening that first. */}
+          <div className="actions">
+            <button className="primary" disabled={busy} onClick={() => onRerun?.(['health'])}>
+              {busy ? 'Reading…' : 'Read the complaints again'}
+            </button>
+            <button className="ghost" disabled={busy} onClick={() => onRerun?.(['discovery', 'buzz', 'health'], true)}>
+              ⤓ Search wider, then triage
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -173,10 +232,20 @@ export function Health({ scan, onChange, onScan }: {
             >
               <div className="t">{i.title}</div>
               <div className="m">
-                <span className={`tag ${i.severity}`}>{i.severity}</span>
+                {(() => {
+                  const now = standing(i);
+                  return (
+                    <span className={`tag ${now.severity}`} title={now.why ?? i.severity}>
+                      {now.severity}
+                      {now.why && <span className="tag-was">was {i.severity}</span>}
+                    </span>
+                  );
+                })()}
                 <span className="tag plain">{i.kind}</span>
+                {/* When, before how many. On a terminal the age is the first
+                    thing worth knowing about a defect. */}
                 <span style={{ font: '400 10.5px var(--mono)', color: 'var(--ink-3)' }}>
-                  {i.evidence.length} {i.evidence.length === 1 ? 'report' : 'reports'}
+                  {fmtAgo(i.lastSeen ?? i.firstSeen) ?? 'undated'} · {i.evidence.length}
                 </span>
                 {/* How long this has been true, which is the only thing on the
                     row that a second run can tell you and a first cannot. */}
@@ -242,6 +311,131 @@ function Provenance({ scan, issue }: { scan: Scan; issue: Issue }) {
           {missing.length} cited {missing.length === 1 ? 'source is' : 'sources are'} not in this scan.
         </p>
       )}
+    </div>
+  );
+}
+
+interface ProjectCode {
+  state: 'workspace' | 'specified' | 'discovered' | 'declared-none' | 'unknown';
+  at?: string;
+  why: string;
+}
+
+/** Where the code is, stated and changeable.
+ *
+ *  This is a setting, not a readout. What the resolve step found is a
+ *  suggestion — for a closed product it routinely finds something adjacent, and
+ *  bolt.new resolves to `stackblitz/bolt.new`, which exists, is public, and is
+ *  not the product people are complaining about. Offering to read that is worse
+ *  than offering nothing, because the diagnosis comes back confident.
+ *
+ *  So the guess is shown as a guess, in the place where the action is, with
+ *  every alternative next to it: point it somewhere else, point it at a local
+ *  checkout, or say there is no source. All three are answers, and all three
+ *  are remembered against the company so nothing re-guesses next run.
+ */
+function CodeSource({ scan, onScan }: { scan: Scan; onScan: (changes: Partial<Scan>) => void }) {
+  const [code, setCode] = useState<ProjectCode | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [url, setUrl] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    api<{ code: ProjectCode }>(`api/scans/${scan.id}/project`)
+      .then((p) => setCode(p.code))
+      .catch(() => {});
+  }, [scan.id]);
+  useEffect(load, [load, scan.workspace]);
+
+  const save = async (changes: Record<string, unknown>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const p = await api<{ code: ProjectCode }>(`api/scans/${scan.id}/project`, {
+        method: 'PUT', body: JSON.stringify(changes),
+      });
+      setCode(p.code);
+      setEditing(false);
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, '').slice(0, 200));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!code) return null;
+
+  const LABEL: Record<ProjectCode['state'], string> = {
+    workspace: 'a local checkout',
+    specified: 'the repository you set',
+    discovered: 'a guess',
+    'declared-none': 'no source',
+    unknown: 'not known',
+  };
+
+  return (
+    <div className={`codesrc${code.state === 'discovered' ? ' unconfirmed' : ''}`}>
+      <div className="codesrc-head">
+        <strong>Source code</strong>
+        <span className={`tag ${code.state === 'declared-none' || code.state === 'unknown' ? 'warning' : code.state === 'discovered' ? 'plain' : 'good'}`}>
+          {LABEL[code.state]}
+        </span>
+        {!editing && (
+          <button className="ghost" onClick={() => { setEditing(true); setUrl(code.at ?? ''); }}>
+            Change
+          </button>
+        )}
+      </div>
+
+      {code.at
+        ? <div className="codesrc-at"><code>{code.at}</code></div>
+        : null}
+      <p className="q">{code.why}</p>
+
+      {/* A guess is offered for confirmation rather than acted on. One click
+          makes it the answer and it stops being re-derived every run. */}
+      {code.state === 'discovered' && !editing && (
+        <div className="actions">
+          <button className="primary" disabled={busy} onClick={() => save({ url: code.at })}>
+            Yes, that is this product
+          </button>
+          <button className="ghost" disabled={busy} onClick={() => save({ noSource: true, url: '' })}>
+            No — closed source
+          </button>
+        </div>
+      )}
+
+      {code.state === 'declared-none' && !editing && (
+        <div className="actions">
+          <button className="ghost" disabled={busy} onClick={() => save({ noSource: false })}>
+            Undo — there is source after all
+          </button>
+        </div>
+      )}
+
+      {editing && (
+        <div className="actions">
+          <input
+            className="conn-url"
+            value={url}
+            spellCheck={false}
+            placeholder="https://github.com/owner/repo"
+            onChange={(e) => setUrl(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') void save({ url: url.trim(), noSource: false }); }}
+          />
+          <button className="primary" disabled={busy} onClick={() => save({ url: url.trim(), noSource: false })}>
+            Save
+          </button>
+          <button className="ghost" disabled={busy} onClick={() => setEditing(false)}>Cancel</button>
+          <button className="ghost" disabled={busy} onClick={() => save({ noSource: true, url: '' })}>
+            There is no source
+          </button>
+        </div>
+      )}
+
+      {error && <p className="conn-err">{error}</p>}
+      <WorkspacePicker scan={scan} onScan={onScan} />
     </div>
   );
 }
@@ -449,14 +643,8 @@ function Report({ scan, issue, onChange, onScan }: {
 
       <Provenance scan={scan} issue={issue} />
 
-      <WorkspacePicker scan={scan} onScan={onScan} />
-      {!hasRepo ? (
-        <p className="q">
-          No public repository is known for <b>{scan.company}</b>, and no workspace checkout is
-          selected — so there is nothing to read this against yet. Pick one above, or add the
-          repository to <code>config/repos.json</code>.
-        </p>
-      ) : (
+      <CodeSource scan={scan} onScan={onScan} />
+      {!hasRepo ? null : (
         /* Its own block, not a row of buttons.
          * This is the thing the product is for — reading a stranger's complaint
          * against real code and coming back with a patch — and it was rendering

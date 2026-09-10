@@ -33,6 +33,7 @@ import { describeError } from './errors.ts';
 import { performScan } from './run.ts';
 import { listSchedule, removeEntry, runningNow, startScheduler, upsert } from './schedule.ts';
 import { listCredits, setLedger } from './credits.ts';
+import { cancelJob, enqueue, listJobs, queueDepth, setRunner, type Job } from './queue.ts';
 import { add as addProfile, applyOverrides, block, overridesFor, unblock } from './presence-overrides.ts';
 import { LANGUAGES } from './languages.ts';
 import { buildPayload } from './trackers.ts';
@@ -294,6 +295,60 @@ app.put('/api/credentials', async (req, res) => {
  *  it is being demoed the free grants are the whole budget — so the number
  *  belongs on the screen, not in four separate vendor consoles. */
 app.get('/api/credits', (_req, res) => res.json(listCredits()));
+
+/* ---------------------------------------------------------------- jobs ---
+ *
+ *  Asking for work now queues it. The previous behaviour refused a second ask
+ *  outright, so the intent was lost — and let two companies run at once, where
+ *  they shared one search budget and both came back thin. */
+app.get('/api/jobs', (_req, res) => res.json({ jobs: listJobs(), waiting: queueDepth() }));
+
+app.post('/api/jobs', (req, res) => {
+  const { scanId, stages, depth, languages, dig } = (req.body ?? {}) as {
+    scanId?: string; stages?: Stage[]; depth?: 'deep' | 'normal'; languages?: string[]; dig?: string;
+  };
+  const scan = scanId ? store.get(scanId) : undefined;
+  if (!scan) return res.status(404).json({ error: 'no such scan' });
+
+  const wanted = (stages ?? []).filter((stage) => (STAGE_KEYS as string[]).includes(stage));
+  const job = enqueue(scan.id, scan.company, wanted, { depth, languages, dig });
+  res.status(202).json({ job, waiting: queueDepth() });
+});
+
+app.delete('/api/jobs/:id', (req, res) => {
+  if (!cancelJob(req.params.id)) {
+    return res.status(409).json({ error: 'that job has already started — stop the scan instead' });
+  }
+  res.json({ jobs: listJobs(), waiting: queueDepth() });
+});
+
+/** How the queue performs a job: the same paths a watched run takes, with the
+ *  events going to the scan's own log rather than to a socket. */
+setRunner(async (job: Job, onStage) => {
+  const scan = store.get(job.scanId);
+  if (!scan) throw new Error('the scan was deleted before its job ran');
+
+  const lock = store.claim(scan.id, `queued ${job.stages.join('+') || 'scan'}`);
+  if (!lock.ok) throw new Error(`busy with ${lock.held.what}`);
+
+  const log: Log = (level, text) => {
+    scan.log.push({ at: new Date().toISOString(), level, stage: scan.stage, text });
+  };
+
+  store.patch(scan.id, { startedAt: new Date().toISOString(), status: 'running' });
+  try {
+    for (const stage of job.stages.length ? job.stages : STAGE_KEYS) {
+      onStage(stage);
+      await runStage({
+        scan, log, send: () => {}, dig: job.options.dig,
+      }, stage);
+    }
+    scan.status = 'done';
+    store.put(scan);
+  } finally {
+    store.release(scan.id, `queued ${job.stages.join('+') || 'scan'}`);
+  }
+});
 
 /* ------------------------------------------------------------- presence --
  *
@@ -700,7 +755,32 @@ function openStream(res: import('express').Response, onEvent: (event: ScanEvent)
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
-  return (event: ScanEvent) => { onEvent(event); res.write(`data: ${JSON.stringify(event)}\n\n`); };
+
+  // Losing the watcher must not touch the work.
+  //
+  // A run outlives the page that started it, on purpose: a scan is minutes of
+  // model time and somebody closing a laptop, locking a phone or driving into a
+  // tunnel is not a decision to abandon it. Nothing here cancels — the only way
+  // to stop a run is to ask for it — but the writes have to stop, because
+  // writing to a socket nobody is holding raises an error event on the
+  // response, and an unhandled one of those takes down the process that is
+  // doing the work.
+  let watching = true;
+  const drop = () => { watching = false; };
+  res.on('close', drop);
+  res.on('error', drop);
+
+  return (event: ScanEvent) => {
+    // The listener runs either way. It is what feeds the scan's own log and the
+    // agent-run records, which are the things that survive the disconnect.
+    onEvent(event);
+    if (!watching || res.writableEnded) return;
+    try {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    } catch {
+      watching = false;
+    }
+  };
 }
 
 /**
@@ -974,10 +1054,13 @@ app.put('/api/scans/:id/project', (req, res) => {
   if (!scan) return res.status(404).json({ error: 'no such scan' });
 
   const body = req.body ?? {};
-  const changes: Record<string, string> = {};
+  const changes: Record<string, string | boolean> = {};
   for (const field of ['url', 'tracker', 'testCommand'] as const) {
     if (typeof body[field] === 'string') changes[field] = body[field];
   }
+  // "There is no source" is an answer, not an empty field — it has to be
+  // storable or the resolve step's guess comes back every run.
+  if (typeof body.noSource === 'boolean') changes.noSource = body.noSource;
   if (Object.keys(changes).length === 0) {
     return res.status(400).json({ error: 'nothing to change' });
   }

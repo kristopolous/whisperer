@@ -19,7 +19,13 @@ import { fmtDate, venueOf } from '../lib.ts';
  *  separately and hatched, because a stated intention is not a migration and
  *  folding the two together inflates churn.
  */
-export function MigrationFlow({ migrations }: { migrations: Migration[] }) {
+export function MigrationFlow({ migrations, onSearchDeeper, busy }: {
+  migrations: Migration[];
+  /** Widen the corpus this panel reads. */
+  onSearchDeeper?: () => void;
+  /** True while that is happening, so the button says so. */
+  busy?: boolean;
+}) {
   const [open, setOpen] = useState<string | null>(null);
 
   const rows = useMemo(() => {
@@ -51,9 +57,18 @@ export function MigrationFlow({ migrations }: { migrations: Migration[] }) {
       <div className="empty">
         <h3>Nobody said they moved</h3>
         <p>
-          No one in the collected discussion stated a switch in either direction. That is a
-          finding rather than a gap — migrations are only counted when somebody actually says so.
+          Nothing in the corpus states a switch either way. That is only as good as the corpus —
+          say so and it will look harder.
         </p>
+        {/* An empty state that cannot be argued with is a shrug. The corpus is
+            the input to this panel, so "nothing found" and "not enough was
+            collected" look identical from here, and only the person reading it
+            knows which one they believe. */}
+        {onSearchDeeper && (
+          <button className="primary" onClick={onSearchDeeper} disabled={busy}>
+            {busy ? 'Looking…' : '⤓ Go look harder'}
+          </button>
+        )}
       </div>
     );
   }

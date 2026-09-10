@@ -272,10 +272,8 @@ function Credits() {
         <span className="tag plain">what the searching costs</span>
       </div>
       <p className="set-desc">
-        Every paid request is counted here as it happens, and a provider with nothing left is
-        skipped rather than asked — an exhausted account answers with a refusal that still costs a
-        round trip. Correct a figure by typing what the provider&apos;s own console says; the tally
-        drifts whenever a response is lost.
+        Correct a figure by typing what the provider&apos;s own console says; the tally drifts
+        whenever a response is lost.
       </p>
 
       {error && <div className="set-message err" style={{ padding: '0 16px 10px' }}>{error}</div>}

@@ -246,7 +246,7 @@ export async function searchReddit(
   emit?: (level: 'info' | 'warn', text: string) => void,
   options: RedditOptions = {},
 ): Promise<Mention[] | null> {
-  const { perAlias = 500, threads = 25, target = 1000, exclude = [], site = '', discovered = [] } = options;
+  const { perAlias = 1_500, threads = 40, target = 3_000, exclude = [], site = '', discovered = [] } = options;
   if (!redditReady()) {
     emit?.('info', 'reddit: no credentials, so its own API was not asked (search still covers reddit.com)');
     return null;

@@ -152,9 +152,44 @@ export function escapeControlChars(json: string): string {
   return out;
 }
 
+/** The first complete JSON value in a string.
+ *
+ *  Brace-matched rather than sliced. Taking everything from the first `{` to the
+ *  last `}` is right when there is one value and some prose around it, and
+ *  wrong the moment a model emits two — `{...}{...}` becomes one string with a
+ *  brace in the middle, which fails as "Unexpected non-whitespace character
+ *  after JSON". A retry hits the same shape because it is how that model
+ *  answers, not a fluke.
+ *
+ *  String-aware, so a `}` inside a quoted value does not end the scan early. */
+function firstJsonValue(text: string): string | null {
+  const start = text.search(/[{[]/);
+  if (start === -1) return null;
+
+  const open = text[start]!;
+  const close = open === '{' ? '}' : ']';
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\' && inString) { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === open) depth += 1;
+    else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
 /** Models wrap JSON in prose or fences often enough that this is not optional,
  *  even with a grammar applied. */
-function parseJson<T>(raw: string): T {
+export function parseJson<T>(raw: string): T {
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
   const body = fenced ? fenced[1]! : raw;
   const start = body.search(/[{[]/);
@@ -171,6 +206,21 @@ function parseJson<T>(raw: string): T {
     try {
       return JSON.parse(escapeControlChars(slice)) as T;
     } catch {
+      // Still no. Try the first complete value on its own — the case where the
+      // model answered twice, and the slice above welded both answers into one
+      // malformed string.
+      const first = firstJsonValue(body);
+      if (first && first !== slice) {
+        try {
+          return JSON.parse(first) as T;
+        } catch {
+          try {
+            return JSON.parse(escapeControlChars(first)) as T;
+          } catch {
+            // Fall through to the original error.
+          }
+        }
+      }
       // The original error, because it says what was wrong with what the model
       // produced — with the text attached, so the next failure of this kind is
       // read rather than deduced from a character offset.

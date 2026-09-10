@@ -47,6 +47,16 @@ export interface Mention {
   /** -1 (hostile) .. +1 (delighted) */
   score: number;
   themes: string[];
+  /** Whether complaint triage has already read this one, so a rerun costs the
+   *  difference rather than the corpus. */
+  triaged?: boolean;
+  /** Whether the disambiguation pass has read this one.
+   *
+   *  Persisted so a rerun costs the difference rather than the corpus. A
+   *  mention that was judged to be about this product does not stop being
+   *  about it, and re-asking was most of what made repairing anything mean
+   *  re-running everything. */
+  subjectChecked?: boolean;
   /** Whether the sentiment pass actually judged this one.
    *
    *  Needed because a mention scored a genuine, considered 0.0 and a mention
@@ -312,6 +322,9 @@ export interface BuzzPoint {
 /** One entry in the live feed: the latest thing that surfaced about a company
  *  — a new YouTube video, a comment, a post — with what and when. */
 export interface FeedItem {
+  /** Whether the quality pass has read this one — see Mention.subjectChecked
+   *  for why this is stored rather than recomputed. */
+  judged?: boolean;
   id: string;
   venue: Venue;
   /** What kind of thing surfaced — a video upload, a comment, or a post. */
@@ -512,6 +525,11 @@ export interface ReviewScore {
   url: string;
   /** From the review site's own page, rather than someone quoting it. */
   firstParty: boolean;
+  /** The site itself published this number, read from the page's own structured
+   *  data — as opposed to the number having been parsed out of a search
+   *  result's snippet, which is a guess about what a site says rather than what
+   *  it says. Unverified scores are not shown. */
+  verified?: boolean;
   /** The sentence it was read out of, so a wrong number is traceable. */
   quote: string;
   kind: ReviewKind;

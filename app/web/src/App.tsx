@@ -12,6 +12,7 @@ import { SourcesView } from './components/Sources.tsx';
 import { RunDashboard, type RunSummary } from './components/RunDashboard.tsx';
 import { AgentsPanel } from './components/AgentsPanel.tsx';
 import { OutboxPanel } from './components/OutboxPanel.tsx';
+import { QueuePanel } from './components/QueuePanel.tsx';
 import { SettingsPanel } from './components/SettingsPanel.tsx';
 import { StatCards, type OverviewTab } from './components/StatCards.tsx';
 import { api, apiUrl, cleanName, normalize, siteOf } from './lib.ts';
@@ -58,9 +59,9 @@ function hashFor(id: string, tab: Tab): string {
  *  nothing about what was on screen: a reload from Settings — or ctrl+R, or a
  *  restored session, or sending someone the link — landed back on the scan
  *  view. They are real destinations, so they get real routes. */
-const VIEWS = ['settings', 'agents', 'outbox'] as const;
+const VIEWS = ['settings', 'agents', 'outbox', 'queue'] as const;
 type View = (typeof VIEWS)[number];
-const VIEW_RE = /^#\/(settings|agents|outbox)\b/i;
+const VIEW_RE = /^#\/(settings|agents|outbox|queue)\b/i;
 
 function parseView(): View | null {
   const m = window.location.hash.match(VIEW_RE);
@@ -88,6 +89,17 @@ function fmtElapsed(ms: number): string {
 export function App() {
   const [input, setInput] = useState('');
   const [runs, setRuns] = useState<RunSummary[]>([]);
+  /** When this page last heard anything from a run. A stage can legitimately go
+   *  quiet for a minute; quiet for ten is the difference between working and
+   *  stuck, and nothing on screen could tell those apart. */
+  const [lastEventAt, setLastEventAt] = useState<number>(() => Date.now());
+  /** The scan this page started, and the stage it is on.
+   *
+   *  Held by id rather than read off the scan being viewed. Runs are
+   *  property-centric and outlive the page: starting one on Replit and then
+   *  opening Bolt had the indicator rename the running job to Bolt, because it
+   *  was describing the screen instead of the work. */
+  const [ownRun, setOwnRun] = useState<{ id: string; company: string; stage?: Stage } | null>(null);
   const [scan, setScan] = useState<Scan>(BLANK);
   const [stage, setStage] = useState<Stage>('queued');
   const [log, setLog] = useState<LogLine[]>([]);
@@ -100,6 +112,7 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showAgents, setShowAgents] = useState(false);
   const [showOutbox, setShowOutbox] = useState(false);
+  const [showQueue, setShowQueue] = useState(false);
   // Elapsed clocks: runStart/stageStart are wall-clock instants (ms) each set
   // when a run or a stage kicks off; clock is the live tick repainted every
   // second so a long, silent stage still visibly moves instead of looking hung.
@@ -112,6 +125,7 @@ export function App() {
     setShowSettings(view === 'settings');
     setShowAgents(view === 'agents');
     setShowOutbox(view === 'outbox');
+    setShowQueue(view === 'queue');
   }, []);
 
   /** Open a full-page view by navigating to it.
@@ -146,8 +160,10 @@ export function App() {
   // rather than about one company's results, and it stays useful — arguably is
   // most useful — when a scan has just failed and there is nothing to show.
   const openOutbox = useCallback(() => openView('outbox'), [openView]);
+  const openQueue = useCallback(() => openView('queue'), [openView]);
 
   const closeOutbox = closeView;
+  const closeQueue = closeView;
 
   const openAgents = useCallback(() => openView('agents'), [openView]);
 
@@ -315,6 +331,7 @@ useEffect(() => {
     source.current = stream;
 
     stream.onmessage = (message) => {
+      setLastEventAt(Date.now());
       const event = JSON.parse(message.data) as ScanEvent;
       if (event.type === 'stage') { setStage(event.stage); setStageStart(Date.now()); }
       if (event.type === 'log') setLog((l) => [...l.slice(-200), event.line]);
@@ -392,9 +409,61 @@ useEffect(() => {
    *  The target scan id is read from the selection ref rather than the state
    *  closure: the ref is set synchronously the instant a site is picked in the
    *  rail, so a rerun can never hit a different site than the one highlighted. */
+  // The server is the authority on what is running.
+  //
+  // Local `running` is set when a stream opens and cleared when it settles — so
+  // a stream that stalls without erroring leaves it true forever, the snackbar
+  // never goes away and every Rerun button stays disabled. The runs list is
+  // already polled; if it says nothing is in flight and nothing has arrived on
+  // the wire for a while, believe it.
+  useEffect(() => {
+    if (!running && rerunningStage === null) return;
+    const anyRunning = (runs ?? []).some((r) => r.status === 'running');
+    if (anyRunning) return;
+    if (Date.now() - lastEventAt < 30_000) return;
+    setRunning(false);
+    setRerunningStage(null);
+  }, [runs, running, rerunningStage, lastEventAt]);
+
+  // The server is the authority on what is running.
+  //
+  // Local `running` is set when a stream opens and cleared when it settles, so
+  // a stream that dies without erroring leaves it true forever: the snackbar
+  // never clears and every Rerun button stays disabled. The runs list is polled
+  // anyway — if it says nothing is in flight and nothing has come over the wire
+  // for half a minute, believe it.
+  useEffect(() => {
+    if (!running && rerunningStage === null) return;
+    if ((runs ?? []).some((r) => r.status === 'running')) return;
+    if (Date.now() - lastEventAt < 30_000) return;
+    setRunning(false);
+    setRerunningStage(null);
+  }, [runs, running, rerunningStage, lastEventAt]);
+
+  // Anything the server says is in flight, whichever scan it belongs to.
+  // `runs` is refreshed on a timer already, so this costs nothing extra.
+  const busyRuns = (runs ?? []).filter((run) => run.status === 'running');
+
+  // How many jobs are waiting, for the header badge. Polled with the runs list
+  // rather than on its own timer — a queue that moves without saying so is the
+  // thing this is meant to fix.
+  const [waiting, setWaiting] = useState(0);
+  useEffect(() => {
+    let live = true;
+    const read = () => {
+      api<{ waiting: number }>('api/jobs')
+        .then((data) => { if (live) setWaiting(data.waiting); })
+        .catch(() => {});
+    };
+    read();
+    const timer = setInterval(read, 5_000);
+    return () => { live = false; clearInterval(timer); };
+  }, []);
+
   const rerun = useCallback(async (stages: Stage[], options?: { depth?: 'deep' | 'normal'; languages?: string[]; dig?: string }) => {
     const target = scanIdRef.current;
     if (!target || stages.length === 0) return;
+    setOwnRun({ id: target, company: cleanName(scan.company), stage: stages[0] });
     source.current?.close();
     setRerunningStage(stages[0]);
     setRunning(true);
@@ -428,6 +497,7 @@ useEffect(() => {
           ]);
         };
         stream.onmessage = (message) => {
+          setLastEventAt(Date.now());
           const event = JSON.parse(message.data) as ScanEvent;
           if (event.type === 'log') setLog((l) => [...l.slice(-200), event.line]);
           if (event.type === 'patch') {
@@ -528,15 +598,63 @@ useEffect(() => {
 
   return (
     <>
+      {/* Work started from halfway down a page needs to say so where the click
+          happened. The run panel lives above the tabs, which is off-screen from
+          any empty state that offers an action. */}
+      {/* Every run in flight, named by the company it belongs to. Server truth
+          first, so a run somebody else started — or one this page started and
+          then navigated away from — is still accounted for. */}
+      {(() => {
+        const live = busyRuns.map((r) => ({ id: r.id, company: cleanName(r.company), stage: r.stage }));
+        const shown = live.length === 0 && ownRun && (running || rerunningStage !== null)
+          ? [{ ...ownRun, stage: rerunningStage ?? ownRun.stage }]
+          : live;
+        if (shown.length === 0) return null;
+        return (
+          <div className="snack" role="status">
+            {shown.map((run) => (
+              <button key={run.id} className="snack-run" onClick={() => open(run.id)}>
+                <span className="lamp busy" />
+                <b>{run.company || 'Scan'}</b>
+                {run.stage ? ` · ${STAGES.find((s) => s.key === run.stage)?.label ?? run.stage}` : ''}
+              </button>
+            ))}
+          </div>
+        );
+      })()}
+
       <header className="masthead">
         <div className="wordmark">Whis<span>·</span>perer</div>
         <div className="masthead-tag">reputation forensics</div>
         <div className="rig">
-          <span className={`lamp ${running ? 'busy' : rig ? 'live' : ''}`} />
+          {/* What is running, anywhere.
+              A scan keeps going on the server whether or not this page is
+              watching it, and every Rerun button in the app disables while one
+              is in flight — so without this a dimmed button has no visible
+              cause, on a tab that may not even be the scan that is busy. */}
+          {busyRuns.map((run) => (
+            <button
+              key={run.id}
+              className="running-now"
+              onClick={() => open(run.id)}
+              title={`${run.company} is running ${run.stage} — click to watch it`}
+            >
+              <span className="lamp busy" />
+              {run.company} · {run.stage}
+            </button>
+          ))}
+          {busyRuns.length === 0 && <span className={`lamp ${running ? 'busy' : rig ? 'live' : ''}`} />}
           <span className="rig-model" title={rig ? `${rig.model} · ${rig.servers.length} connectors` : 'no api'}>
             {rig ? `${rig.model} · ${rig.servers.length} connectors` : 'no api'}
           </span>
           <button className="logout" onClick={openAgents} title="Agents and their runs">agents</button>
+          <button className="logout" onClick={openQueue} title="What is running and what is waiting">
+            queue
+            {/* A badge, not a number appended to the word. Work waiting is a
+                thing to notice from across the room; set in the header's own
+                muted type it read as part of the label. */}
+            {waiting > 0 && <span className="badge">{waiting}</span>}
+          </button>
           <button className="logout" onClick={openOutbox} title="Replies drafted but never sent">outbox</button>
           <button className="logout" onClick={openSettings} title="Connector API keys">settings</button>
           <button className="logout" onClick={logout} title="Sign out">sign out</button>
@@ -553,7 +671,9 @@ useEffect(() => {
         />
 
         <main className="shell dash-main">
-          {showOutbox ? (
+          {showQueue ? (
+            <QueuePanel onClose={closeQueue} onOpenScan={open} />
+          ) : showOutbox ? (
             <OutboxPanel onClose={closeOutbox} />
           ) : showAgents ? (
             <AgentsPanel onClose={closeAgents} />
@@ -660,7 +780,7 @@ useEffect(() => {
           )}
 
           {running && (
-            <div className="panel">
+            <div className="panel runbar-sticky">
               <div className="runbar">
                 <div className="run-head">
                   <div className="run-title">
@@ -675,6 +795,14 @@ useEffect(() => {
                     <span className="run-clock-box">
                       <span className="clock-label">this stage</span>
                       <span className={`clock-time ${clock - stageStart > 10 * 60_000 ? 'warn' : ''}`}>{fmtElapsed(clock - stageStart)}</span>
+                    </span>
+                    {/* Silence is the only symptom of a stuck stage, so it is
+                        measured rather than left to be felt. */}
+                    <span className="run-clock-box">
+                      <span className="clock-label">last output</span>
+                      <span className={`clock-time ${clock - lastEventAt > 120_000 ? 'warn' : ''}`}>
+                        {fmtElapsed(clock - lastEventAt)}
+                      </span>
                     </span>
                     <span className="run-clock-box">
                       <span className="clock-label">total</span>
@@ -771,6 +899,8 @@ useEffect(() => {
                     scan={scan}
                     cursor={cursor}
                     onScrub={setCursor}
+                    onSearchDeeper={() => rerun(['discovery', 'buzz'], { depth: 'deep' })}
+                    busy={running || rerunningStage !== null}
                   />
                 )}
 
@@ -778,7 +908,6 @@ useEffect(() => {
                   <section>
                     <div className="rubric">
                       <h2>Sources</h2>
-                      <p>Accounts found on the site, and what to sweep.</p>
                       <button
                         className="rerun"
                         onClick={() => rerun(rerunStageFor('presence')!)}
@@ -795,7 +924,6 @@ useEffect(() => {
                   <section>
                     <div className="rubric">
                       <h2>Discovery</h2>
-                      <p>Everything public said about them, and where.</p>
                       <button
                         className="rerun"
                         onClick={() => rerun(rerunStageFor('discovery')!)}
@@ -824,7 +952,6 @@ useEffect(() => {
                   <section>
                     <div className="rubric">
                       <h2>Feed</h2>
-                      <p>The latest videos, comments and posts coming in about the company — with the source, the text, and a link (or the video itself) to go look.</p>
                       <button
                         className="rerun"
                         onClick={() => rerun(rerunStageFor('feed')!)}
@@ -841,7 +968,6 @@ useEffect(() => {
                   <section>
                     <div className="rubric">
                       <h2>Defects</h2>
-                      <p>Public complaints triaged into things that can actually be fixed — then read against the source and patched.</p>
                       <button
                         className="rerun"
                         onClick={() => rerun(rerunStageFor('defects')!)}
@@ -856,6 +982,8 @@ useEffect(() => {
                         setScan((s) => ({ ...s, issues: s.issues.map((i) => (i.id === issue.id ? issue : i)) }))
                       }
                       onScan={(changes) => setScan((s) => ({ ...s, ...changes }))}
+                      onRerun={(stages, deep) => rerun(stages, deep ? { depth: 'deep' } : undefined)}
+                      busy={running || rerunningStage !== null}
                     />
                   </section>
                 )}
@@ -864,7 +992,6 @@ useEffect(() => {
                   <section>
                     <div className="rubric">
                       <h2>Project</h2>
-                      <p>Where this company's code and issues actually are.</p>
                     </div>
                     <ProjectPanel scan={scan} />
                   </section>
@@ -878,7 +1005,6 @@ useEffect(() => {
                   <section className="card-stack">
                     <div className="rubric">
                       <h2>Integrity</h2>
-                      <p>Impersonation, scams and other misuse of the brand.</p>
                       <button
                         className="rerun"
                         onClick={() => rerun(rerunStageFor('integrity')!)}

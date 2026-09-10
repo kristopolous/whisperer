@@ -86,11 +86,6 @@ export function AgentsPanel({ onClose }: { onClose?: () => void }) {
       )}
       <div className="rubric">
         <h2>Agents</h2>
-        <p>
-          Every agent is defined in <code>app/server/agents/</code> as plain data — instructions, output
-          schema, connectors — and run from here directly. The same definitions export to TrueForge with{' '}
-          <code>npm run setup</code>, so going back to a platform is a command, not a rewrite.
-        </p>
       </div>
 
       {error && <div className="set-message err" style={{ padding: '12px 16px' }}>{error}</div>}
@@ -101,7 +96,6 @@ export function AgentsPanel({ onClose }: { onClose?: () => void }) {
           <AgentGroup
             title="In the pipeline"
             badge="fired by a scan"
-            hint="These run automatically, in stage order, every time a scan goes."
             rows={pipeline}
             open={open}
             onToggle={(name) => setOpen(open === name ? null : name)}
@@ -109,10 +103,6 @@ export function AgentsPanel({ onClose }: { onClose?: () => void }) {
           <AgentGroup
             title="Saved, not in the pipeline"
             badge="on demand"
-            hint={
-              'Kept because they are worth firing by hand. The retrieval they used to do is done '
-              + 'deterministically now, so zero runs here is expected rather than a failure.'
-            }
             rows={saved}
             open={open}
             onToggle={(name) => setOpen(open === name ? null : name)}
@@ -159,8 +149,8 @@ export function AgentsPanel({ onClose }: { onClose?: () => void }) {
 }
 
 function AgentGroup(
-  { title, badge, hint, rows, open, onToggle }:
-  { title: string; badge: string; hint: string; rows: AgentRow[]; open: string | null; onToggle: (name: string) => void },
+  { title, badge, rows, open, onToggle }:
+  { title: string; badge: string; rows: AgentRow[]; open: string | null; onToggle: (name: string) => void },
 ) {
   if (rows.length === 0) return null;
 
@@ -170,7 +160,6 @@ function AgentGroup(
         <strong>{title}</strong>
         <span className="tag plain">{badge}</span>
       </div>
-      <p className="set-desc">{hint}</p>
       <div className="conn-list">
         {rows.map((agent) => {
           const { stats } = agent;

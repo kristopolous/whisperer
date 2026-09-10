@@ -83,7 +83,7 @@ export async function searchGithubIssues(
   emit: (level: 'info' | 'warn', text: string) => void,
   options: GithubSearchOptions = {},
 ): Promise<Mention[]> {
-  const limit = options.limit ?? 60;
+  const limit = options.limit ?? 300;
   const own = (options.ownRepo ?? '').toLowerCase();
 
   // The phrase is quoted so a two-word brand is matched as a phrase, and the

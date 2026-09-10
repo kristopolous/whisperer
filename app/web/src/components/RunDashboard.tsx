@@ -8,6 +8,11 @@ export interface RunSummary {
   company: string;
   site: string;
   createdAt: string;
+  /** When the work currently on this record began, and when each stage last
+   *  finished. The rail reads these rather than `createdAt`, which is when the
+   *  row first appeared and never moves again. */
+  startedAt?: string;
+  pulledAt?: Partial<Record<Scan['stage'], string>>;
   status: Scan['status'];
   stage: Scan['stage'];
   error?: string;
@@ -19,6 +24,23 @@ export interface RunSummary {
 }
 
 const STAGE_KEYS: Stage[] = ['presence', 'discovery', 'buzz', 'health', 'abuse'];
+
+/** When this company was last actually looked at.
+ *
+ *  Not `createdAt`, which is when the record was minted and never moves again —
+ *  so a company scanned an hour ago still read "4d" because that is when the row
+ *  first appeared. The rail is asked "which of these is stale", and a stage
+ *  rerun is the commonest way something stops being stale.
+ *
+ *  The latest of: this run's start, and the last time any stage finished. */
+function lastRunAt(run: { createdAt: string; startedAt?: string; pulledAt?: Record<string, string | undefined> }): string {
+  const stamps = [
+    run.createdAt,
+    run.startedAt,
+    ...Object.values(run.pulledAt ?? {}),
+  ].filter((at): at is string => Boolean(at));
+  return stamps.sort().at(-1) ?? run.createdAt;
+}
 
 const fmtScore = (n: number) => (n > 0 ? '+' : n < 0 ? '−' : '') + Math.abs(n).toFixed(2);
 const cleanSite = (site: string) => (site ? site.replace(/^https?:\/\//, '') : '');
@@ -135,7 +157,7 @@ export function RunDashboard({
                 className={`tag ${run.status === 'done' ? 'plain' : run.status === 'error' ? 'critical' : 'warning'}`}
                 title={new Date(run.createdAt).toLocaleString()}
               >
-                {run.status === 'done' ? (fmtAgo(run.createdAt) ?? 'done') : run.status}
+                {run.status === 'done' ? (fmtAgo(lastRunAt(run)) ?? 'done') : run.status}
               </span>
             </span>
           </button>

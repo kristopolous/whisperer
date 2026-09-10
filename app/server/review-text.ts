@@ -112,6 +112,51 @@ export function reviewsFrom(html: string, limit = 6): ReviewSnippet[] {
     .slice(0, limit);
 }
 
+/** The site's own aggregate rating, from its JSON-LD.
+ *
+ *  This is the number the site publishes about itself. Everything on the
+ *  scorecard used to be read out of a search result's snippet — a rating found
+ *  in text near the word "Capterra" is not Capterra's rating, and printing it
+ *  as one is a claim we cannot support. Where the page states it, that is what
+ *  should be shown; where it does not, we should say so rather than fall back
+ *  to the snippet and hope.
+ */
+export function aggregateFrom(html: string): { rating: number; scale: number; count: number | null } | null {
+  if (!html) return null;
+
+  for (const block of html.matchAll(
+    /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
+  )) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(block[1]!.trim());
+    } catch {
+      continue;
+    }
+
+    const queue: unknown[] = [parsed];
+    for (let guard = 0; queue.length && guard < 400; guard += 1) {
+      const node = queue.shift();
+      if (Array.isArray(node)) { queue.push(...node); continue; }
+      if (!node || typeof node !== 'object') continue;
+      const record = node as Node;
+
+      const agg = record.aggregateRating as Node | undefined;
+      if (agg) {
+        const rating = Number(agg.ratingValue);
+        const scale = Number(agg.bestRating) || 5;
+        const count = Number(agg.reviewCount ?? agg.ratingCount);
+        // A rating outside its own scale is a misparse, not a score.
+        if (Number.isFinite(rating) && rating >= 0 && scale > 0 && rating <= scale) {
+          return { rating, scale, count: Number.isFinite(count) && count > 0 ? count : null };
+        }
+      }
+      for (const value of Object.values(record)) if (value && typeof value === 'object') queue.push(value);
+    }
+  }
+  return null;
+}
+
 /** Reviews out of the markdown a scraper returns.
  *
  *  The fallback, and only reached when the JSON-LD is gone. Trustpilot blocks a

@@ -98,6 +98,7 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
   // a company can be loved by software buyers and hated by its own staff —
   // but it belongs on the card, not in the page structure.
   const ordered = KIND_ORDER.flatMap((kind) => reviews.filter((r) => r.kind === kind));
+  const [open, setOpen] = useState<string | null>(null);
 
   return (
     <div className="panel">
@@ -105,41 +106,72 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
         <strong>Public scores</strong>
         <span className="tag plain">{reviews.length} sites</span>
       </div>
-      <p className="set-desc">
-        What this company scores where buyers, customers and staff go to look. Read from search
-        results rather than scraped — these sites block that — so each one links back and carries
-        the sentence it came from.
-      </p>
 
-      <div className="score-row">
+      {/* A score with nothing under it is a number to take on trust, which is
+          the one thing this product exists not to ask. Each row carries the
+          reviews it was calculated from, and says plainly when it could not get
+          them — "we could not read them" and "there are none" are different
+          facts and both beat a bare figure. */}
+      <div className="scores">
         {ordered.map((r) => {
           const share = r.rating / r.scale;
+          const recent = r.recent ?? [];
+          const showing = open === r.site + r.url;
           return (
-            <a
-              key={r.site + r.url}
-              className="score"
-              href={r.url}
-              target="_blank"
-              rel="noreferrer"
-              title={[
-                KIND_LABEL[r.kind],
-                r.count ? `${r.count.toLocaleString()} reviews` : 'review count not stated',
-                r.firstParty ? 'from the site itself' : 'quoted second-hand',
-                r.quote,
-              ].filter(Boolean).join(' · ')}
-              data-tone={share >= 0.8 ? 'good' : share >= 0.6 ? 'mid' : 'bad'}
-            >
-              {/* One row: name, then score. The four stacked lines made each
-                  site a card three lines tall for two facts — and this panel is
-                  read by scanning down the numbers, which a column of blocks
-                  actively prevents. The audience and the review count moved to
-                  the title, where they are there when questioned and cost no
-                  height when not. */}
-              <span className="score-site">{r.site}</span>
-              <span className="score-value">
-                {r.rating}<span className="score-scale">/{r.scale}</span>
-              </span>
-            </a>
+            <div key={r.site + r.url} className="score-line">
+              <button
+                className="score-head"
+                onClick={() => setOpen(showing ? null : r.site + r.url)}
+                data-tone={share >= 0.8 ? 'good' : share >= 0.6 ? 'mid' : 'bad'}
+              >
+                <span className="score-site">{r.site}</span>
+                <span className="score-value">
+                  {r.rating}<span className="score-scale">/{r.scale}</span>
+                </span>
+                <span className="conn-meta">
+                  {KIND_LABEL[r.kind]}
+                  {r.count ? ` · ${r.count.toLocaleString()} reviews` : ''}
+                  {!r.firstParty ? ' · quoted second-hand' : ''}
+                </span>
+                <span className={`tag ${recent.length ? 'plain' : 'warning'}`}>
+                  {recent.length
+                    ? `${showing ? 'hide' : 'read'} ${recent.length}`
+                    : r.firstParty ? 'reviews unreadable' : 'no page to read'}
+                </span>
+              </button>
+
+              {showing && recent.length > 0 && (
+                <ul className="revs">
+                  {recent.map((review, i) => (
+                    <li key={i}>
+                      <div className="revs-head">
+                        {typeof review.rating === 'number' && (
+                          <span className={`tag ${review.rating <= 2 ? 'critical' : review.rating <= 3 ? 'warning' : 'good'}`}>
+                            {review.rating}/5
+                          </span>
+                        )}
+                        <span className="conn-meta">{review.date ? fmtDate(review.date) : 'undated'}</span>
+                        {review.author && <span className="conn-meta">{review.author}</span>}
+                        <a href={r.url} target="_blank" rel="noreferrer" className="conn-meta">open</a>
+                      </div>
+                      {review.title && <div className="revs-title">{review.title}</div>}
+                      <p className="revs-body">{review.body}</p>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {showing && recent.length === 0 && (
+                <p className="q score-none">
+                  {r.firstParty
+                    ? 'The page loaded but no reviews could be read out of it — these sites serve a '
+                      + 'sign-in wall to anything that is not a browser.'
+                    : 'This score was quoted by another site rather than read from the review site '
+                      + 'itself, so there is no page of reviews behind it.'}
+                  {' '}<a href={r.url} target="_blank" rel="noreferrer">Open it</a>.
+                </p>
+              )}
+            </div>
           );
         })}
       </div>

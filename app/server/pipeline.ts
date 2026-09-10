@@ -37,6 +37,16 @@ import {
 const ROOT = path.resolve(import.meta.dirname, '../..');
 
 export type Log = (level: LogLevel, text: string) => void;
+
+/** Save what has been done so far.
+ *
+ *  Called after every batch of every long stage. Without it a stage was
+ *  all-or-nothing: work was held in memory and written once at the end, so a
+ *  disconnect, a restart or a model outage forty minutes in threw away forty
+ *  minutes of finished work and the next attempt began from nothing. With it,
+ *  plus the "skip what is already done" checks in each stage, a rerun costs the
+ *  remainder rather than the corpus. */
+export type Checkpoint = () => void;
 type Emit = Log;
 
 const formatBytes = (n: number) => (n < 1024 ? `${n} B` : `${Math.round(n / 1024)} kB`);
@@ -333,10 +343,25 @@ function isWrongSubject(hit: SearchHit, exclude: string[]): boolean {
   });
 }
 
-/** How far back still counts as current for a brand watch. A year is the outer
- *  edge of useful: a complaint from thirteen months ago has either been fixed
- *  or has stopped being news. */
-const RECENT_MONTHS = 12;
+/** How far back still counts as current for a brand watch.
+ *
+ *  The one limit here that is about relevance rather than cost, and the only
+ *  kind worth having. Storage is not a constraint and neither is inference, so
+ *  nothing is rationed by volume — but a complaint from 2024 describes a
+ *  product that no longer exists in that form, and putting it next to last
+ *  week's makes the picture worse rather than fuller.
+ *
+ *  Three months, and the last few days are what the screen is really for. This
+ *  is a terminal, not an archive: a product manager opens it to find out what
+ *  changed since yesterday, and a thread from last year sitting in the same
+ *  list makes that harder to see, not easier. Last year's complaint is about a
+ *  product that has since been rewritten, repriced and renamed.
+ *
+ *  Digging into a source deliberately widens it, because asking for the history
+ *  is exactly what that button means — but the history is the exception and
+ *  now is the default. */
+const RELEVANT_MONTHS = Number(process.env.RELEVANT_MONTHS ?? 3);
+const RECENT_MONTHS = RELEVANT_MONTHS;
 
 /** Volume controls, env-overridable because the right numbers depend on both
  *  the subject and the Brave plan.
@@ -352,7 +377,7 @@ const RECENT_MONTHS = 12;
  *  extra page across twenty queries is another twenty seconds of wall clock.
  *  Three pages is the default because it roughly triples the corpus for about a
  *  minute more, and going wider is a plan question, not a code one. */
-const SEARCH_PAGES = Number(process.env.SEARCH_PAGES ?? 6);
+const SEARCH_PAGES = Number(process.env.SEARCH_PAGES ?? 10);
 
 /** What a deep run multiplies the volume caps by.
  *
@@ -367,12 +392,12 @@ const DEEP_FACTOR = Number(process.env.DEEP_FACTOR ?? 4);
 const deeper = (n: number) => (isDeep() ? n * DEEP_FACTOR : n);
 
 /** How many results discovery wants before it stops widening its window. */
-const DISCOVERY_TARGET = Number(process.env.DISCOVERY_TARGET ?? 400);
+const DISCOVERY_TARGET = Number(process.env.DISCOVERY_TARGET ?? 1_500);
 
 /** How many complaint-shaped results to gather before the complaint pass stops
  *  widening. Separate from the general target because this is the half of the
  *  corpus the product actually exists to act on. */
-const COMPLAINT_TARGET = Number(process.env.COMPLAINT_TARGET ?? 300);
+const COMPLAINT_TARGET = Number(process.env.COMPLAINT_TARGET ?? 1_200);
 
 /** How many mentions the corpus keeps.
  *
@@ -385,8 +410,15 @@ const COMPLAINT_TARGET = Number(process.env.COMPLAINT_TARGET ?? 300);
  *  Raising pages costs wall-clock rather than breadth of window: Brave paginates
  *  to ten and rate-limits to one request a second, so each extra page across
  *  thirty queries is another thirty seconds. Six pages is roughly a thousand raw
- *  results before dedup and filtering. Past that it is a Brave plan question. */
-const MENTION_CAP = Number(process.env.MENTION_CAP ?? 1000);
+ *  results before dedup and filtering. Past that it is a Brave plan question.
+ *
+ *  Five thousand, not one thousand. A round number that a real corpus reaches
+ *  is not a cap, it is a floor being mistaken for one — a product with fifty
+ *  million users generates more discussion than that, and cutting there means
+ *  the number on screen describes the cut rather than the company. Rows are
+ *  cheap; only the stages that read them are rationed, and those have their own
+ *  stated budgets. */
+const MENTION_CAP = Number(process.env.MENTION_CAP ?? 5_000);
 
 /** The few questions whose best answers are old by nature. Everything else goes
  *  through the widening recent sweep. */
@@ -457,7 +489,7 @@ const fromOwnCommunity = (m: Mention) => (m.themes ?? []).some((t) => t.startsWi
 const TRIAGE_BATCH = 30;
 /** How many unplaced items to read at most. Each batch is about twenty seconds
  *  of local model time, so this is the ceiling on what the pass can cost. */
-const TRIAGE_CAP = Number(process.env.COMPLAINT_TRIAGE_CAP ?? 90);
+const TRIAGE_CAP = Number(process.env.COMPLAINT_TRIAGE_CAP ?? 3_000);
 
 /* ------------------------------------------------- subject disambiguation --*/
 
@@ -524,11 +556,16 @@ export function compactTokens(company: string, site: string, subject?: Subject):
  *  discovery run over a disambiguation pass would be a bad trade. */
 async function dropWrongSubject(
   company: string, site: string, mentions: Mention[], emit: Emit, subject?: Subject,
+  save: Checkpoint = () => {},
 ): Promise<Mention[]> {
   const settling = settlingTokens(company, site, subject);
   const compacted = compactTokens(company, site, subject);
 
   const ambiguous = mentions.filter((m) => {
+    // Already read on an earlier run. A verdict about what a thread is about
+    // does not expire, and re-asking is what turned "fix one thing" into "redo
+    // the whole stage".
+    if (m.subjectChecked) return false;
     // Its own community already answers the topic question — everything in
     // r/GIMP is about GIMP — so it is never worth paying to ask again.
     if (fromOwnCommunity(m)) return false;
@@ -581,15 +618,19 @@ async function dropWrongSubject(
       });
       for (const verdict of result.verdict ?? []) {
         const mention = batch[verdict.index];
-        if (!mention || verdict.same !== false) continue;
+        if (!mention) continue;
+        // Marked either way: the point is that it has been read.
+        mention.subjectChecked = true;
+        if (verdict.same !== false) continue;
         wrong.add(mention);
         // Said out loud, with the topic the model gave it. A silent filter that
         // removes a third of the corpus is indistinguishable from a search that
         // found nothing, and this is the log line that tells them apart.
         emit('info', `not this subject — "${mention.title.slice(0, 70)}" reads as ${verdict.topic || 'something else'}`);
       }
+      save();
     } catch (error) {
-      emit('warn', `subject check batch failed — ${error instanceof Error ? error.message.slice(0, 100) : 'error'}`);
+      emit('warn', `subject check batch failed — ${describeError(error).slice(0, 100)}`);
     }
   }
 
@@ -601,7 +642,9 @@ async function dropWrongSubject(
   return mentions.filter((m) => !wrong.has(m));
 }
 
-async function triageUnflagged(company: string, mentions: Mention[], emit: Emit): Promise<number> {
+async function triageUnflagged(
+  company: string, mentions: Mention[], emit: Emit, save: Checkpoint = () => {},
+): Promise<number> {
   const flagged = mentions.filter((m) => m.complaint).length;
   if (flagged >= complaintShare()) {
     emit('info', `complaint triage skipped — ${flagged} already flagged, which fills the reading share`);
@@ -666,6 +709,7 @@ async function triageUnflagged(company: string, mentions: Mention[], emit: Emit)
         mention.complaint = true;
         found += 1;
       }
+      save();
     } catch (error) {
       // One failed batch leaves those items unflagged, which is the state they
       // were already in. Never a reason to fail discovery.
@@ -722,6 +766,9 @@ export { resetSearchBudget, searchSpend } from './search.ts';
 
 export async function findMentions(
   company: string, site: string, profiles: Profile[], emit: Emit, subject?: Subject,
+  /** Hand the corpus over as it becomes real, so the long passes that follow
+   *  can be resumed rather than restarted. */
+  save: (corpus: Mention[]) => void = () => {},
 ): Promise<Mention[]> {
   // Venue by venue, as site-scoped queries. No agent decides which of these to
   // run or in what order — they all run, every time, and a failure in one is a
@@ -960,6 +1007,11 @@ export async function findMentions(
       count: 20,
       target: deeper(DISCOVERY_TARGET),
       pages: SEARCH_PAGES,
+      // Day, week, month — and no further unless somebody asked for the
+      // history. The ladder used to end at "last year", so a quiet week pushed
+      // the whole corpus back twelve months and the newest thing on the screen
+      // could be from last spring.
+      ladder: isDeep() ? ['pd', 'pw', 'pm', 'py'] : ['pd', 'pw', 'pm'],
       // A deep run walks every rung to the end rather than stopping at the
       // first one that satisfies the target. That is the whole difference:
       // "last month had enough" is exactly how the last five years stayed
@@ -1113,11 +1165,12 @@ export async function findMentions(
     // limits are right for a nightly run and wrong the moment somebody points
     // at the hole and asks for the history.
     searchHackerNews(brand, emit, dig === 'hackernews'
-      ? { days: null, limit: 3_000 }
-      : { days: 365 }).catch(() => []),
+      // Digging is the request for history, so it drops the window.
+      ? { days: null, limit: 6_000 }
+      : { days: RELEVANT_MONTHS * 31, limit: 3_000 }).catch(() => []),
     searchGithubIssues(brand, emit, dig === 'github'
-      ? { ownRepo: ownRepoOf(subject), limit: 400 }
-      : { ownRepo: ownRepoOf(subject), limit: 40 }).catch(() => []),
+      ? { ownRepo: ownRepoOf(subject), limit: 1_000 }
+      : { ownRepo: ownRepoOf(subject), limit: 300 }).catch(() => []),
     findAppReviews(brand, site, emit, 60).catch(() => []),
     // Reddit through its own API rather than through `site:reddit.com`. Null
     // when there are no credentials, which is not an error — the search path
@@ -1207,10 +1260,13 @@ export async function findMentions(
   // and there is no sense reading an item for what is wrong with it before
   // establishing that it is about this product at all — a well-written
   // complaint about a different Bolt would sail through triage.
-  const onTopic = await dropWrongSubject(company, site, corpus, emit, subject);
+  // The corpus is handed over before the long passes run, so a checkpoint
+  // during them saves real work rather than an empty array.
+  save(corpus);
+  const onTopic = await dropWrongSubject(company, site, corpus, emit, subject, () => save(corpus));
 
   // Before the cut, because the flag is what decides who survives it.
-  await triageUnflagged(company, onTopic, emit);
+  await triageUnflagged(company, onTopic, emit, () => save(onTopic));
 
   const head = onTopic.slice(0, SCORE_BUDGET);
   const share = (pool: Mention[]) => head.filter((m) => pool.includes(m)).length;
@@ -1221,7 +1277,24 @@ export async function findMentions(
     + `${share(searched)} from search`,
   );
 
-  return onTopic.slice(0, deeper(MENTION_CAP));
+  // Old enough not to describe the product any more.
+  //
+  // Requested, stated and countable — not a quiet cut. Undated mentions are
+  // kept: "we could not read a date" is not evidence of age, and dropping them
+  // would silently delete whole venues that never publish one.
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - (isDeep() ? RELEVANT_MONTHS * 2 : RELEVANT_MONTHS));
+  const current = onTopic.filter((m) => !m.date || m.date >= cutoff.toISOString());
+  const stale = onTopic.length - current.length;
+  if (stale) {
+    emit(
+      'info',
+      `dropped ${stale} mention(s) older than ${cutoff.toISOString().slice(0, 7)} — a brand watch is `
+      + `about now, and a complaint from two years ago describes a different product`,
+    );
+  }
+
+  return current.slice(0, deeper(MENTION_CAP));
 }
 
 /* ------------------------------------------------------------------- feed */
@@ -1230,6 +1303,69 @@ export async function findMentions(
  *  posts, newest first — by running the attached search connectors (YouTube
  *  search first). */
 const FEED_QUALITY_BATCH = 20;
+
+/** How many items the model reads. Stated in the log, never silent.
+ *
+ *  The cheap pass below settles most of it for nothing; this bounds what is
+ *  left. Judging all 1,151 items of a real feed was 58 batches and the better
+ *  part of an hour, which is not a stage, it is an outage. */
+const FEED_QUALITY_CAP = Number(process.env.FEED_QUALITY_CAP ?? 5_000);
+
+/** Page furniture, recognised without asking anybody.
+ *
+ *  These are the exact shapes a search engine returns when it indexes a wall
+ *  rather than a page, and they are identical every time — which is what makes
+ *  them a job for a pattern rather than a judgement. Measured on a real Replit
+ *  feed: X's sign-in interstitial, a subreddit's standing welcome message under
+ *  four different thread titles, and a footer of Terms/Privacy/Cookies links.
+ *
+ *  Deliberately narrow. Every pattern here matches boilerplate that a site
+ *  emits verbatim, so a false positive would have to be somebody quoting a
+ *  cookie banner. Anything less certain goes to the model. */
+const CHROME = [
+  /\bsign up with (google|apple)\b/i,
+  /\bsee what.s happening\b/i,
+  /\blog in with username or email\b/i,
+  /\bby signing up, you agree to the\b/i,
+  /welcome to r\/\w+!/i,
+  /noticed today the subreddit is on the community hub/i,
+  /\bterms of service\b.{0,40}\bprivacy policy\b.{0,40}\bcookie\b/i,
+  /\bthis (page|content) (is|isn.t) available\b/i,
+  /\benable javascript( and cookies)? to continue\b/i,
+  /\bcreate an account or sign in\b/i,
+];
+
+/** Titles that are a page's furniture rather than a post: a bare subreddit
+ *  name, an X profile tab. These are certain on the title alone. */
+const CHROME_TITLE = [
+  /^r\/\w+$/i,
+  /\(@[\w.]+\)\s*\/\s*X$/i,
+  /\/\s*(Posts|Highlights|Posts and Replies|Media|Likes)\s*\/\s*X$/i,
+  /^(help|home|search)$/i,
+];
+
+/** How much of the snippet a chrome match has to account for.
+ *
+ *  A page can be real content AND carry furniture — a scraped X post arrives
+ *  with the poster's words followed by the sign-in wall — and matching the wall
+ *  would throw away the post. Measured on a real feed, that was the first item
+ *  in the list: "Replit Agent completely replaced Claude CoWork in my
+ *  day-to-day work", dropped because the same page also said "Log in with
+ *  username or email".
+ *
+ *  So the body patterns only settle it when there is barely anything else
+ *  there. A long snippet with a banner buried in it goes to the model, which
+ *  can tell the difference. */
+const CHROME_ONLY_UNDER = 400;
+
+const looksLikeChrome = (item: FeedItem): boolean => {
+  const headline = (item.headline ?? '').trim();
+  if (CHROME_TITLE.some((pattern) => pattern.test(headline))) return true;
+
+  const snippet = (item.snippet ?? '').trim();
+  if (snippet.length >= CHROME_ONLY_UNDER) return false;
+  return CHROME.some((pattern) => pattern.test(`${headline} ${snippet}`));
+};
 
 /** Drop the items nobody said anything in.
  *
@@ -1244,15 +1380,40 @@ const FEED_QUALITY_BATCH = 20;
  *  Never throws, and on failure keeps everything: a feed with some chrome in it
  *  is worse than a clean one and far better than an empty one.
  */
-async function keepDatapoints(company: string, items: FeedItem[], emit: Emit): Promise<FeedItem[]> {
+async function keepDatapoints(company: string, items: FeedItem[], emit: Emit, save: Checkpoint = () => {}): Promise<FeedItem[]> {
   if (items.length === 0) return items;
 
   const dropped = new Set<FeedItem>();
   let read = 0;
   let unquoted = 0;
 
-  for (let start = 0; start < items.length; start += FEED_QUALITY_BATCH) {
-    const batch = items.slice(start, start + FEED_QUALITY_BATCH);
+  // The cheap pass first, over everything. Same division of labour as the
+  // complaint vocabulary and its triage: patterns settle what is unambiguous
+  // for nothing, and the model is paid only for what is left.
+  const chrome = items.filter(looksLikeChrome);
+  for (const item of chrome) dropped.add(item);
+  if (chrome.length) {
+    emit('info', `feed: ${chrome.length} recognised as sign-in walls or sidebar boilerplate without reading them`);
+  }
+
+  // Newest first, because that is the end of the feed anybody looks at, and
+  // said out loud rather than applied quietly.
+  const remaining = items.filter((item) => !dropped.has(item) && !item.judged);
+  const settled = items.filter((item) => item.judged).length;
+  if (settled) emit('info', `feed: ${settled} were read on an earlier run and are left alone`);
+  const toRead = [...remaining]
+    .sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''))
+    .slice(0, FEED_QUALITY_CAP);
+  if (remaining.length > toRead.length) {
+    emit(
+      'info',
+      `feed: reading the newest ${toRead.length} of ${remaining.length} — the rest are kept unjudged `
+      + `(FEED_QUALITY_CAP)`,
+    );
+  }
+
+  for (let start = 0; start < toRead.length; start += FEED_QUALITY_BATCH) {
+    const batch = toRead.slice(start, start + FEED_QUALITY_BATCH);
     try {
       const result = await runAgent<{ verdict: { index: number; quote?: string; isDatapoint: boolean }[] }>(
         feedQualityAgent,
@@ -1270,6 +1431,7 @@ async function keepDatapoints(company: string, items: FeedItem[], emit: Emit): P
       for (const verdict of result.verdict ?? []) {
         const item = batch[verdict.index];
         if (!item) continue;
+        item.judged = true;
         if (verdict.isDatapoint) {
           // The quote has to be real. Without checking it, "quote first" buys
           // nothing — it is a field the model can fill with anything.
@@ -1280,6 +1442,7 @@ async function keepDatapoints(company: string, items: FeedItem[], emit: Emit): P
         }
         dropped.add(item);
       }
+      save();
     } catch (error) {
       emit('warn', `feed triage batch failed — ${describeError(error).slice(0, 100)}`);
     }
@@ -1298,11 +1461,12 @@ async function keepDatapoints(company: string, items: FeedItem[], emit: Emit): P
 }
 
 /** How many items the feed wants before it stops widening its window. */
-const FEED_TARGET = Number(process.env.FEED_TARGET ?? 400);
-const FEED_CAP = Number(process.env.FEED_CAP ?? 800);
+const FEED_TARGET = Number(process.env.FEED_TARGET ?? 1_500);
+const FEED_CAP = Number(process.env.FEED_CAP ?? 5_000);
 
 export async function findFeed(
   company: string, site: string, profiles: Profile[], emit: Emit, subject?: Subject,
+  save: Checkpoint = () => {},
 ): Promise<FeedItem[]> {
   // The feed is the same deterministic search, biased to fresh things and
   // sorted newest first. YouTube gets its own queries because video is the
@@ -1442,7 +1606,7 @@ export async function findFeed(
 
   emit('info', `feed: ${items.length} items, ${items.filter((item) => item.date).length} dated`);
 
-  const worthShowing = await keepDatapoints(company, items, emit);
+  const worthShowing = await keepDatapoints(company, items, emit, save);
 
   // Dated items first, newest to oldest; undated ones keep search order behind
   // them rather than being dropped.
@@ -1477,8 +1641,12 @@ function normalizeDate(value: string | null | undefined): string | null {
  *  is ranked real-discussion-first then newest-first, is the part worth
  *  reading anyway.
  *
- *  Raise it when pointing at a fast hosted model, where the arithmetic is
- *  completely different. */
+ *  That note said "raise it when pointing at a fast model", and the model here
+ *  runs at thousands of tokens a second — so it is raised. The reading budgets
+ *  in this file were all sized for a slow local model and never revisited, and
+ *  the result was a warehouse of collected discussion with a few hundred rows
+ *  of it actually read. Inference is not the scarce resource here; retrieval
+ *  is, and that is already paid for by the time these run. */
 /** How many mentions the model reads and scores.
  *
  *  Was 60, chosen when a batch held four items and 60 meant fifteen sequential
@@ -1487,23 +1655,41 @@ function normalizeDate(value: string | null | undefined): string | null {
  *  pool it selects from has also grown by an order of magnitude: HN alone
  *  returns 965 items about GIMP in a year, and a scan sees a couple of thousand.
  *  Reading 4% of that and calling it the sentiment was the real cap. */
-const SCORE_BUDGET = Number(process.env.SCORE_BUDGET ?? 180);
+const SCORE_BUDGET = Number(process.env.SCORE_BUDGET ?? 5_000);
 
 export async function scoreBuzz(
-  company: string, mentions: Mention[], emit: Emit,
+  company: string, mentions: Mention[], emit: Emit, save: Checkpoint = () => {},
 ): Promise<{ mentions: Mention[]; verdict: string }> {
   if (mentions.length === 0) return { mentions, verdict: 'No third-party discussion found to score.' };
 
-  // The corpus keeps its order; only the head of it is scored. The unscored
-  // tail stays in the mention list and stays visible in Discovery — it is real
-  // discussion that was found, and hiding it would misrepresent the reach of
-  // the search as the reach of the model.
-  const budgeted = mentions.slice(0, SCORE_BUDGET);
-  if (mentions.length > budgeted.length) {
+  // Only what has not been scored yet.
+  //
+  // This used to re-score the head of the corpus on every run, which made
+  // repairing anything cost the whole stage: raise a budget, fix a bug, add a
+  // source, and the price was reading a thousand mentions again to find the
+  // fifty that were new. A scored mention does not become unscored, so the work
+  // is the difference and nothing else.
+  //
+  // The corpus keeps its order, so the unscored head is taken first. The tail
+  // beyond the budget stays in the list and stays visible in Discovery — it is
+  // real discussion that was found, and hiding it would misrepresent the reach
+  // of the search as the reach of the model.
+  const alreadyScored = mentions.filter((m) => m.scored).length;
+  const budgeted = mentions.filter((m) => !m.scored).slice(0, SCORE_BUDGET);
+
+  if (budgeted.length === 0) {
+    emit('info', `every one of the ${mentions.length} mentions is already scored — nothing to do`);
+    return { mentions, verdict: '' };
+  }
+  if (alreadyScored) {
+    emit('info', `scoring ${budgeted.length} new mentions; ${alreadyScored} were scored on an earlier run`);
+  }
+  const unscored = mentions.length - alreadyScored;
+  if (unscored > budgeted.length) {
     emit(
       'info',
-      `scoring the top ${budgeted.length} of ${mentions.length} mentions — the rest are collected `
-      + `and listed but not scored (SCORE_BUDGET)`,
+      `scoring ${budgeted.length} of ${unscored} unscored — the rest are collected and listed `
+      + `but not scored (SCORE_BUDGET)`,
     );
   }
 
@@ -1620,10 +1806,20 @@ export async function scoreBuzz(
         // there is no way to tell which item was meant, and attaching a score
         // to the wrong mention is worse than leaving one unscored.
         const mention = batch[entry?.index ?? -1];
-        if (mention) scores.set(mention.url, entry);
+        if (!mention) continue;
+        scores.set(mention.url, entry);
+        // Written onto the mention itself, now, rather than collected and
+        // applied at the end. These are the objects the scan holds, so the
+        // checkpoint below persists them — and a run that dies at batch forty
+        // keeps thirty-nine batches of work instead of none.
+        mention.sentiment = entry.sentiment ?? 'neutral';
+        mention.score = clamp(entry.score ?? 0);
+        mention.themes = entry.themes ?? [];
+        mention.scored = true;
       }
       if (verdict) verdicts.push(verdict);
       emit('info', `batch ${index + 1}/${batches.length}: ${(scored ?? []).length} scored`);
+      save();
     } catch (error) {
       // One failed batch leaves those mentions unscored (neutral); it does not
       // cost the batches that worked.
@@ -1635,17 +1831,8 @@ export async function scoreBuzz(
 
   emit('info', `${scores.size}/${mentions.length} mentions scored`);
 
-  const scored = mentions.map((m) => {
-    const hit = scores.get(m.url);
-    if (!hit) return m;
-    return {
-      ...m,
-      sentiment: hit.sentiment ?? 'neutral',
-      score: clamp(hit.score ?? 0),
-      themes: hit.themes ?? [],
-      scored: true,
-    };
-  });
+  // Already applied in place as each batch landed, so the corpus is the result.
+  const scored = mentions;
 
   // One verdict written over the whole corpus, not fifteen batch verdicts glued
   // end to end.
@@ -1698,14 +1885,17 @@ const clamp = (n: number) => Math.max(-1, Math.min(1, Number(n) || 0));
 /* ------------------------------------------------------------------ health */
 
 export async function findIssues(
-  company: string, mentions: Mention[], emit: Emit,
+  company: string, mentions: Mention[], emit: Emit, save: Checkpoint = () => {},
 ): Promise<Issue[]> {
-  // Worst-first, and capped: triage has to emit a full issue object (summary,
-  // impact, evidence, a draft reply) per issue, which is far more output per
-  // input than scoring is. Handing it every complaint at once overruns the
-  // model's output cap and loses the entire stage, so take the most negative
-  // ones — those are the issues worth filing anyway.
-  const MAX_COMPLAINTS = 20;
+  // Worst-first, and effectively uncapped.
+  //
+  // This was twenty. On a corpus of 1,569 mentions holding 443 complaints, the
+  // stage this entire product exists for read twenty of them and reported "no
+  // defects found" — a sentence about our cap, presented as a fact about the
+  // company. The stated reason was the model's output limit, which is real and
+  // is what the batching below is for; the cap on top of it was belt and braces
+  // that quietly became the binding constraint.
+  const MAX_COMPLAINTS = Number(process.env.MAX_COMPLAINTS ?? 1_000);
 
   // Triage selects the worst-scored mentions, so it is only meaningful once
   // something has scored them. When buzz fails, every mention still carries its
@@ -1722,6 +1912,10 @@ export async function findIssues(
 
   const complaints = mentions
     .filter((m) => m.score < 0.15)
+    // Already read on an earlier run. Triage is the expensive stage and its
+    // verdicts do not expire, so a rerun costs the new complaints and nothing
+    // else.
+    .filter((m) => !m.triaged)
     .sort((a, b) => a.score - b.score)
     .slice(0, MAX_COMPLAINTS);
   if (complaints.length === 0) return [];
@@ -1754,7 +1948,10 @@ export async function findIssues(
   // The cost is real and worth stating: merging duplicates ("one issue per
   // underlying cause") can only happen inside a batch, so the same complaint
   // raised in two different batches can surface twice.
-  const BATCH = 3;
+  // Six, not three. Evidence is index-keyed now, so a batch no longer has to
+  // echo three URLs back per issue — the same measurement that took scoring
+  // from four items a batch to twenty-four.
+  const BATCH = Number(process.env.TRIAGE_BATCH ?? 6);
   const batches: typeof corpus[] = [];
   for (let i = 0; i < corpus.length; i += BATCH) batches.push(corpus.slice(i, i + BATCH));
 
@@ -1782,6 +1979,10 @@ export async function findIssues(
         items: batch.length,
       });
 
+      for (const item of batch) {
+        const mention = mentions.find((m) => m.id === item.id);
+        if (mention) mention.triaged = true;
+      }
       for (const issue of result.issues ?? []) {
         // Resolved here, inside the batch, because the indices only mean
         // anything against the items this call was given.
@@ -1793,6 +1994,7 @@ export async function findIssues(
       }
       succeeded += 1;
       emit('info', `batch ${index + 1}/${batches.length}: ${(result.issues ?? []).length} issue(s)`);
+      save();
     } catch (error) {
       failures.push(error instanceof Error ? error.message.slice(0, 120) : 'error');
       emit('warn', `batch ${index + 1}/${batches.length} failed — ${failures.at(-1)}`);
@@ -2090,7 +2292,7 @@ export function buildBuzz(mentions: Mention[]): BuzzPoint[] {
  *  it gets. Both exist because this runs against a local model: the work is
  *  proportional to the vocabulary, and the panel is worth about a minute of a
  *  scan's time, not five. */
-const TOPIC_VOCABULARY_LIMIT = 60;
+const TOPIC_VOCABULARY_LIMIT = Number(process.env.TOPIC_VOCABULARY_LIMIT ?? 400);
 const TOPIC_GROUPING_TIMEOUT_MS = 150_000;
 
 /** How many themes to hand the model at once.
@@ -2449,7 +2651,7 @@ const SWITCHING = [
  *  in about a minute, and this runs inside a stage that already has a sentiment
  *  pass in it — so the candidates are ranked and the tail is cut rather than
  *  queued behind an unbounded loop. */
-const MIGRATION_BUDGET = Number(process.env.MIGRATION_BUDGET ?? 36);
+const MIGRATION_BUDGET = Number(process.env.MIGRATION_BUDGET ?? 2_000);
 const MIGRATION_BATCH = 12;
 const MIGRATION_TIMEOUT_MS = 150_000;
 

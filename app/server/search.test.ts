@@ -253,3 +253,18 @@ test('a missing Brave key does not fail the search', async () => {
     'the brave branch must skip itself when it has no key',
   );
 });
+
+test('a model that answers twice is parsed, not rejected', async () => {
+  // "Unexpected non-whitespace character after JSON": slicing from the first
+  // `{` to the last `}` welded both answers into one malformed string.
+  const { parseJson } = await import('./model.ts');
+  assert.deepEqual(parseJson('{"a":1}{"a":2}'), { a: 1 });
+  assert.deepEqual(parseJson('{"verdict":[{"index":0}]}\n{"verdict":[]}'), { verdict: [{ index: 0 }] });
+});
+
+test('prose around a single value still parses', async () => {
+  const { parseJson } = await import('./model.ts');
+  assert.deepEqual(parseJson('Here you go:\n```json\n{"a":[1,2]}\n```\nhope that helps'), { a: [1, 2] });
+  // A brace inside a string must not end the scan early.
+  assert.deepEqual(parseJson('{"a":"} not the end"}{"b":2}'), { a: '} not the end' });
+});
