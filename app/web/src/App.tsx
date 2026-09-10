@@ -747,17 +747,39 @@ useEffect(() => {
           <span className="rig-model" title={rig ? `${rig.model} · ${rig.servers.length} connectors` : 'no api'}>
             {rig ? `${rig.model} · ${rig.servers.length} connectors` : 'no api'}
           </span>
-          <button className="logout" onClick={openAgents} title="Agents and their runs">agents</button>
-          <button className="logout" onClick={openQueue} title="What is running and what is waiting">
-            queue
-            {/* A badge, not a number appended to the word. Work waiting is a
-                thing to notice from across the room; set in the header's own
-                muted type it read as part of the label. */}
-            {waiting > 0 && <span className="badge">{waiting}</span>}
-          </button>
-          <button className="logout" onClick={openOutbox} title="Replies drafted but never sent">outbox</button>
-          <button className="logout" onClick={openSettings} title="Connector API keys">settings</button>
-          <button className="logout" onClick={logout} title="Sign out">sign out</button>
+          {/* Three groups, not five identical words.
+              These were five buttons in one undifferentiated row, all the same
+              size, colour and weight, distinguished only by reading them. They
+              are not the same kind of thing: agents, queue and outbox are views
+              onto the work, settings is configuration, and sign out ends the
+              session. Grouping them says that without a word, a glyph makes
+              each one findable by shape rather than by reading, and the current
+              one is marked — which nothing did before, so the header gave no
+              clue which panel you were looking at. */}
+          <nav className="mnav" aria-label="Workspace">
+            <button className="mnav-b" aria-current={showAgents} onClick={openAgents} title="Agents and their runs">
+              <span className="mnav-g">◈</span>agents
+            </button>
+            <button className="mnav-b" aria-current={showQueue} onClick={openQueue} title="What is running and what is waiting">
+              <span className="mnav-g">≡</span>queue
+              {/* A badge, not a number appended to the word. Work waiting is a
+                  thing to notice from across the room; set in the header's own
+                  muted type it read as part of the label. */}
+              {waiting > 0 && <span className="badge">{waiting}</span>}
+            </button>
+            <button className="mnav-b" aria-current={showOutbox} onClick={openOutbox} title="Replies drafted but never sent">
+              <span className="mnav-g">✉</span>outbox
+            </button>
+
+            <span className="mnav-sep" aria-hidden="true" />
+
+            <button className="mnav-b" aria-current={showSettings} onClick={openSettings} title="Connector API keys">
+              <span className="mnav-g">⚙</span>settings
+            </button>
+            <button className="mnav-b quiet" onClick={logout} title="Sign out">
+              <span className="mnav-g">⏻</span>
+            </button>
+          </nav>
         </div>
       </header>
 
