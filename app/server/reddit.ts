@@ -135,6 +135,18 @@ function runScript(
     if (!url) args.push('--with-comments', String(threads));
     if (!url && target) args.push('--target', String(target));
     if (!url && subs.length) args.push('--subs', subs.join(','));
+    // The exact command, quoted, for every failure below.
+    //
+    // A failure said "praw is not installed" for an hour while the fix was
+    // already applied — because the script being executed was a stale copy in
+    // a different checkout, and nothing in the message named a path. The
+    // interpreter and the script path together answer that instantly: which
+    // Python, and which tree. Printing the command that ran should never have
+    // needed to be worked out from anything else.
+    const invocation = [PYTHON, ...args]
+      .map((part) => (/[\s"']/.test(part) ? JSON.stringify(part) : part))
+      .join(' ');
+
     const child = spawn(PYTHON, args, {
       env: {
         ...process.env,
@@ -148,7 +160,7 @@ function runScript(
     let out = '', err = '';
     child.stdout.setEncoding('utf8').on('data', (c) => { out += c; });
     child.stderr.setEncoding('utf8').on('data', (c) => { err += c; });
-    child.on('error', (e) => resolve({ ok: false, error: e.message }));
+    child.on('error', (e) => resolve({ ok: false, error: `${e.message}\n  ran: ${invocation}` }));
     child.on('close', (code) => {
       if (code !== 0) {
         // Naming the interpreter is the difference between a five-minute fix
@@ -159,13 +171,16 @@ function runScript(
         // it — and 300 characters cut them off inside the first list. This is
         // one line per failed run, not per item; there is nothing to save.
         const detail = err.trim().slice(0, 4_000) || `exited ${code}`;
-        return resolve({ ok: false, error: `${detail} [ran ${PYTHON}]` });
+        return resolve({ ok: false, error: `${detail}\n  ran: ${invocation}` });
       }
       try {
         const parsed = JSON.parse(out) as { ok: boolean; mentions?: RawMention[]; error?: string };
         resolve(parsed);
       } catch {
-        resolve({ ok: false, error: 'reddit script returned unparsable output' });
+        resolve({
+          ok: false,
+          error: `reddit script returned unparsable output\n  ran: ${invocation}\n  got: ${out.slice(0, 400)}`,
+        });
       }
     });
   });
