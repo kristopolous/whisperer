@@ -43,22 +43,67 @@ def paced():
     _last_request[0] = time.monotonic()
 
 
+def _import_diagnosis():
+    """Everything needed to fix a failed import, in one read.
+
+    "praw is not installed" is true and useless. It does not say which of the
+    several interpreters on a box was used, where that interpreter looks, or
+    why the obvious fix did not take. Three things go wrong here and they are
+    indistinguishable from that sentence:
+
+    - a Debian system python refuses installs (PEP 668), so `pip install praw`
+      never succeeded in the first place;
+    - a virtualenv was made and installed into, but the server spawns a
+      different interpreter and cannot see it;
+    - `pip install --user` landed correctly, but the server process has no
+      HOME, so Python never added the user site directory to sys.path at all.
+
+    So this reports the interpreter, its version, whether user site is even
+    enabled, the environment that decides all of it, and where it actually
+    looked. Whoever reads it should not have to run a single command to know
+    which of the three it is.
+    """
+    import site
+    import sysconfig
+
+    home = os.environ.get("HOME")
+    try:
+        user_site = site.getusersitepackages()
+    except Exception:
+        user_site = "<unavailable>"
+
+    lines = [
+        "praw could not be imported.",
+        "  interpreter : %s" % sys.executable,
+        "  version     : %s" % sys.version.split()[0],
+        "  prefix      : %s" % sys.prefix,
+        "  in a venv   : %s" % ("yes" if sys.prefix != sys.base_prefix else "no"),
+        "  HOME        : %s" % (home or "NOT SET  <-- user site-packages is disabled without it"),
+        "  VIRTUAL_ENV : %s" % (os.environ.get("VIRTUAL_ENV") or "not set"),
+        "  PYTHONPATH  : %s" % (os.environ.get("PYTHONPATH") or "not set"),
+        "  user site   : %s (enabled: %s)" % (user_site, site.ENABLE_USER_SITE),
+        "  purelib     : %s" % sysconfig.get_path("purelib"),
+        "  sys.path    :",
+    ]
+    lines += ["      %s" % entry for entry in sys.path if entry]
+    lines += [
+        "",
+        "  Fix: install praw for THIS interpreter, or point the server at one",
+        "  that has it:",
+        "      %s -m pip install praw" % sys.executable,
+        "      python3 -m venv .venv && .venv/bin/pip install praw",
+        "  The server prefers .venv/bin/python3 beside the checkout, and",
+        "  WHISPERER_PYTHON overrides that with an absolute path — which is the",
+        "  only thing that works when the process has no PATH or HOME of its own.",
+    ]
+    return "\n".join(lines)
+
+
 def make_reddit():
     try:
         import praw
     except ImportError as exc:
-        # Naming the interpreter matters more than naming the package. On a
-        # Debian host the system python refuses installs (PEP 668), so the
-        # obvious `pip install praw` fails, and a venv made afterwards is
-        # invisible unless the server is told to use it. Both halves, here,
-        # because seeing only one of them costs an hour.
-        raise RuntimeError(
-            "praw is not installed for %s. Create a virtualenv beside the "
-            "checkout and install into it:\n"
-            "    python3 -m venv .venv && .venv/bin/pip install praw\n"
-            "The server picks up .venv/bin/python3 automatically; set "
-            "WHISPERER_PYTHON to use an interpreter elsewhere." % sys.executable
-        ) from exc
+        raise RuntimeError(_import_diagnosis()) from exc
 
     return praw.Reddit(
         client_id=os.environ.get("REDDIT_CLIENT_ID", ""),

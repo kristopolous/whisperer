@@ -154,7 +154,11 @@ function runScript(
         // Naming the interpreter is the difference between a five-minute fix
         // and an hour: "praw is not installed" against a bare `python3` sends
         // somebody to install it into an environment this never reads.
-        const detail = err.slice(0, 300) || `exited ${code}`;
+        // Generous on purpose. The interesting failures here are environment
+        // reports — an interpreter, its sys.path and the variables that built
+        // it — and 300 characters cut them off inside the first list. This is
+        // one line per failed run, not per item; there is nothing to save.
+        const detail = err.trim().slice(0, 4_000) || `exited ${code}`;
         return resolve({ ok: false, error: `${detail} [ran ${PYTHON}]` });
       }
       try {
@@ -313,7 +317,12 @@ export async function searchReddit(
       () => runScript(alias, perAlias, subs, '', threads, target),
     );
     if (!res.ok) {
-      emit?.('warn', `reddit search for "${alias}" failed — ${(res.error ?? 'unknown').slice(0, 140)}`);
+      // Not truncated. A 140-character window turned a full diagnosis into
+      // "praw is not installed: run `pip install praw` (see data-reddit.txt)"
+      // — which named a file that does not exist and an environment the reader
+      // never looks at. The whole point of producing the detail is that it
+      // arrives.
+      emit?.('warn', `reddit search for "${alias}" failed — ${res.error ?? 'unknown'}`);
       continue;
     }
     if (res.requests) {
