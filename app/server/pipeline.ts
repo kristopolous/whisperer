@@ -652,6 +652,43 @@ async function dropWrongSubject(
   return mentions.filter((m) => !wrong.has(m));
 }
 
+
+/** Write dates recovered from the fetched pages back onto the mentions.
+ *
+ *  `fetchAll` parses a published date out of every page it retrieves — JSON-LD,
+ *  meta tags, `<time datetime>`, then the URL path — and returns it beside the
+ *  text. Nothing used it. Every stage took `.text` and dropped `.date` on the
+ *  floor, so a mention that arrived undated from a search result stayed undated
+ *  for the life of the scan, and any defect resting on it was undated too.
+ *
+ *  That is not a source without a date. It is a date sitting on a page we had
+ *  already downloaded and parsed. And an undated defect cannot be bisected,
+ *  confirmed against a version, ordered for reproduction, or recognised as a
+ *  duplicate — which is every use a defect has.
+ *
+ *  Only fills in what is missing: a date the source stated in its own listing
+ *  is better evidence than one scraped out of the page around it.
+ */
+function backfillDates(
+  mentions: Mention[],
+  fetched: Map<string, { text: string; full: boolean; date?: string | null }>,
+  emit: Emit,
+): number {
+  let recovered = 0;
+  for (const mention of mentions) {
+    if (mention.date) continue;
+    const date = fetched.get(mention.url)?.date;
+    if (!date) continue;
+    mention.date = date;
+    recovered += 1;
+  }
+  if (recovered) {
+    const left = mentions.filter((m) => !m.date).length;
+    emit('info', `dates: recovered ${recovered} from the fetched pages, ${left} still undated`);
+  }
+  return recovered;
+}
+
 async function triageUnflagged(
   company: string, mentions: Mention[], emit: Emit, save: Checkpoint = () => {},
 ): Promise<number> {
@@ -681,6 +718,7 @@ async function triageUnflagged(
   // scoring stage that fetches the same URLs later pays nothing.
   const bodies = await fetchAll(unplaced, (done, total, full) =>
     emit('info', `complaint triage: fetched ${done}/${total} (${full} with full text)`));
+  backfillDates(unplaced, bodies, emit);
   const bodyOf = (mention: Mention) =>
     (bodies.get(mention.url)?.text ?? mention.excerpt).slice(0, 700);
 
@@ -1820,6 +1858,7 @@ export async function scoreBuzz(
   emit('info', `fetching real page text for ${budgeted.length} mentions`);
   const fetched = await fetchAll(budgeted, (done, total, full) =>
     emit('info', `fetched ${done}/${total} (${full} with full text)`));
+  backfillDates(budgeted, fetched, emit);
   const fullCount = [...fetched.values()].filter((f) => f.full).length;
   emit('info', `${fullCount}/${budgeted.length} yielded real content; the rest keep their search snippet`);
 
@@ -1996,6 +2035,7 @@ export async function findIssues(
   emit('info', `fetching complaint text for ${complaints.length} mentions`);
   const fetched = await fetchAll(complaints, (done, total, full) =>
     emit('info', `fetched ${done}/${total} (${full} with full text)`));
+  backfillDates(complaints, fetched, emit);
 
   const corpus = complaints.map((m) => {
     const got = fetched.get(m.url);
@@ -2099,9 +2139,31 @@ export async function findIssues(
       id: randomUUID().slice(0, 8),
       firstSeen: dates[0] ?? null,
       lastSeen: dates.at(-1) ?? null,
+      // Always set, so nothing is ever dateless. Where the evidence carries no
+      // published date this is the only bound there is, and an upper bound is
+      // what makes a defect bisectable at all.
+      observedAt: new Date().toISOString(),
       status: 'open' as const,
     };
   });
+
+  // Said out loud, because a defect nobody can date is a defect nobody can
+  // bisect, confirm against a version, reproduce in order, or recognise as a
+  // duplicate of one already filed. If that number is high the fault is
+  // upstream — dates missing from the corpus, or citations that did not resolve
+  // — and neither is visible from the defect list itself.
+  {
+    const undated = catalogued.filter((issue) => !issue.firstSeen).length;
+    const noEvidence = catalogued.filter((issue) => (issue.evidence ?? []).length === 0).length;
+    const datedCorpus = mentions.filter((m) => m.date).length;
+    emit(
+      undated ? 'warn' : 'info',
+      `defects: ${catalogued.length - undated}/${catalogued.length} carry a reported date`
+      + (undated ? `, ${undated} do not` : '')
+      + (noEvidence ? `, ${noEvidence} ended up with no evidence at all` : '')
+      + ` — the corpus they were drawn from is ${datedCorpus}/${mentions.length} dated`,
+    );
+  }
 
   // Who raised each one, and how to answer them.
   //
@@ -2779,6 +2841,7 @@ export async function findMigrations(
   // the buzz stage has already fetched most of these URLs into the cache.
   const fetched = await fetchAll(candidates, (done, total, full) =>
     emit('info', `migrations: fetched ${done}/${total} (${full} with full text)`));
+  backfillDates(candidates, fetched, emit);
 
   const textFor = (mention: Mention) => {
     const got = fetched.get(mention.url);

@@ -16,7 +16,19 @@ export function VenueBars({ mentions }: { mentions: Mention[] }) {
 
   return (
     <div className="viz">
-      <svg viewBox={`0 0 ${W} ${rows.length * ROW + 6}`} role="img" aria-label="Mentions by venue">
+      {/* Drawn at its own size, not stretched to the panel.
+          A `viewBox` with no width or height scales to the container, and
+          everything inside scales with it — including the labels, which then
+          render at nearly twice the size of every other word on the page in a
+          wide panel. The chart is 460 units wide because that is how wide it
+          was designed to be; `.viz` scrolls if the panel is narrower. */}
+      <svg
+        viewBox={`0 0 ${W} ${rows.length * ROW + 6}`}
+        width={W}
+        height={rows.length * ROW + 6}
+        role="img"
+        aria-label="Mentions by venue"
+      >
         {rows.map(([venue, n], i) => {
           const meta = venueOf(venue);
           const width = Math.max(3, (n / max) * track);

@@ -411,7 +411,28 @@ section { margin-top: 44px; }
   border: 1px solid var(--hair);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow);
-  overflow: hidden;
+  /* NOT `overflow: hidden`.
+     It was, to clip children to the rounded corners — and it silently cut off
+     everything wider than the panel, with no scrollbar and no edge to say
+     content continued. A rounded corner is worth nothing next to a table whose
+     last three columns cannot be reached.
+     `overflow-x` and `overflow-y` cannot disagree: setting either to a
+     non-visible value forces the other, so there is no "clip vertically, scroll
+     horizontally" to reach for here. The panel stays out of the way and each
+     wide child manages its own overflow, which is also the only way to keep the
+     panel's header and footer in place while the middle scrolls. */
+  overflow: visible;
+}
+
+/* Anything that can outgrow its panel scrolls inside itself.
+   Applied by element rather than by class so a table added later is handled
+   without anybody having to remember this rule. */
+.panel table,
+.panel pre,
+.panel .scroll-x {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
 }
 .panel > header {
   display: flex;
@@ -508,7 +529,10 @@ section { margin-top: 44px; }
 
 /* ------------------------------------------------------------------ charts */
 
-.viz { padding: 8px 12px 14px; max-width: 100%; overflow: hidden; }
+/* Charts scroll rather than lose their right-hand end. A clipped chart reads
+   as a chart whose data stops there, which is the one thing a chart must not
+   say by accident. */
+.viz { padding: 8px 12px 14px; max-width: 100%; overflow-x: auto; }
 .viz svg { display: block; width: 100%; max-width: 100%; height: auto; overflow: visible; }
 .tick { font: 400 10px var(--mono); fill: var(--ink-3); }
 .mark-label { font: 500 11px var(--mono); fill: var(--ink-2); }
@@ -950,15 +974,19 @@ button.big {
 .empty p { margin: 0 auto; max-width: 48ch; font-size: 13.5px; }
 
 .notice {
-  display: flex; gap: 10px; align-items: flex-start;
+  /* Centred. `flex-start` pins each child to the top of the row, and a 10px
+     uppercase tag, a 13px sentence and a button all have different heights —
+     so each one sat a little higher than the last. Same fault as the run
+     status bar had. The per-child `align-self: center` overrides below were
+     patching this one child at a time. */
+  display: flex; gap: 10px; align-items: center;
   padding: 12px 14px;
   border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
   border-radius: var(--r);
   background: color-mix(in srgb, var(--warning) 8%, transparent);
   font-size: 13px;
 }
-.notice .tag { align-self: center; }
-.notice button { margin-left: auto; align-self: center; flex: none; }
+.notice button { margin-left: auto; flex: none; }
 /* The settled state — where writes are going — is not a warning. */
 .notice.ok {
   border-color: color-mix(in srgb, var(--good) 45%, transparent);

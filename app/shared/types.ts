@@ -112,8 +112,19 @@ export interface Issue {
   impact: string;
   /** Mention ids backing this up. */
   evidence: string[];
+  /** When the evidence says people reported it — the earliest and latest dates
+   *  on the mentions backing it. Null when none of them published a date. */
   firstSeen: string | null;
   lastSeen: string | null;
+  /** When the scan that catalogued this ran.
+   *
+   *  Bookkeeping, and deliberately NOT shown as the defect's date. It records
+   *  when we looked, which says nothing whatever about when the defect appeared
+   *  or when anybody hit it — presenting it as a date for the bug turns a
+   *  failure to parse a page into something that looks like evidence. The
+   *  defect's dates are `firstSeen`/`lastSeen`, and they come from what the
+   *  sources actually published. */
+  observedAt?: string;
   /** A reply to the people who raised it — acknowledgement plus what is being done. */
   draftReply: string;
   status: IssueStatus;

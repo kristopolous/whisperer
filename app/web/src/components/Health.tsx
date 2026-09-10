@@ -245,7 +245,10 @@ export function Health({ scan, onChange, onScan, onRerun, busy }: {
                 {/* When, before how many. On a terminal the age is the first
                     thing worth knowing about a defect. */}
                 <span style={{ font: '400 10.5px var(--mono)', color: 'var(--ink-3)' }}>
-                  {fmtAgo(i.lastSeen ?? i.firstSeen) ?? 'undated'} · {i.evidence.length}
+                  {/* When the complaint was made. Not when we ran a scan —
+                      that says nothing about the defect, and printing it in
+                      this slot dressed a failed date parse up as a fact. */}
+                  {fmtAgo(i.lastSeen ?? i.firstSeen) ?? 'no date'} · {i.evidence.length}
                 </span>
                 {/* How long this has been true, which is the only thing on the
                     row that a second run can tell you and a first cannot. */}
@@ -633,7 +636,12 @@ function Report({ scan, issue, onChange, onScan }: {
         <span className={`tag ${issue.severity}`}>{issue.severity}</span>
         <span className="tag plain">{issue.kind}</span>
         <span style={{ font: '400 11px var(--mono)', color: 'var(--ink-3)' }}>
-          {issue.firstSeen ? `reported on ${fmtDate(issue.firstSeen)}` : 'undated'}
+          {issue.firstSeen
+            ? `reported on ${fmtDate(issue.firstSeen)}`
+            /* Named as our failure, against the pages it failed on, because
+               that is what it is: every one of these has a URL we fetched, and
+               the date is on it. */
+            : `no date could be read from ${issue.evidence.length} source${issue.evidence.length === 1 ? '' : 's'}`}
           {issue.lastSeen && issue.lastSeen !== issue.firstSeen ? ` · last ${fmtDate(issue.lastSeen)}` : ''}
         </span>
         {issue.filedTo && (
@@ -991,11 +999,16 @@ function WriteTarget({ scan, onScan }: { scan: Scan; onScan: (changes: Partial<S
 
   return (
     <div className="notice">
-      <span className="tag warning">nowhere to file</span>
-      {/* The button beside this says "Fork it", and `assertWritable` is what
-          actually stops a write reaching somebody else's repository — the
-          paragraph explaining both was reassurance, not information. */}
-      <span>This scan's project is <code>{short}</code>, fork it</span>
+      {/* Says what to do, not what is wrong. "nowhere to file" and "no write
+          access" both describe a state and leave the reader to work out the
+          action; the action is the only reason this notice exists. */}
+      <span className="tag warning">fork to file tickets</span>
+      {/* Names what gets copied and where it lands.
+          "fork it" beside a button reading "Fork it" said the same word twice
+          and neither said what would be forked, or into whose account, or what
+          changes afterwards. A button that creates a repository under somebody's
+          own login should say so before it is pressed. */}
+      <span><code>{short}</code> is not yours to write to.</span>
       <button
         disabled={busy}
         onClick={async () => {
@@ -1011,7 +1024,7 @@ function WriteTarget({ scan, onScan }: { scan: Scan; onScan: (changes: Partial<S
           } finally { setBusy(false); }
         }}
       >
-        {busy ? 'Forking…' : 'Fork it'}
+        {busy ? `Forking ${short}…` : `Fork ${short} to your account`}
       </button>
       {error && <span className="conn-err">{error}</span>}
     </div>

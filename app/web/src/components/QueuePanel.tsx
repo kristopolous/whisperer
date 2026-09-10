@@ -15,12 +15,17 @@ interface Job {
   finishedAt?: string;
   error?: string;
   stage?: Stage;
+  /** Started straight from a Rerun button rather than put in the line. It is
+   *  real work holding the write lock, so it belongs in "Now" — but there is
+   *  nothing to remove, because it has already begun. */
+  direct?: boolean;
+  what?: string;
 }
 
 const label = (stage: Stage) => STAGES.find((s) => s.key === stage)?.label ?? stage;
 
 const what = (job: Job) =>
-  (job.stages.length ? job.stages.map(label).join(' → ') : 'Full scan');
+  (job.stages.length ? job.stages.map(label).join(' → ') : job.what ?? 'Full scan');
 
 /** What is running, what is waiting, and what happened to the rest.
  *
@@ -82,7 +87,7 @@ export function QueuePanel({ onClose, onOpenScan }: {
           <div className="set-head">
             <strong>Now</strong>
             <span className="tag plain">
-              {running.length ? '1 running' : 'idle'}{waiting ? ` · ${waiting} waiting` : ''}
+              {running.length ? `${running.length} running` : 'idle'}{waiting ? ` · ${waiting} waiting` : ''}
             </span>
           </div>
 
@@ -97,6 +102,7 @@ export function QueuePanel({ onClose, onOpenScan }: {
                 <span className="conn-meta">
                   {job.stage ? `on ${label(job.stage)}` : ''}
                   {job.startedAt ? ` · ${fmtAgo(job.startedAt)}` : ''}
+                  {job.direct ? ' · started directly' : ''}
                 </span>
               </div>
             ))}

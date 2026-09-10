@@ -305,7 +305,38 @@ app.get('/api/credits', (_req, res) => res.json(listCredits()));
  *  Asking for work now queues it. The previous behaviour refused a second ask
  *  outright, so the intent was lost — and let two companies run at once, where
  *  they shared one search budget and both came back thin. */
-app.get('/api/jobs', (_req, res) => res.json({ jobs: listJobs(), waiting: queueDepth() }));
+app.get('/api/jobs', (_req, res) => {
+  const jobs = listJobs();
+
+  // A run started directly — the Rerun buttons open a stream rather than
+  // enqueueing when nothing else is going — never existed as a job, so the
+  // queue panel showed "nothing running" while a scan was plainly running.
+  // That is the exact failure the queue was built to end: work in flight that
+  // the queue cannot see is work nobody can account for.
+  //
+  // The write lock knows about it, because every run takes one. Reported as a
+  // job so the panel has one list to render, marked `direct` so it is not
+  // mistaken for something that can be removed from the line.
+  const held = store.currentClaim();
+  const alreadyListed = jobs.some((job) => job.state === 'running' && job.scanId === held?.scanId);
+  const active = held && !alreadyListed
+    ? [{
+      id: `direct-${held.scanId}`,
+      scanId: held.scanId,
+      company: held.company || store.get(held.scanId)?.company || 'Scan',
+      stages: [] as Stage[],
+      options: {},
+      state: 'running' as const,
+      queuedAt: new Date(held.since).toISOString(),
+      startedAt: new Date(held.since).toISOString(),
+      stage: store.get(held.scanId)?.stage,
+      direct: true,
+      what: held.what,
+    }]
+    : [];
+
+  res.json({ jobs: [...active, ...jobs], waiting: queueDepth() });
+});
 
 app.post('/api/jobs', (req, res) => {
   const { scanId, stages, depth, languages, dig } = (req.body ?? {}) as {
