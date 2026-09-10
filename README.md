@@ -145,8 +145,13 @@ threads through the API and folds them into the results alongside the agent's
 own search:
 
 ```
-pip install praw        # required once (see skills/reddit-search/requirements.txt)
+python3 -m venv .venv && .venv/bin/pip install praw    # required once
 ```
+
+A virtualenv rather than `pip install praw`, because a Debian host refuses
+installs into its system interpreter (PEP 668) and `--user` is no better. The
+server looks for `.venv/bin/python3` beside the checkout and uses it for the
+Reddit reader; set `WHISPERER_PYTHON` if the interpreter lives somewhere else.
 
 Without keys, discovery falls back to whatever search connectors are attached.
 

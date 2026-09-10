@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { Mention } from '../shared/types.ts';
 import { secret } from './secrets.ts';
@@ -8,6 +9,49 @@ import { mentionId } from './mention-id.ts';
 import { hostOf } from '../shared/name.ts';
 
 const SCRIPT = path.resolve(import.meta.dirname, '../../skills/reddit-search/scripts/reddit_search.py');
+
+const ROOT = path.resolve(import.meta.dirname, '../..');
+
+/** Which Python to run the Reddit reader with.
+ *
+ *  This used to be the bare string `python3`, which meant whatever the server
+ *  process happened to inherit on its PATH — and on a Debian host that is the
+ *  system interpreter, which refuses to have anything installed into it
+ *  (PEP 668, "externally-managed-environment"). So the documented fix, making a
+ *  virtualenv and installing `praw` into it, had no effect at all: the venv was
+ *  simply invisible to the spawn, and the reader went on reporting that praw
+ *  was not installed while it sat installed a directory away.
+ *
+ *  Resolved in order, and the first that exists wins:
+ *
+ *  1. `WHISPERER_PYTHON`, for a host that keeps its interpreter somewhere of
+ *     its own choosing.
+ *  2. A virtualenv beside the checkout — `.venv` or `venv` — which is what
+ *     `python3 -m venv` produces and what the README should tell people to
+ *     make.
+ *  3. `VIRTUAL_ENV`, if the server was started from an activated shell.
+ *  4. `python3` on PATH, unchanged, for a host where that is the right answer.
+ *
+ *  Resolved once at import: a server does not grow a virtualenv while running,
+ *  and re-checking the filesystem on every Reddit call would be four stats per
+ *  query for an answer that cannot change.
+ */
+export const PYTHON: string = (() => {
+  const candidates = [
+    process.env.WHISPERER_PYTHON,
+    path.join(ROOT, '.venv/bin/python3'),
+    path.join(ROOT, 'venv/bin/python3'),
+    process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin/python3') : undefined,
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  for (const candidate of candidates) {
+    // An explicit WHISPERER_PYTHON is honoured even if it is a bare name on
+    // PATH rather than a path that exists — that is the operator being
+    // deliberate, and second-guessing it would be worse than failing loudly.
+    if (candidate === process.env.WHISPERER_PYTHON || existsSync(candidate)) return candidate;
+  }
+  return 'python3';
+})();
 
 /** Reddit's credentials, from the same store as every other credential.
  *
@@ -91,7 +135,7 @@ function runScript(
     if (!url) args.push('--with-comments', String(threads));
     if (!url && target) args.push('--target', String(target));
     if (!url && subs.length) args.push('--subs', subs.join(','));
-    const child = spawn('python3', args, {
+    const child = spawn(PYTHON, args, {
       env: {
         ...process.env,
         REDDIT_CLIENT_ID: secret('REDDIT_CLIENT_ID') ?? '',
@@ -106,7 +150,13 @@ function runScript(
     child.stderr.setEncoding('utf8').on('data', (c) => { err += c; });
     child.on('error', (e) => resolve({ ok: false, error: e.message }));
     child.on('close', (code) => {
-      if (code !== 0) return resolve({ ok: false, error: `${err.slice(0, 300) || `exited ${code}`}` });
+      if (code !== 0) {
+        // Naming the interpreter is the difference between a five-minute fix
+        // and an hour: "praw is not installed" against a bare `python3` sends
+        // somebody to install it into an environment this never reads.
+        const detail = err.slice(0, 300) || `exited ${code}`;
+        return resolve({ ok: false, error: `${detail} [ran ${PYTHON}]` });
+      }
       try {
         const parsed = JSON.parse(out) as { ok: boolean; mentions?: RawMention[]; error?: string };
         resolve(parsed);

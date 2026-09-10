@@ -47,7 +47,18 @@ def make_reddit():
     try:
         import praw
     except ImportError as exc:
-        raise RuntimeError("praw is not installed: run `pip install praw` (see data-reddit.txt)") from exc
+        # Naming the interpreter matters more than naming the package. On a
+        # Debian host the system python refuses installs (PEP 668), so the
+        # obvious `pip install praw` fails, and a venv made afterwards is
+        # invisible unless the server is told to use it. Both halves, here,
+        # because seeing only one of them costs an hour.
+        raise RuntimeError(
+            "praw is not installed for %s. Create a virtualenv beside the "
+            "checkout and install into it:\n"
+            "    python3 -m venv .venv && .venv/bin/pip install praw\n"
+            "The server picks up .venv/bin/python3 automatically; set "
+            "WHISPERER_PYTHON to use an interpreter elsewhere." % sys.executable
+        ) from exc
 
     return praw.Reddit(
         client_id=os.environ.get("REDDIT_CLIENT_ID", ""),
