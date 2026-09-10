@@ -500,7 +500,7 @@ export const healthSchema = {
         type: 'array',
         items: {
           type: 'object',
-          required: ['title', 'kind', 'severity', 'summary', 'impact', 'evidence', 'draftReply'],
+          required: ['title', 'kind', 'severity', 'summary', 'impact', 'check', 'evidence', 'draftReply'],
           properties: {
             title: { type: 'string', description: 'Imperative and specific, as an issue title' },
             kind: {
@@ -509,7 +509,19 @@ export const healthSchema = {
             },
             severity: { type: 'string', enum: ['critical', 'serious', 'warning', 'good'] },
             summary: { type: 'string' },
-            impact: { type: 'string', description: 'What the user hits, in their words' },
+            impact: {
+              type: 'string',
+              description:
+                'The observable consequence: what stops working, for whom, under what conditions. '
+                + 'A statement of fact about the product, not a quote and not a verdict.',
+            },
+            check: {
+              type: 'string',
+              description:
+                'How to tell whether this is real, and later whether it is fixed. Concrete steps '
+                + 'and the observation that decides it. Exactly "cannot be derived from the '
+                + 'evidence" when the reports do not say enough to build one.',
+            },
             evidence: {
               type: 'array',
               items: { type: 'integer' },

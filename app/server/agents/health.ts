@@ -29,6 +29,20 @@ Merge duplicates: one issue per underlying cause, with every supporting item's i
 
 Severity: critical = data loss, outage, or a security exposure; serious = a broken workflow with no workaround; warning = friction with a workaround; good = a resolved or minor nit.
 
+IMPACT is a statement about the product, not about the reporter's mood. Write what stops working, for whom, under what conditions — something another person could agree or disagree with by looking. "Making your program run like ass" is a feeling; "GIMP 3.0 takes over ten seconds to become interactive when a font directory contains several thousand files" is an impact. Never quote the complaint here; the complaint is already attached as evidence.
+
+CHECK is the test that decides whether this is real, and later whether a fix worked. Give the steps somebody would actually take and the observation that settles it — a threshold, a state, an error, a count. It must be possible to be WRONG about it.
+
+  Good:  "Open a project with more than 200 files, then rename any folder. Fails if the file tree still shows the old name after 5 seconds."
+  Good:  "Cancel a paid plan, then wait one billing cycle. Fails if a charge appears on the card."
+  Bad:   "Check if it is slow."           (no threshold, nothing to be wrong about)
+  Bad:   "Verify the UI is intuitive."    (not observable)
+  Bad:   "See the linked thread."         (not a test)
+
+Where the reports genuinely do not say enough to build a test — the complaint is a verdict with no described behaviour, or the conditions are missing — write exactly: cannot be derived from the evidence
+
+Do not invent conditions to make a test look concrete. A stated inability to test is useful; a fabricated reproduction sends somebody into a codebase looking for a defect that was never described.
+
 The draft reply is written to the people who raised it. Acknowledge the specific thing that happened, say plainly what is being done about it, and stop. No apology theatre, no gratitude padding, no promised dates, no marketing.`,
   invocation:
     '\n\nHow you are invoked: the first message names the product, then numbered items, '

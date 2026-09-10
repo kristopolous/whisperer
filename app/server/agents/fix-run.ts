@@ -207,7 +207,7 @@ export async function fixIssue(
       prompt: `Product: "${scan.company}".
 
 Issue:
-${JSON.stringify({ title: issue.title, kind: issue.kind, severity: issue.severity, summary: issue.summary, impact: issue.impact })}
+${JSON.stringify({ title: issue.title, kind: issue.kind, severity: issue.severity, summary: issue.summary, impact: issue.impact, check: issue.check })}
 
 Diagnosis:
 ${JSON.stringify({ cause: diagnosis.likelyCause, fix: diagnosis.proposedFix, test: diagnosis.regressionTest })}

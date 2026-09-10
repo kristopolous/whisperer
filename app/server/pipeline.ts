@@ -2167,6 +2167,21 @@ export async function findIssues(
   // upstream — dates missing from the corpus, or citations that did not resolve
   // — and neither is visible from the defect list itself.
   {
+    // How many can actually be pursued. An issue with no falsifiable test is
+    // not a defect record, it is an opinion with a severity attached — and
+    // sending one into a repository is minutes of work that cannot conclude
+    // anything either way.
+    const untestable = catalogued.filter(
+      (issue) => !issue.check || /^cannot be derived/i.test(issue.check),
+    ).length;
+    if (untestable) {
+      emit(
+        'warn',
+        `defects: ${catalogued.length - untestable}/${catalogued.length} carry a reproduction test`
+        + ` — ${untestable} could not be given one from what people wrote, and cannot be`
+        + ' investigated until they are',
+      );
+    }
     const undated = catalogued.filter((issue) => !issue.firstSeen).length;
     const noEvidence = catalogued.filter((issue) => (issue.evidence ?? []).length === 0).length;
     const datedCorpus = mentions.filter((m) => m.date).length;

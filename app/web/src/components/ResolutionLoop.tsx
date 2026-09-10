@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import type { Issue, LoopEvent, LoopStep } from '../../../shared/types.ts';
 import { fmtDate } from '../lib.ts';
 
@@ -46,7 +47,7 @@ const STEP_LABEL: Record<LoopStep, string> = {
  *  These get the quoted treatment. */
 const CONVERSATIONAL: LoopStep[] = ['discovered', 'outreach', 'fix-notified', 'confirmed'];
 
-export type LoopAction = 'investigate' | 'file' | 'reply' | 'notify';
+export type LoopAction = 'investigate' | 'diagnose' | 'file' | 'reply' | 'notify';
 
 /** The order this is supposed to happen in.
  *
@@ -62,7 +63,14 @@ const LADDER: {
   pending: string;
   action?: LoopAction;
   actionLabel?: string;
+  /** What pressing this rung's button actually does, shown only when it is the
+   *  next move. Per rung, because the sentence differs per rung — passing one
+   *  in from outside put a description of reading the source under whichever
+   *  step happened to be next. */
+  blurb?: string;
   needs?: LoopStep;
+  /** True when the rung cannot be attempted without a falsifiable test. */
+  needsCheck?: boolean;
   /** Steps only the reporter can take — no button, ever. */
   theirs?: boolean;
 }[] = [
@@ -71,7 +79,15 @@ const LADDER: {
     step: 'reproduced',
     pending: 'Nobody has checked this against the source yet',
     action: 'investigate',
-    actionLabel: 'Read the source',
+    actionLabel: 'Read the source and patch it',
+    // Gated. Cloning a repository, reading it against a complaint and running a
+    // test suite is minutes of work and real money, and none of it can conclude
+    // anything if the issue has no statement that could turn out to be false.
+    // "Runs like ass" is exactly the rabbit hole this stops.
+    needsCheck: true,
+    blurb: 'Reads the project\u2019s source, writes a patch and runs the test suite in a throwaway '
+      + 'copy. Nothing is committed or pushed, and a fix only counts as working if the new '
+      + 'regression test fails against the original code.',
   },
   {
     step: 'filed',
@@ -111,15 +127,39 @@ function since(iso: string, prose = false): string {
   return `${days} ${days === 1 ? 'day' : 'days'}${prose ? ' ago' : ''}`;
 }
 
-export function ResolutionLoop({ issue, onAction, busy }: {
+export function ResolutionLoop({ issue, onAction, busy, progress }: {
   issue: Issue;
   /** Absent in read-only contexts; a rung then shows its state without a button. */
   onAction?: (action: LoopAction) => void;
   busy?: boolean;
+  /** What the running action is doing, drawn under the rung that started it.
+   *
+   *  Work belongs where it was asked for. This used to live in a separate block
+   *  above the ladder, which meant two places on the same screen claimed to be
+   *  the next step — one of them a large blue panel that was really just a
+   *  duplicate of whichever rung was next. */
+  progress?: ReactNode;
 }) {
   const loop = issue.loop ?? [];
   const done = new Map<LoopStep, LoopEvent>();
   for (const event of loop) if (!done.has(event.step)) done.set(event.step, event);
+
+  // `discovered` is true by construction and nothing ever writes it.
+  //
+  // An issue exists because people complained about it in public — that IS the
+  // first rung. Leaving it unmarked made it the "next" step on every untouched
+  // defect, which is both false and useless: it has no action, so the ladder
+  // offered no next move at all on exactly the defects that most need one.
+  if (!done.has('discovered') && issue.evidence.length > 0) {
+    done.set('discovered', {
+      id: `${issue.id}-discovered`,
+      step: 'discovered',
+      at: issue.firstSeen ?? issue.lastSeen ?? issue.observedAt ?? new Date().toISOString(),
+      actor: 'system',
+      human: false,
+      summary: `Found in ${issue.evidence.length} public ${issue.evidence.length === 1 ? 'mention' : 'mentions'}`,
+    });
+  }
 
   const humanSteps = loop.filter((event) => event.human);
   const closed = loop.some((event) => event.step === 'closed');
@@ -162,7 +202,10 @@ export function ResolutionLoop({ issue, onAction, busy }: {
       <ol className="loop">
         {LADDER.map((rung) => {
           const event = done.get(rung.step);
-          const blocked = rung.needs ? !done.has(rung.needs) : false;
+          // A check that says the evidence was too thin is not a check.
+          const testable = Boolean(issue.check) && !/^cannot be derived/i.test(issue.check!);
+          const untestable = Boolean(rung.needsCheck) && !testable;
+          const blocked = (rung.needs ? !done.has(rung.needs) : false) || untestable;
           const isNext = next?.step === rung.step;
 
           return (
@@ -194,6 +237,8 @@ export function ResolutionLoop({ issue, onAction, busy }: {
                   <blockquote className="loop-quote">{event.message}</blockquote>
                 )}
 
+                {!event && isNext && rung.blurb && <p className="loop-note">{rung.blurb}</p>}
+                {!event && isNext && progress}
                 {!event && isNext && rung.action && onAction && (
                   <div className="actions">
                     <button
@@ -206,9 +251,18 @@ export function ResolutionLoop({ issue, onAction, busy }: {
                     {/* Said rather than left as a dead control. Replying before
                         anything is filed sends an acknowledgement promising a
                         ticket that does not exist. */}
-                    {blocked && (
+                    {blocked && untestable && (
                       <span className="conn-meta">
-                        {STEP_LABEL[rung.needs!]} has to happen first — otherwise the reply has
+                        {issue.check
+                          ? 'No falsifiable test could be derived from what people wrote, so there '
+                            + 'is nothing here to confirm or to verify a fix against.'
+                          : 'This issue predates the reproduction test, so there is nothing to '
+                            + 'check a fix against. Re-run triage to give it one.'}
+                      </span>
+                    )}
+                    {blocked && !untestable && rung.needs && (
+                      <span className="conn-meta">
+                        {STEP_LABEL[rung.needs]} has to happen first — otherwise the reply has
                         nowhere to point them.
                       </span>
                     )}

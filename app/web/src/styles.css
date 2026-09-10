@@ -769,8 +769,30 @@ td .quote { color: var(--ink-2); font-size: 12.5px; margin-top: 3px; }
 
 /* ------------------------------------------------------------------ health */
 
+/* A master/detail pane, bounded by the viewport, with each side scrolling.
+   The list used to be capped at 620px while its row was 1546 — nine hundred
+   pixels of empty column beside the report. Removing the cap swung it the other
+   way: with no definite height anywhere, the row sized to the list's content
+   and the panel became 31,333px tall with no scrollbar at all.
+   Neither is a height. The docket is as tall as the screen allows, both columns
+   stretch to it, and each scrolls its own overflow — which is what lets a list
+   of 328 defects and a long report sit side by side without either one setting
+   the height of the page. */
+/* The report sets the height; the list matches it.
+   Three shapes were wrong before this one. A fixed `max-height: 620px` on the
+   list left nine hundred pixels of empty column beside a 1,546px report.
+   Removing the cap let the list's 328 rows size the row instead, making the
+   panel 31,333px tall with no scrollbar. Bounding the container with
+   `max-height` did nothing, because that clips the box without shrinking the
+   row TRACK. And giving the whole docket a definite viewport height fixed the
+   list but boxed the report into a nested scroller, which is a worse thing to
+   read than the page scroll it replaced.
+   So: the report is left alone to grow, and the list's contents come out of
+   flow so they cannot contribute to the row height at all. */
 .docket { display: grid; grid-template-columns: 300px 1fr; min-height: 420px; }
-.docket-list { border-right: 1px solid var(--hair); overflow: auto; max-height: 620px; }
+.docket-list { position: relative; }
+.docket-scroll { position: absolute; inset: 0; overflow-y: auto; }
+.docket-list { border-right: 1px solid var(--hair); }
 
 .docket-row {
   display: block; width: 100%; text-align: left;
@@ -1658,31 +1680,83 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 .loop-reporter { margin-bottom: 12px; }
 .loop-reporter-h { display: flex; align-items: center; gap: 8px; font: 400 12px var(--mono); }
 
-.loop { list-style: none; margin: 0; padding: 0 0 0 18px; position: relative; }
+/* The resolution ladder. ---------------------------------------------------
+   Ten rungs from "somebody complained in public" to "the reporter confirmed it
+   is fixed", drawn as a vertical track so the shape of the loop is visible at a
+   glance: how far this defect has got, and what the next move is.
+
+   The markup had been renamed to `.loop-dot` / `.loop-body` / `.loop-quote`
+   while these rules still said `.loop-mark` / `.loop-message`, so none of it
+   applied — the dots rendered as unstyled inline boxes with no size, no shape
+   and no distinction between a step that had happened and one that had not.
+   Which is precisely what a progress ladder must never be.
+
+   Three states, told apart by fill as well as colour so a glance is enough:
+   done is solid, the next move is ringed and is the only thing that moves, and
+   everything after it is hollow. */
+.loop { list-style: none; margin: 0; padding: 0 0 0 22px; position: relative; }
+/* The track the rungs sit on. Stops short at both ends so it reads as a path
+   between the steps rather than a border down the panel. */
 .loop::before {
-  content: ''; position: absolute; left: 3px; top: 6px; bottom: 6px;
-  width: 1px; background: var(--hair);
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 7px;
+  bottom: 11px;
+  width: 1px;
+  background: var(--hair);
 }
 .loop-step { position: relative; padding: 0 0 16px; }
-.loop-mark {
-  position: absolute; left: -18px; top: 4px; width: 7px; height: 7px;
-  border-radius: 50%; background: var(--ink-3); box-shadow: 0 0 0 3px var(--paper);
-}
-/* The reporter is the only human in the loop, so their steps are the ones
-   marked — the eye should land on exactly the moments a person was involved. */
-.loop-step.actor-reporter .loop-mark { background: var(--good); }
-.loop-step.actor-system .loop-mark { background: var(--signal); }
+.loop-step:last-child { padding-bottom: 0; }
 
-.loop-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.loop-dot {
+  position: absolute;
+  left: -22px;
+  top: 3px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1.5px solid var(--ink-3);
+  background: var(--paper);
+  /* Punches a hole in the track so the dot sits ON the line, not over it. */
+  box-shadow: 0 0 0 3px var(--paper);
+}
+/* Done: filled, and in the good colour — this actually happened. */
+.loop-step[data-state='done'] .loop-dot {
+  background: var(--good);
+  border-color: var(--good);
+}
+/* The next move: the one thing on the ladder anybody can act on, so it is the
+   one thing that draws the eye. */
+.loop-step[data-state='next'] .loop-dot {
+  background: var(--signal);
+  border-color: var(--signal);
+  box-shadow: 0 0 0 3px var(--paper), 0 0 0 5px color-mix(in srgb, var(--signal) 30%, transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .loop-step[data-state='next'] .loop-dot { animation: pulse 1.6s ease-in-out infinite; }
+}
+/* Not yet: hollow and quiet. These are the majority and must not compete. */
+.loop-step[data-state='todo'] .loop-dot { border-color: var(--hair); }
+.loop-step[data-state='todo'] .loop-label { color: var(--ink-3); font-weight: 500; }
+.loop-step[data-state='next'] .loop-label { color: var(--signal); }
+
+.loop-body { min-width: 0; }
+.loop-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .loop-label { font-weight: 600; font-size: 12.5px; }
 .loop-at { font: 400 10.5px var(--mono); color: var(--ink-3); margin-left: auto; }
-.loop-summary { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; }
-.loop-message {
-  margin: 7px 0 0; padding: 7px 10px;
-  border-left: 2px solid var(--hair); background: var(--raised);
-  font-size: 12.5px; color: var(--ink); white-space: pre-wrap;
+.loop-summary { font-size: 12.5px; color: var(--ink-2); margin: 2px 0 0; }
+/* A reply posted in the company's name is the thing a reader most needs to be
+   able to reread, so it is quoted rather than summarised. */
+.loop-quote {
+  margin: 7px 0 0;
+  padding: 7px 10px;
+  border-left: 2px solid var(--good);
+  background: var(--raised);
+  font-size: 12.5px;
+  color: var(--ink);
+  white-space: pre-wrap;
 }
-.loop-step.actor-reporter .loop-message { border-left-color: var(--good); }
 .loop-ref { margin-top: 5px; font: 400 10.5px var(--mono); color: var(--ink-3); }
 
 /* ---- migration flow -------------------------------------------------------
@@ -2713,3 +2787,75 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   /* Still unmistakably marked, just not moving. */
   .cover-cell.chasing::after { animation: none; }
 }
+
+/* The defect list, grouped by where each one is in the loop. ---------------
+   A flat column of three hundred rows said nothing about which of them anybody
+   had touched — a defect that had been diagnosed, patched, filed and replied to
+   sat between two nobody had opened, wearing the same tags. */
+.docket-group {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 9px 14px 7px;
+  background: var(--tape);
+  border-bottom: 1px solid var(--hair);
+  font: 600 10px var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.docket-group-n { margin-left: auto; font-weight: 500; color: var(--ink-3); }
+
+/* An accent down the left edge, so worked and unworked rows are told apart
+   before a single word is read. `open` gets none: the backlog is the default
+   state and marking all of it marks nothing. */
+.docket-row { border-left: 2px solid transparent; }
+.docket-row[data-phase='acting'] { border-left-color: var(--signal); }
+.docket-row[data-phase='waiting'] { border-left-color: var(--warning); }
+.docket-row[data-phase='closed'] { border-left-color: var(--good); }
+.docket-row[data-phase='closed'] .t { color: var(--ink-2); }
+
+/* Loop state is outlined, severity is filled.
+   Both were `tag warning` before, so "awaiting reporter" — which means real
+   work has happened and somebody else now owes an answer — looked exactly like
+   a severity nobody had acted on. Shape carries the distinction, not just
+   colour, so it survives being glanced at. */
+.tag.step {
+  background: none;
+  border: 1px solid currentColor;
+  font-weight: 600;
+}
+.tag.step.acting { color: var(--signal); }
+.tag.step.waiting { color: var(--warning); }
+.tag.step.done { color: var(--good); }
+
+/* The next rung is the call to action. -------------------------------------
+   It used to be a large blue block above the ladder, which meant the screen had
+   two things claiming to be the next step — and the ladder, which actually
+   knows which rung is next, was the quieter of the two. */
+.loop-note {
+  margin: 5px 0 0;
+  max-width: 62ch;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-2);
+}
+.loop-step[data-state='next'] .actions { margin-top: 9px; }
+.loop-step[data-state='next'] .actions .primary { font-size: 13px; padding: 9px 16px; }
+.loop-step[data-state='next'] .steps-run { margin: 9px 0 0; }
+
+/* The reproduction test. Set in mono because it is a procedure to follow, not
+   prose to read past. */
+.check {
+  margin: 0;
+  padding: 9px 11px;
+  border-left: 2px solid var(--signal);
+  background: var(--raised);
+  font: 400 12.5px var(--mono);
+  line-height: 1.6;
+  color: var(--ink);
+}
+.check-none { margin: 0; max-width: 68ch; }

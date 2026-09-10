@@ -68,7 +68,7 @@ export async function fileTicket(
     prompt: `Product: "${scan.company}" (${scan.site}).
 
 Issue as triaged:
-${JSON.stringify({ title: issue.title, kind: issue.kind, severity: issue.severity, summary: issue.summary, impact: issue.impact })}
+${JSON.stringify({ title: issue.title, kind: issue.kind, severity: issue.severity, summary: issue.summary, impact: issue.impact, check: issue.check })}
 
 What the reporters actually wrote:
 ${JSON.stringify(reports)}

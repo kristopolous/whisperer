@@ -108,8 +108,22 @@ export interface Issue {
   kind: IssueKind;
   severity: Severity;
   summary: string;
-  /** What the user actually hits, in their words. */
+  /** The observable consequence: what stops working, for whom, under what
+   *  conditions. A statement about the product, not a quote from a reporter —
+   *  "making your program run like ass" is a mood, and an issue record whose
+   *  impact field is a mood cannot be filed, argued with, or checked. */
   impact: string;
+  /** How to tell whether this is real, and later whether it is fixed.
+   *
+   *  The load-bearing field for everything downstream. Reproducing needs it,
+   *  the patch needs it as an acceptance criterion, and closing the loop needs
+   *  it to say the thing the reporter complained about no longer happens. An
+   *  issue without one is an opinion with a severity attached.
+   *
+   *  Optional only because issues catalogued before this existed do not have
+   *  one; new ones always do, even if the value says the evidence was too thin
+   *  to build a test from. */
+  check?: string;
   /** Mention ids backing this up. */
   evidence: string[];
   /** When the evidence says people reported it — the earliest and latest dates

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import type { FixStep, Issue, Mention, Scan, Stage, Tracker } from '../../../shared/types.ts';
 import { api, apiUrl, fmtAgo, fmtDate, plain, venueOf } from '../lib.ts';
 import type { DefectHistory, Series } from '../../../server/series.ts';
@@ -234,11 +234,52 @@ export function Health({ scan, onChange, onScan, onRerun, busy, patchSignal }: {
     );
   }
 
+  /** How far along the loop a defect is.
+   *
+   *  The list was 328 rows in one column with nothing separating them, so a
+   *  defect somebody had diagnosed, patched, filed and replied to sat between
+   *  two nobody had opened, wearing the same tags. The whole product is the
+   *  loop; the list has to say where each thing is in it.
+   *
+   *  Ordered by what needs a person, not by how much has been done: untouched
+   *  work is the backlog, work waiting on us is the queue, work waiting on
+   *  somebody else is a reminder, and closed is history. */
+  const PHASES = [
+    { key: 'acting', label: 'Worked on', hint: 'Diagnosed, patched or filed — not yet answered' },
+    { key: 'waiting', label: 'Waiting on the reporter', hint: 'We replied; they have not come back' },
+    { key: 'open', label: 'Not started', hint: 'Nobody has opened these yet' },
+    { key: 'closed', label: 'Closed', hint: 'The reporter confirmed it' },
+  ] as const;
+
+  const phaseOf = (i: Issue): typeof PHASES[number]['key'] => {
+    if (i.loop?.some((e) => e.step === 'closed')) return 'closed';
+    // Told them, not heard back. `outreach` and `fix-notified` are the two
+    // steps that put the ball in the reporter's court; `confirmed` means it
+    // came back and is on its way to closed.
+    if (i.loop?.some((e) => e.step === 'outreach' || e.step === 'fix-notified')
+      && !i.loop.some((e) => e.step === 'confirmed')) return 'waiting';
+    if (i.diagnosis || i.fix || i.filedTo || (i.loop?.length ?? 0) > 0) return 'acting';
+    return 'open';
+  };
+
+  const grouped = PHASES
+    .map((phase) => ({ phase, rows: issues.filter((i) => phaseOf(i) === phase.key) }))
+    .filter((group) => group.rows.length > 0);
+
   return (
     <div className="panel">
       <WriteTarget scan={scan} onScan={onScan} />
       <div className="docket">
-        <div className="docket-list" role="listbox" aria-label="Issue catalogue">
+        {/* An absolutely-positioned scroller inside a plain grid item.
+            This is the only way a grid column can be exactly as tall as its
+            neighbour without either one bounding the other: the list's own
+            content is taken out of flow, so it contributes nothing to the row
+            height, the row is sized by the report alone, and the scroller
+            stretches to fill whatever that turns out to be. Capping the list at
+            a fixed height leaves dead space; letting it size itself makes a
+            328-row list set the height of the page. */}
+        <div className="docket-list">
+        <div className="docket-scroll" role="listbox" aria-label="Issue catalogue">
           <Delta series={series} />
           <Filter
             value={query}
@@ -248,10 +289,20 @@ export function Health({ scan, onChange, onScan, onRerun, busy, patchSignal }: {
             total={all.length}
           />
           {issues.length === 0 && <div className="dash-empty">Nothing matches “{query}”.</div>}
-          {issues.map((i) => (
+          {grouped.map((group) => (
+            <Fragment key={group.phase.key}>
+              {/* Sticky, because these lists run to hundreds and a heading that
+                  scrolls away leaves you reading rows with no idea which group
+                  you are in. */}
+              <div className="docket-group" title={group.phase.hint}>
+                <span>{group.phase.label}</span>
+                <span className="docket-group-n">{group.rows.length}</span>
+              </div>
+              {group.rows.map((i) => (
             <button
               key={i.id}
               className="docket-row"
+              data-phase={group.phase.key}
               aria-current={i.id === issue.id}
               onClick={() => setSelected(i.id)}
             >
@@ -281,13 +332,23 @@ export function Health({ scan, onChange, onScan, onRerun, busy, patchSignal }: {
                 {(history[i.id]?.streak ?? 0) > 1 && (
                   <span className="tag plain">{history[i.id]!.streak} runs running</span>
                 )}
-                {i.loop?.some((e) => e.step === 'closed') && <span className="tag good">closed by reporter</span>}
-                {i.loop?.length && !i.loop.some((e) => e.step === 'closed')
-                  ? <span className="tag warning">awaiting reporter</span>
-                  : null}
+                {/* The loop's own state, told apart from severity by shape as
+                    well as colour: severity tags are filled, these are outlined,
+                    so a row that has been worked does not read as a row that is
+                    merely serious. */}
+                {group.phase.key === 'closed' && <span className="tag step done">closed by reporter</span>}
+                {group.phase.key === 'waiting' && <span className="tag step waiting">awaiting reporter</span>}
+                {group.phase.key === 'acting' && (
+                  <span className="tag step acting">
+                    {i.fix ? 'patched' : i.filedTo ? `filed to ${i.filedTo.tracker}` : 'diagnosed'}
+                  </span>
+                )}
               </div>
             </button>
+              ))}
+            </Fragment>
           ))}
+        </div>
         </div>
         <Report scan={scan} issue={issue} onChange={onChange} onScan={onScan} autoStart={autoStart} />
       </div>
@@ -690,69 +751,7 @@ function Report({ scan, issue, onChange, onScan, autoStart }: {
       <Provenance scan={scan} issue={issue} />
 
       <CodeSource scan={scan} onScan={onScan} />
-      {!hasRepo ? null : (
-        /* Its own block, not a row of buttons.
-         * This is the thing the product is for — reading a stranger's complaint
-         * against real code and coming back with a patch — and it was rendering
-         * as two ordinary buttons in the same generic row used for "Discard".
-         * The explanation sits above the action rather than below it, because
-         * it says what is about to happen, and that is worth reading first. */
-        <div className="source-action">
-          {/* The heading lives inside the block now. As a quiet <h5> above it,
-              it read as a section label for a form; the block is the first
-              thing on the report and needs to announce itself. */}
-          <h4 className="source-action-title">Go into the source</h4>
-          <p className="source-action-what">
-            Reads the project's source, then writes a patch and runs the test suite in a throwaway
-            copy. Nothing is committed or pushed, and a fix is only reported as working if the new
-            regression test fails against the original code.
-          </p>
-          <div className="source-action-go">
-            <button className="primary big" onClick={investigate} disabled={busyNow}>
-              {busyNow ? 'Investigating…' : issue.fix || issue.diagnosis ? 'Investigate again' : 'Investigate'}
-            </button>
-            <button className="ghost" onClick={() => runSource('diagnose')} disabled={busyNow}>
-              {/* Named for what comes back, not for what it does internally.
-                  "Just read the source" sounds like it opens a file viewer; it
-                  returns a diagnosis — which files hold this, why, and what it
-                  could not work out. */}
-              {issue.diagnosis ? 'Locate it again' : 'Locate it in the code'}
-            </button>
-          </div>
-
-          {/* The steps, so minutes of work are legible while they take them.
-              Forking, cloning, reading, patching and publishing were five
-              controls in four places; this is the same work as one story. */}
-          {(busyNow || steps.length > 0) && (
-            <ol className="steps-run">
-              {STEP_ORDER.map((key) => {
-                const hit = steps.find((s) => s.step === key);
-                const last = steps.at(-1)?.step === key;
-                // The step that died is the last one reached. Without this every
-                // step rendered as done and the error sat under the whole
-                // ladder, so the one thing the list is for — saying how far it
-                // got — was the one thing it did not say.
-                const state = !hit ? 'idle'
-                  : last && sourceError ? 'failed'
-                    : last && busyNow ? 'active'
-                      : 'done';
-                return (
-                  <li key={key} className="steps-run-item" data-state={state}>
-                    <span className="steps-run-dot" />
-                    <span className="steps-run-label">{STEP_LABEL[key]}</span>
-                    {hit?.note && state === 'active' && <span className="conn-meta">{hit.note}</span>}
-                    {state === 'failed' && <span className="conn-err">{sourceError}</span>}
-                  </li>
-                );
-              })}
-            </ol>
-          )}
-          {/* Only when no step owns it — an error during forking belongs on
-              the forking row, not repeated at the bottom of the list. */}
-          {sourceError && steps.length === 0 && <p className="conn-err">{sourceError}</p>}
-        </div>
-      )}
-
+      
       {issue.diagnosis && <DiagnosisView diagnosis={issue.diagnosis} />}
       {issue.fix && <FixView fix={issue.fix} />}
 
@@ -810,13 +809,67 @@ function Report({ scan, issue, onChange, onScan, autoStart }: {
       <p>{plain(issue.summary)}</p>
 
       <h5>Impact</h5>
-      <p>{issue.impact}</p>
+      <p>{plain(issue.impact)}</p>
 
+      {/* The test that decides it, shown at the same level as the impact —
+          because it is what makes the impact a claim rather than an opinion,
+          and it is the acceptance criterion every downstream step is measured
+          against. */}
+      <h5>How to tell</h5>
+      {issue.check && !/^cannot be derived/i.test(issue.check)
+        ? <p className="check">{plain(issue.check)}</p>
+        : (
+          <p className="q check-none">
+            {issue.check
+              ? 'No falsifiable test could be derived from what people wrote. Until there is one, '
+                + 'there is nothing to confirm and nothing to verify a fix against — so the source '
+                + 'is not worth opening for this yet.'
+              : 'This issue was catalogued before reproduction tests existed. Re-run triage to '
+                + 'give it one.'}
+          </p>
+        )}
+
+      {/* The ladder is the call to action.
+          Its `next` rung is by definition the next thing that will be done, so
+          the button belongs on it — not in a separate panel above that said the
+          same thing louder. */}
       <ResolutionLoop
         issue={issue}
         busy={busyNow || busy}
+        progress={(busyNow || steps.length > 0 || sourceError) ? (
+          <>
+            {(busyNow || steps.length > 0) && (
+              <ol className="steps-run">
+                {STEP_ORDER.map((key) => {
+                  const hit = steps.find((step) => step.step === key);
+                  const last = steps.at(-1)?.step === key;
+                  // The step that died is the last one reached. Without this
+                  // every step rendered as done and the error sat under the
+                  // whole ladder, so the one thing the list is for — saying how
+                  // far it got — was the one thing it did not say.
+                  const state = !hit ? 'idle'
+                    : last && sourceError ? 'failed'
+                      : last && busyNow ? 'active'
+                        : 'done';
+                  return (
+                    <li key={key} className="steps-run-item" data-state={state}>
+                      <span className="steps-run-dot" />
+                      <span className="steps-run-label">{STEP_LABEL[key]}</span>
+                      {hit?.note && state === 'active' && <span className="conn-meta">{hit.note}</span>}
+                      {state === 'failed' && <span className="conn-err">{sourceError}</span>}
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+            {/* Only when no step owns it — an error during forking belongs on
+                the forking row, not repeated under the list. */}
+            {sourceError && steps.length === 0 && <p className="conn-err">{sourceError}</p>}
+          </>
+        ) : null}
         onAction={(action) => {
           if (action === 'investigate') return investigate();
+          if (action === 'diagnose') return void runSource('diagnose');
           if (action === 'file') return void preview('github');
           // Filing first is enforced by the ladder, so by the time this fires
           // there is a ticket for the reply to hand over.

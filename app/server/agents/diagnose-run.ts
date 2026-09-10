@@ -66,7 +66,7 @@ export async function diagnoseIssue(
     prompt: `Product: "${scan.company}".
 
 Issue as triaged:
-${JSON.stringify({ title: issue.title, kind: issue.kind, severity: issue.severity, summary: issue.summary, impact: issue.impact })}
+${JSON.stringify({ title: issue.title, kind: issue.kind, severity: issue.severity, summary: issue.summary, impact: issue.impact, check: issue.check })}
 
 What the reporters wrote:
 ${JSON.stringify(reported.map((m) => ({ venue: m.venue, url: m.url, said: m.excerpt.slice(0, 500) })))}
