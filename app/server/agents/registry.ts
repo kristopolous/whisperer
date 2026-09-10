@@ -21,6 +21,7 @@ import { fixAgent } from './fix.ts';
 import { footprintAgent } from './footprint.ts';
 import { healthAgent } from './health.ts';
 import { migrationsAgent } from './migrations.ts';
+import { rescueAgent } from './rescue.ts';
 import { resolveAgent } from './resolve.ts';
 import { respondAgent } from './respond-to-user.ts';
 import { siteAgent } from './site.ts';
@@ -32,6 +33,9 @@ import type { AgentDefinition } from './types.ts';
  *  agent list should read in. */
 export const AGENTS: AgentDefinition[] = [
   resolveAgent,
+  // Fires only when a deterministic step fails, so its run history is also the
+  // record of which parsers are not covering the shapes the world produces.
+  rescueAgent,
   crawlAgent,
   footprintAgent,
   discoveryAgent,

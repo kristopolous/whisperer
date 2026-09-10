@@ -468,7 +468,7 @@ async function upstreamMentions(
   if (!source) return [];
 
   try {
-    return await fetchUpstreamIssues(source, emit);
+    return await fetchUpstreamIssues(source, emit, 50, { name: subject?.name ?? company, site });
   } catch (error) {
     emit('warn', `tracker lookup failed — ${why(error)}`);
     return [];

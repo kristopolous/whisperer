@@ -547,6 +547,28 @@ export const healthSchema = {
 };
 
 /** Resolve a company name to a homepage URL. */
+export const rescueSchema = {
+  name: 'rescue',
+  schema: {
+    type: 'object',
+    required: ['value', 'confident', 'why'],
+    properties: {
+      value: {
+        type: 'string',
+        description:
+          'The value alone, in the form asked for. Empty string when it cannot be supplied.',
+      },
+      confident: {
+        type: 'boolean',
+        description:
+          'False when the answer would be a constructed guess rather than something known. A '
+          + 'plausible URL for a thing that does not exist is worse than no answer.',
+      },
+      why: { type: 'string', description: 'One short line: how this was arrived at, or why not.' },
+    },
+  },
+};
+
 export const siteSchema = {
   name: 'site',
   schema: {

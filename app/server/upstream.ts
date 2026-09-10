@@ -19,6 +19,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { why } from './errors.ts';
+import { rescue } from './rescue.ts';
 import type { Mention } from '../shared/types.ts';
 import { cached, HOUR } from './cache.ts';
 import { cleanText } from '../shared/html.ts';
@@ -43,9 +44,70 @@ interface Upstream {
  *  counts as open. Guessing a product name from a company name would be wrong
  *  more often than right — "GIMP" happens to match, "Firefox" under a company
  *  called Mozilla does not. */
-export function upstreamFor(repoUrl: string, limit: number): Upstream | null {
+/** Whatever somebody had to hand, turned into a URL this can parse.
+ *
+ *  The field feeding this holds whatever the resolver put in it, and that is
+ *  not always a URL. `microsoft/markitdown` — the shorthand every GitHub user
+ *  writes, and the one the model returns — threw inside `new URL()` and was
+ *  reported as "cannot work out an issue tracker", which reads as the tracker
+ *  being unfindable rather than the string being a shorthand.
+ *
+ *  Tracker URLs are accepted too, because that is what a person pastes when
+ *  they mean "the issues are here". `github.com/o/n/issues` was previously
+ *  parsed as a repository path and built an API URL of `repos/o/n/issues/issues`,
+ *  which 404s — a wrong answer rather than a refusal, which is worse.
+ */
+export function repoUrlFrom(reference: string): string | null {
+  const raw = reference.trim().replace(/\.git$/, '').replace(/\/+$/, '');
+  if (!raw) return null;
+
+  // `git@host:owner/name`
+  const ssh = /^[\w.-]+@([\w.-]+):(.+)$/.exec(raw);
+  const withScheme = ssh
+    ? `https://${ssh[1]}/${ssh[2]}`
+    : /^[a-z][a-z0-9+.-]*:\/\//i.test(raw)
+      ? raw
+      // A bare `owner/name` with no host is GitHub by convention; anything
+      // carrying a dotted host is that host.
+      : /^[^/\s]+\.[^/\s]+\//.test(raw)
+        ? `https://${raw}`
+        : /^[^/\s]+\/[^/\s]+$/.test(raw)
+          ? `https://github.com/${raw}`
+          : null;
+  if (!withScheme) return null;
+
+  let parsed: URL;
   try {
-    const parsed = new URL(repoUrl.replace(/\.git$/, ''));
+    parsed = new URL(withScheme);
+  } catch {
+    return null;
+  }
+
+  // A Bugzilla reference carries its own query and must not be trimmed.
+  if (/bugzilla|^bugs\./i.test(parsed.hostname) || parsed.pathname.includes('/rest/bug')) {
+    return parsed.toString();
+  }
+
+  // Trim anything past the repository itself: /issues, /issues/1180, /pulls,
+  // GitLab's /-/issues, /tree/main, and so on.
+  const parts = parsed.pathname.split('/').filter(Boolean);
+  const stop = parts.findIndex((part) => part === '-' || TRACKER_TAILS.has(part.toLowerCase()));
+  const repo = (stop === -1 ? parts : parts.slice(0, stop)).slice(0, 2);
+  if (repo.length < 2) return null;
+  return `${parsed.origin}/${repo.join('/')}`;
+}
+
+/** Path segments that mean "past the repository" on the common hosts. */
+const TRACKER_TAILS = new Set([
+  'issues', 'pulls', 'pull', 'merge_requests', 'discussions', 'tree', 'blob',
+  'wiki', 'releases', 'commits', 'actions', 'projects', 'security',
+]);
+
+export function upstreamFor(reference: string, limit: number): Upstream | null {
+  const repoUrl = repoUrlFrom(reference);
+  if (!repoUrl) return null;
+  try {
+    const parsed = new URL(repoUrl);
 
     if (/bugzilla|^bugs\./i.test(parsed.hostname) || parsed.pathname.includes('/rest/bug')) {
       const query = new URLSearchParams(parsed.search);
@@ -141,14 +203,62 @@ const labelNames = (issue: RawIssue): string[] =>
  *
  *  Cached for an hour: a tracker does not turn over fast enough to be worth
  *  re-fetching on every rerun of a stage. */
+/** Does this tracker actually exist? A HEAD against its API.
+ *
+ *  The check that makes a model's suggestion usable. A constructed URL that
+ *  follows the right pattern for a project that does not exist is the worst
+ *  possible answer here — it looks exactly like a correct one, and every stage
+ *  downstream would then report "no issues" for a project with hundreds. */
+async function trackerAnswers(upstream: Upstream): Promise<boolean> {
+  const token = upstream.host === 'github' ? secret('GITHUB_TOKEN') : secret('GITLAB_TOKEN');
+  try {
+    const response = await fetch(upstream.url, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'whisperer',
+        ...(token
+          ? upstream.host === 'github'
+            ? { Authorization: `Bearer ${token}` }
+            : { 'PRIVATE-TOKEN': token }
+          : {}),
+      },
+      signal: AbortSignal.timeout(15_000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 export async function fetchUpstreamIssues(
   repoUrl: string,
   emit: (level: 'info' | 'warn', text: string) => void,
   limit = 50,
+  subject?: { name?: string; site?: string },
 ): Promise<Mention[]> {
-  const upstream = upstreamFor(repoUrl, limit);
+  let upstream = upstreamFor(repoUrl, limit);
+
   if (!upstream) {
-    emit('warn', `cannot work out an issue tracker for ${repoUrl}`);
+    // The parser only knows the shapes somebody wrote down, and there is a
+    // model attached to this thing. Its answer is put through the same parser
+    // and then actually called, so a plausible-looking tracker for a project
+    // that does not exist is discarded rather than believed.
+    upstream = await rescue<Upstream>({
+      what: 'the issue tracker for this project',
+      input: repoUrl,
+      context: { project: subject?.name, site: subject?.site },
+      emit,
+      verify: async (suggestion) => {
+        const candidate = upstreamFor(suggestion, limit);
+        if (!candidate) return null;
+        return (await trackerAnswers(candidate)) ? candidate : null;
+      },
+    });
+  }
+
+  if (!upstream) {
+    emit('warn', `no issue tracker could be established for ${repoUrl}`);
     return [];
   }
 
