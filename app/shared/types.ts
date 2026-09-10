@@ -409,6 +409,14 @@ export interface Scan {
   errorKind?: ErrorKind;
   profiles: Profile[];
   mentions: Mention[];
+  /** Windows already searched on purpose, per source.
+   *
+   *  An empty cell means one of two opposite things: nobody has looked there,
+   *  or somebody looked and the internet was quiet. The first is a gap in our
+   *  coverage and the second is a finding about the subject — and until this
+   *  was recorded the grid drew them identically, so acting on a dark band told
+   *  you nothing about whether it was worth acting on again. */
+  digs?: { venue: string; from: string; to: string; at: string; found: number }[];
   /** Per-source accounting: what search returned, and what we threw away and
    *  why. The coverage grid's empty rows are unreadable without it — an empty
    *  row means "nobody posted", "nothing came back" or "we dropped it all", and

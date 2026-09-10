@@ -47,6 +47,35 @@ function bucketKey(iso: string, grain: 'week' | 'month'): string {
   return monday.toISOString().slice(0, 10);
 }
 
+/** The window a cell stands for, written out in full.
+ *
+ *  A cell is a span, not a day, and clicking it searches the whole span — so
+ *  naming it by its first day ("14 Aug") described neither what the cell counts
+ *  nor what the click will do. A week bucket labelled by its Monday is the
+ *  worst of it: the number under the cursor covers seven days and the label
+ *  named one.
+ *
+ *  Collapsed where the ends share a part, because "1 Aug 2026 – 31 Aug 2026"
+ *  spends most of its width repeating itself. */
+export function rangeLabel(from: string, to: string): string {
+  const start = new Date(`${from}T00:00:00Z`);
+  const end = new Date(`${to}T00:00:00Z`);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) return from;
+
+  const day = (d: Date) => d.getUTCDate();
+  const month = (d: Date) => d.toLocaleDateString(undefined, { month: 'short', timeZone: 'UTC' });
+  const year = (d: Date) => d.getUTCFullYear();
+
+  if (year(start) !== year(end)) {
+    return `${day(start)} ${month(start)} ${year(start)} – ${day(end)} ${month(end)} ${year(end)}`;
+  }
+  if (month(start) !== month(end)) {
+    return `${day(start)} ${month(start)} – ${day(end)} ${month(end)} ${year(start)}`;
+  }
+  if (day(start) === day(end)) return `${day(start)} ${month(start)} ${year(start)}`;
+  return `${day(start)}–${day(end)} ${month(start)} ${year(start)}`;
+}
+
 const labelFor = (key: string, grain: 'week' | 'month') =>
   (grain === 'month'
     ? new Date(`${key}-01T00:00:00Z`).toLocaleDateString(undefined, { month: 'short', year: '2-digit' })
@@ -181,6 +210,7 @@ export function Coverage({ scan, onDig, onDigWindow, pursuing }: {
             <Row
               key={row.key}
               row={row}
+              scan={scan}
               buckets={buckets}
               counts={counts}
               undated={undated.get(row.key) ?? 0}
@@ -238,8 +268,9 @@ const WHY: Record<string, string> = {
   forum: 'aims the complaint queries at the forums in Sources',
 };
 
-function Row({ row, buckets, counts, undated, anyUndated, peak, grain, rowTotal, onHover, onAim, onDig, onDigWindow, pursuing, picked, onPick }: {
+function Row({ row, scan, buckets, counts, undated, anyUndated, peak, grain, rowTotal, onHover, onAim, onDig, onDigWindow, pursuing, picked, onPick }: {
   row: { key: string; label: string; slot: string };
+  scan: Scan;
   buckets: string[];
   counts: Map<string, number>;
   undated: number;
@@ -314,6 +345,13 @@ function Row({ row, buckets, counts, undated, anyUndated, peak, grain, rowTotal,
           return stop.toISOString().slice(0, 10);
         };
         const hittable = Boolean(onDigWindow) && row.key !== 'other';
+        // Already searched on purpose. An empty cell that has been dug into is
+        // a fact about the subject; an empty cell nobody has touched is a gap
+        // in our coverage. They are opposite conclusions and were drawn the
+        // same.
+        const dug = (scan.digs ?? []).find(
+          (dig) => dig.venue === row.key && dig.from === from && dig.to === until(),
+        );
         // Work is queued or running against exactly this source and window.
         const chasing = pursuing?.has(`${row.key}|${from}|${until()}`) ?? false;
         return (
@@ -321,7 +359,11 @@ function Row({ row, buckets, counts, undated, anyUndated, peak, grain, rowTotal,
             key={b}
             role={hittable ? 'button' : undefined}
             tabIndex={hittable ? 0 : undefined}
-            title={hittable ? `Search ${row.label} for ${labelFor(b, grain)}` : undefined}
+            title={hittable
+              ? (dug && n === 0
+                ? `${row.label}, ${rangeLabel(from, until())} — searched, nothing found. Look again?`
+                : `Search ${row.label} for ${rangeLabel(from, until())}`)
+              : undefined}
             onClick={hittable ? () => onDigWindow?.(row.key, from, until()) : undefined}
             onKeyDown={hittable ? (event) => {
               if (event.key === 'Enter' || event.key === ' ') {
@@ -329,17 +371,25 @@ function Row({ row, buckets, counts, undated, anyUndated, peak, grain, rowTotal,
                 onDigWindow?.(row.key, from, until());
               }
             } : undefined}
-            className={`cover-cell${n === 0 ? ' none' : ''}${hittable ? ' hit' : ''}${chasing ? ' chasing' : ''}`}
+            className={`cover-cell${n === 0 ? ' none' : ''}${hittable ? ' hit' : ''}`
+              + `${chasing ? ' chasing' : ''}${dug && n === 0 ? ' searched' : ''}`}
             // Square-rooted, because a linear ramp against a peak of 400 makes
             // every ordinary week look empty — and "empty" is the one thing
             // this grid must not say by accident.
             style={n > 0 ? { background: row.slot, opacity: 0.18 + 0.82 * Math.sqrt(n / peak) } : undefined}
             onPointerEnter={() => {
-              onHover({ venue: row.label, bucket: labelFor(b, grain), n });
+              const span = rangeLabel(from, until());
+              onHover({ venue: row.label, bucket: span, n });
               if (hittable) {
-                onAim(n === 0
-                  ? `Nothing from ${row.label} in ${labelFor(b, grain)} — click to search that window on its own.`
-                  : `${n} from ${row.label} in ${labelFor(b, grain)} — click to search that window harder.`);
+                onAim(
+                  dug && n === 0
+                    ? `${row.label} was searched for ${span} and there was nothing — that is the `
+                      + 'subject being quiet, not a gap. Click to look again.'
+                    : n === 0
+                      ? `Nothing from ${row.label} across ${span}, and nobody has searched it — `
+                        + 'click to search those dates on their own.'
+                      : `${n} from ${row.label} across ${span} — click to search those dates harder.`,
+                );
               }
             }}
             onPointerLeave={() => { onHover(null); onAim(null); }}

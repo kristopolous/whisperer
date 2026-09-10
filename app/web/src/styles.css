@@ -2743,6 +2743,19 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
    hundred of these are on screen at once and a hover ring on each would be
    noise — but it has to exist, or the fact that a dark band is clickable is
    something you can only find by accident. */
+/* Searched, and there was nothing.
+   Not the same as never searched, and it must not look the same. A hatch
+   rather than a shade, because shade is the channel this grid already uses for
+   volume — a "slightly darker empty" would read as "very slightly not empty".
+   Diagonals say "accounted for" and cannot be mistaken for a count. */
+.cover-cell.none.searched {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--ink-3) 34%, transparent) 0 1px,
+    transparent 1px 3px
+  );
+}
+
 .cover-cell.hit { cursor: pointer; }
 .cover-cell.hit:hover {
   outline: 1px solid var(--signal);

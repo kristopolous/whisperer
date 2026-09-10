@@ -9,6 +9,7 @@ import { resolveSubject } from './agents/resolve-run.ts';
 import { findReviewScores } from './reviews.ts';
 import { brandToken } from '../shared/name.ts';
 import * as store from './store.ts';
+import { venueOf } from './search.ts';
 import { audit, mergeAudit } from './suppression.ts';
 import { applyOverrides } from './presence-overrides.ts';
 
@@ -200,6 +201,32 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
           (corpus) => { scan.mentions = corpus; store.put(scan); },
         );
         log('info', `${scan.mentions.length} mentions, ${scan.mentions.filter((m) => m.date).length} of them dated`);
+
+        // Remember that this window was searched, and what it yielded.
+        //
+        // Recorded even — especially — when it yielded nothing: a cell somebody
+        // has already dug into and come back empty from is a statement about
+        // the subject, and drawing it the same as one nobody has touched throws
+        // that away and invites paying for the same search again.
+        if (ctx.dig && ctx.digFrom && ctx.digTo) {
+          const from = ctx.digFrom;
+          const to = ctx.digTo;
+          const found = scan.mentions.filter((m) => {
+            if (venueOf(m.url) !== ctx.dig || !m.date) return false;
+            const at = m.date.slice(0, 10);
+            return at >= from && at <= to;
+          }).length;
+          const others = (scan.digs ?? []).filter(
+            (dig) => !(dig.venue === ctx.dig && dig.from === from && dig.to === to),
+          );
+          scan.digs = [...others, { venue: ctx.dig, from, to, at: new Date().toISOString(), found }];
+          log(
+            found ? 'info' : 'warn',
+            `dug ${ctx.dig} for ${from} → ${to}: ${found} mention(s)`
+            + (found ? '' : ' — that window is now known-empty rather than unsearched'),
+          );
+          send({ type: 'patch', scan: { digs: scan.digs } });
+        }
         send({ type: 'patch', scan: { mentions: scan.mentions } });
         break;
       }
