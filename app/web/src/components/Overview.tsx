@@ -27,6 +27,36 @@ export function Overview({
   // scores it, so this counts what was actually judged rather than collected.
   const scored = (scan.mentions ?? []).filter((m) => m.scored ?? (m.score !== 0 || m.sentiment !== 'neutral')).length;
 
+  /** Why nothing is scored — stated, not guessed at.
+   *
+   *  This used to say "the sentiment pass has not run, or it failed", which is
+   *  the panel admitting it did not look. It does not have to guess: the scan
+   *  records `timings.buzz` whether the stage succeeded or failed, `failedStage`
+   *  says which way it went, `stage` says whether it is happening right now, and
+   *  `error` carries the reason. Four distinct situations, four different things
+   *  to do about them, and only one of them is "yet".
+   *
+   *  The same reasoning already lives in the sentiment stat card. It is repeated
+   *  here rather than shared because the two say it at different lengths — the
+   *  card has a line, this has a sentence — but they must never disagree. */
+  const whyUnscored = (): string => {
+    if (mentions.length === 0) return 'No mentions have been collected, so there is nothing to score.';
+    if (scan.failedStage === 'buzz') {
+      return `The sentiment pass ran over ${mentions.length} mentions and failed`
+        + `${scan.error ? `: ${scan.error}` : ', with no reason recorded'}. `
+        + 'Rerun it from the Discovery tab.';
+    }
+    if (scan.stage === 'buzz' && scan.status === 'running') {
+      return `Scoring ${mentions.length} mentions now.`;
+    }
+    if (scan.timings?.buzz !== undefined) {
+      return `The sentiment pass ran over ${mentions.length} mentions and returned nothing — `
+        + 'it did not fail, it produced no scores. Rerun it from the Discovery tab.';
+    }
+    return `${mentions.length} mentions collected. The sentiment pass has not run yet — `
+      + 'run it from the Discovery tab.';
+  };
+
   return (
     <>
       {buzz.length > 0 && (
@@ -116,9 +146,7 @@ export function Overview({
                   <div className="value" style={{ color: 'var(--ink-3)' }}>—</div>
                   <div className="delta" style={{ color: 'var(--ink-2)' }}>not scored yet</div>
                   <p className="caption">
-                    {mentions.length === 0
-                      ? 'No mentions have been collected, so there is nothing to score.'
-                      : `${mentions.length} mentions collected and none scored — the sentiment pass has not run, or it failed. Rerun it from the Discovery tab.`}
+                    {whyUnscored()}
                   </p>
                 </>
               ) : (

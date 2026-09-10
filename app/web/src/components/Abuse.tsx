@@ -132,10 +132,13 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
                     search result said near the site's name is not that site's
                     score, and printing it as one invents a company's
                     reputation. */}
+                {/* An em dash, the same as everywhere else on the dashboard
+                    that has no value to show. "not readable" was a status
+                    dressed up as a figure, in the slot where a figure goes. */}
                 <span className="score-value">
                   {r.verified
                     ? <>{r.rating}<span className="score-scale">/{r.scale}</span></>
-                    : <span className="score-blocked">not readable</span>}
+                    : <span className="score-blocked">—</span>}
                 </span>
                 <span className="conn-meta">
                   {KIND_LABEL[r.kind]}
@@ -144,9 +147,23 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
                 <span className={`tag ${recent.length ? 'plain' : 'warning'}`}>
                   {recent.length
                     ? `${showing ? 'hide' : 'read'} ${recent.length}`
-                    : r.verified ? 'reviews unreadable' : 'page blocked'}
+                    : r.verified ? 'no reviews on the page' : 'no score'}
                 </span>
               </button>
+
+              {/* Said on the row, not behind a click.
+                  A blocked row used to read "not readable / software buyers /
+                  page blocked" — three fragments, none of which says what was
+                  attempted or why there is no number. Somebody looking at a
+                  scorecard with a gap in it needs the reason at the gap. */}
+              {!r.verified && (
+                <p className="q score-why">
+                  {r.site} serves a sign-in wall to anything that is not a browser, so its own
+                  score could not be read. The figure that appears in search results is a number
+                  found near {r.site}&apos;s name, not {r.site}&apos;s rating, so it is not shown.
+                  {' '}<a href={r.url} target="_blank" rel="noreferrer">Open {r.site}</a>.
+                </p>
+              )}
 
               {showing && recent.length > 0 && (
                 <ul className="revs">

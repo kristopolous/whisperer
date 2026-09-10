@@ -200,9 +200,20 @@ button {
   cursor: pointer;
   transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.12s var(--ease), box-shadow 0.15s ease;
 }
-button:hover:not(:disabled) { border-color: var(--ink-3); box-shadow: var(--shadow-sm); }
-button:active:not(:disabled) { transform: translateY(1px); }
-button:disabled { opacity: 0.45; cursor: default; }
+/* Wrapped in `:where()`, which makes these specificity zero.
+   As written they were (0,2,1) — a type selector plus two pseudo-classes — so
+   they beat any `.thing:hover` at (0,2,0). Every button in the app that is not
+   shaped like a button then had to fight the default look and mostly lost: the
+   tab strip grew a grey underline under its blue one because `border-color`
+   was repainted on a border kept transparent for spacing, and a snackbar link
+   grew an embossed rounded edge because `box-shadow: none` on the class lost
+   to `box-shadow: var(--shadow-sm)` here. Both read as a styling accident and
+   both were the same rule.
+   At zero specificity these are what a button looks like unless something says
+   otherwise, and a single class is enough to say otherwise. */
+:where(button:hover:not(:disabled)) { border-color: var(--ink-3); box-shadow: var(--shadow-sm); }
+:where(button:active:not(:disabled)) { transform: translateY(1px); }
+:where(button:disabled) { opacity: 0.45; cursor: default; }
 
 button.primary {
   background: linear-gradient(180deg, color-mix(in srgb, white 10%, var(--signal)) 0%, var(--signal) 100%);
@@ -819,8 +830,17 @@ button.big {
 .runbar { display: grid; gap: 12px; padding: 14px 16px 16px; }
 .run-head {
   display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  flex-wrap: wrap;
+  row-gap: 10px;
 }
-.run-title { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+/* Centred, not baseline-aligned, and with one line-height across the row.
+   `align-items: baseline` matches the baselines of an 11px uppercase mono word
+   and a 12px body-font phrase — but their glyph boxes are different heights and
+   their fonts have different metrics, so what you see is each item sitting a
+   little higher than the last. Aligning the boxes and fixing the line-height
+   removes the staircase, because then there is only one height involved. */
+.run-title { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.run-title > * { line-height: 20px; }
 .run-word {
   font: 600 11px var(--mono);
   letter-spacing: 0.07em;
@@ -861,7 +881,10 @@ button.big {
 }
 .now-text { min-width: 0; }
 .steps { display: flex; flex-wrap: nowrap; gap: 6px; align-items: center; }
-.run-clock { display: flex; gap: 8px; align-items: center; flex: none; }
+.run-clock { display: flex; gap: 8px; align-items: stretch; flex: none; }
+/* Every box the same height whatever its label says, so the row of clocks has
+   one top edge and one bottom edge rather than three of each. */
+.run-clock > * { min-height: 40px; justify-content: center; }
 .run-clock-box {
   display: flex; flex-direction: column; align-items: flex-end; gap: 1px;
   padding: 4px 10px;
@@ -871,12 +894,14 @@ button.big {
 }
 .clock-label {
   font: 600 8.5px var(--mono);
+  line-height: 12px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--ink-3);
 }
 .clock-time {
   font: 600 13px var(--mono);
+  line-height: 16px;
   font-variant-numeric: tabular-nums;
   color: var(--ink);
 }
@@ -2277,7 +2302,7 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   font: 500 12px var(--mono);
   cursor: pointer;
 }
-.snack-run:hover { color: var(--signal); box-shadow: none; }
+.snack-run:hover { color: var(--signal); }
 .snack-run + .snack-run { border-left: 1px solid var(--rule); padding-left: 10px; }
 
 /* Work waiting, said the way a notification count is said. */
@@ -2443,3 +2468,6 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   font: 500 12px var(--mono);
   color: var(--ink-2);
 }
+
+/* The reason a row has no number, at the row. */
+.score-why { margin: -2px 0 10px; padding: 0 4px; max-width: 70ch; }

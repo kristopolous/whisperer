@@ -91,7 +91,7 @@ function BusyProgress({ scanId, onStop, stopping }: {
         <span className="conn-meta">{label}</span>
         {onStop && (
           <button className="rerun" onClick={onStop} disabled={stopping}>
-            {stopping ? 'Stopping…' : '■ Stop it'}
+            {stopping ? 'Stopping…' : '■ Stop'}
           </button>
         )}
       </div>

@@ -195,14 +195,35 @@ export function history(id: string): Scan[] {
  *  correct answer is that one scan has one writer, so the second caller is told
  *  what is already running instead of racing it.
  */
-interface Claim { what: string; since: number }
+interface Claim { what: string; since: number; scanId: string; company: string }
 const claims = new Map<string, Claim>();
 
-/** Take the write lock for a scan, or return who already holds it. */
-export function claim(id: string, what: string): { ok: true } | { ok: false; held: Claim } {
-  const held = claims.get(id);
+/** Who is running anything at all, right now. */
+export const currentClaim = (): Claim | null => [...claims.values()][0] ?? null;
+
+/** Take the write lock, or return who already holds it.
+ *
+ *  The lock is process-wide, not per scan, and that is a deliberate widening.
+ *
+ *  Per-scan was enough while it only had to stop two writers racing over one
+ *  record. It is not enough to stop three DIFFERENT scans running at once,
+ *  which is a distinct failure with a distinct cause: the search budget, the
+ *  per-provider rate pacers, the content cache and the inference endpoint are
+ *  all one-per-process. Three concurrent scans do not take three times as long;
+ *  they spend each other's allowance and each comes back with a thin corpus,
+ *  and nothing in any of the three reports says why. The queue serialises work
+ *  for exactly this reason, and a lock that only covered one scan left the
+ *  direct path free to bypass it.
+ *
+ *  So a second caller is told what is already running and can queue behind it,
+ *  which is the whole point of having a queue. The message names the other
+ *  company, because "busy" without saying with what is the kind of message this
+ *  project keeps having to apologise for.
+ */
+export function claim(id: string, what: string, company = ''): { ok: true } | { ok: false; held: Claim } {
+  const held = claims.get(id) ?? currentClaim();
   if (held) return { ok: false, held };
-  claims.set(id, { what, since: Date.now() });
+  claims.set(id, { what, since: Date.now(), scanId: id, company });
   return { ok: true };
 }
 

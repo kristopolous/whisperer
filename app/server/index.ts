@@ -328,7 +328,7 @@ setRunner(async (job: Job, onStage) => {
   const scan = store.get(job.scanId);
   if (!scan) throw new Error('the scan was deleted before its job ran');
 
-  const lock = store.claim(scan.id, `queued ${job.stages.join('+') || 'scan'}`);
+  const lock = store.claim(scan.id, `queued ${job.stages.join('+') || 'scan'}`, scan.company);
   if (!lock.ok) throw new Error(`busy with ${lock.held.what}`);
 
   const log: Log = (level, text) => {
@@ -810,7 +810,7 @@ app.get('/api/scans/:id/stream', async (req, res) => {
 
   // One writer per scan. Racing a stage rerun would not interleave, it would
   // overwrite — see the note on store.claim.
-  const lock = store.claim(req.params.id, 'full scan');
+  const lock = store.claim(req.params.id, 'full scan', store.get(req.params.id)?.company ?? '');
   if (!lock.ok) {
     // Refused over the stream rather than as a 409: the client is an
     // EventSource, which cannot read a response body and would show this as a
@@ -819,8 +819,11 @@ app.get('/api/scans/:id/stream', async (req, res) => {
     send({
       type: 'error',
       kind: 'busy',
-      message: `This scan has been running for ${store.heldFor(lock.held)}s already, `
-        + 'so a second run was not started on top of it.',
+      message: lock.held.scanId === req.params.id
+        ? `Running for ${store.heldFor(lock.held)}s — a second run was not started on top of it.`
+        : `${lock.held.company || 'Another scan'} is running (${store.heldFor(lock.held)}s). `
+          + 'Work is serialised — one search budget, one set of provider pacers, one inference '
+          + 'endpoint — so this was not started alongside it. Queue it instead.',
     });
     return res.end();
   }
@@ -902,16 +905,20 @@ app.get('/api/scans/:id/stages/:stage/stream', async (req, res) => {
   if (!(STAGE_KEYS as string[]).includes(next)) return res.status(400).json({ error: 'no such stage' });
 
   const what = `${next} rerun`;
-  const lock = store.claim(req.params.id, what);
+  const lock = store.claim(req.params.id, what, store.get(req.params.id)?.company ?? '');
   if (!lock.ok) {
     const send = openStream(res, () => {});
     send({
       type: 'error',
       stage: next,
       kind: 'busy',
-      message: `The ${lock.held.what.replace(/ rerun$/, ' step')} of this scan has been running for `
-        + `${store.heldFor(lock.held)}s already. Starting another underneath it would overwrite `
-        + 'whatever it writes when it finishes.',
+      message: lock.held.scanId === req.params.id
+        ? `The ${lock.held.what.replace(/ rerun$/, ' step')} of this scan has been running for `
+          + `${store.heldFor(lock.held)}s. Starting another underneath it would overwrite `
+          + 'whatever it writes when it finishes.'
+        : `${lock.held.company || 'Another scan'} is running (${store.heldFor(lock.held)}s). `
+          + 'Work is serialised — one search budget, one set of provider pacers, one inference '
+          + 'endpoint — so this was not started alongside it. Queue it instead.',
     });
     return res.end();
   }
@@ -1286,7 +1293,7 @@ app.get('/api/scans/:id/issues/:issueId/investigate/stream', async (req, res) =>
   const issue = scan?.issues.find((i) => i.id === req.params.issueId);
   if (!scan || !issue) return res.status(404).json({ error: 'no such issue' });
 
-  const lock = store.claim(req.params.id, 'investigation');
+  const lock = store.claim(req.params.id, 'investigation', store.get(req.params.id)?.company ?? '');
   const send = openStream(res, () => {});
   if (!lock.ok) {
     send({ type: 'error', kind: 'busy', message: `This scan is busy (${lock.held.what}, ${store.heldFor(lock.held)}s).` });

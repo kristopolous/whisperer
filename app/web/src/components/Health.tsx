@@ -666,7 +666,11 @@ function Report({ scan, issue, onChange, onScan }: {
               {busyNow ? 'Investigating…' : issue.fix || issue.diagnosis ? 'Investigate again' : 'Investigate'}
             </button>
             <button className="ghost" onClick={() => runSource('diagnose')} disabled={busyNow}>
-              {issue.diagnosis ? 'Read the source again' : 'Just read the source'}
+              {/* Named for what comes back, not for what it does internally.
+                  "Just read the source" sounds like it opens a file viewer; it
+                  returns a diagnosis — which files hold this, why, and what it
+                  could not work out. */}
+              {issue.diagnosis ? 'Locate it again' : 'Locate it in the code'}
             </button>
           </div>
 
