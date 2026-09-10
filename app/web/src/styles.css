@@ -411,17 +411,19 @@ section { margin-top: 44px; }
   border: 1px solid var(--hair);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow);
-  /* NOT `overflow: hidden`.
-     It was, to clip children to the rounded corners — and it silently cut off
-     everything wider than the panel, with no scrollbar and no edge to say
-     content continued. A rounded corner is worth nothing next to a table whose
-     last three columns cannot be reached.
-     `overflow-x` and `overflow-y` cannot disagree: setting either to a
-     non-visible value forces the other, so there is no "clip vertically, scroll
-     horizontally" to reach for here. The panel stays out of the way and each
-     wide child manages its own overflow, which is also the only way to keep the
-     panel's header and footer in place while the middle scrolls. */
-  overflow: visible;
+  /* Scrolls, rather than clipping or spilling.
+     It was `overflow: hidden`, which cut wide content off with no scrollbar and
+     no edge to say anything continued. Switching it to `visible` fixed the
+     truncation and replaced it with something worse: content spilling out past
+     the panel's border and rounded corners, over whatever sits beside it.
+     `auto` on the horizontal axis is the answer to both — the box still clips to
+     its own shape, and anything wider than it can be reached. `overflow-y` is
+     pinned to `hidden` because the two axes cannot disagree: leaving it
+     `visible` silently promotes it to `auto`, and a panel that grows to fit its
+     content would then be free to sprout a vertical scrollbar from a rounding
+     error. */
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 /* Anything that can outgrow its panel scrolls inside itself.
