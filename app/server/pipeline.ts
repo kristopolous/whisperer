@@ -17,6 +17,9 @@ import { runAgent } from './agents/runtime.ts';
 import { digging, isDeep, runLanguages } from './run-context.ts';
 import { resolveReporter } from './reporter.ts';
 import { mentionId } from './mention-id.ts';
+import { audit, dropped as noteDrop, droppedAll as noteDrops, retrieved } from './suppression.ts';
+import { UpstreamTrouble } from './upstream-trouble.ts';
+import { readingBudget } from './reading-budget.ts';
 import { describeError } from './errors.ts';
 import { enabledLanguages, queriesFor } from './languages.ts';
 import { abuseAgent } from './agents/abuse.ts';
@@ -486,14 +489,16 @@ const complaintShare = () => Math.floor(SCORE_BUDGET / 3);
 
 /** Did this come from the product's own subreddit, where the topic is settled? */
 const fromOwnCommunity = (m: Mention) => (m.themes ?? []).some((t) => t.startsWith('r/'));
-const TRIAGE_BATCH = 30;
+/** Measured at 30 against a 15,000-token window; scaled to the host in use. */
+const TRIAGE_BATCH_BASE = 30;
 /** How many unplaced items to read at most. Each batch is about twenty seconds
  *  of local model time, so this is the ceiling on what the pass can cost. */
 const TRIAGE_CAP = Number(process.env.COMPLAINT_TRIAGE_CAP ?? 3_000);
 
 /* ------------------------------------------------- subject disambiguation --*/
 
-const SUBJECT_BATCH = 30;
+/** Measured at 30 against a 15,000-token window; scaled to the host in use. */
+const SUBJECT_BATCH_BASE = 30;
 
 /** How many ambiguous items to read at most.
  *
@@ -603,8 +608,11 @@ async function dropWrongSubject(
   ].filter(Boolean).join('\n');
 
   const wrong = new Set<Mention>();
-  for (let start = 0; start < reading.length; start += SUBJECT_BATCH) {
-    const batch = reading.slice(start, start + SUBJECT_BATCH);
+  const trouble = new UpstreamTrouble('subject check', emit);
+  const budget = readingBudget(6_000, SUBJECT_BATCH_BASE);
+  emit('info', `subject check: ${budget.note}`);
+  for (let start = 0; start < reading.length; start += budget.items) {
+    const batch = reading.slice(start, start + budget.items);
     try {
       const result = await runAgent<{ verdict: { index: number; topic?: string; same: boolean }[] }>(subjectMatchAgent, {
         prompt: `${described}\n\nItems:\n`
@@ -616,6 +624,7 @@ async function dropWrongSubject(
         note: `ambiguous ${start + 1}–${start + batch.length}`,
         timeoutMs: 180_000,
       });
+      trouble.ok();
       for (const verdict of result.verdict ?? []) {
         const mention = batch[verdict.index];
         if (!mention) continue;
@@ -626,11 +635,12 @@ async function dropWrongSubject(
         // Said out loud, with the topic the model gave it. A silent filter that
         // removes a third of the corpus is indistinguishable from a search that
         // found nothing, and this is the log line that tells them apart.
+        noteDrop(mention, `reads as ${verdict.topic || 'a different subject'}, not this one`);
         emit('info', `not this subject — "${mention.title.slice(0, 70)}" reads as ${verdict.topic || 'something else'}`);
       }
       save();
     } catch (error) {
-      emit('warn', `subject check batch failed — ${describeError(error).slice(0, 100)}`);
+      trouble.record(error);
     }
   }
 
@@ -676,8 +686,11 @@ async function triageUnflagged(
 
   let found = 0;
   let invented = 0;
-  for (let start = 0; start < unplaced.length; start += TRIAGE_BATCH) {
-    const batch = unplaced.slice(start, start + TRIAGE_BATCH);
+  const trouble = new UpstreamTrouble('complaint triage', emit);
+  const budget = readingBudget(12_000, TRIAGE_BATCH_BASE);
+  emit('info', `complaint triage: ${budget.note}`);
+  for (let start = 0; start < unplaced.length; start += budget.items) {
+    const batch = unplaced.slice(start, start + budget.items);
     try {
       const result = await runAgent<{ verdict: { index: number; evidence?: string; isProblem: boolean }[] }>(complaintsAgent, {
         prompt: `Product: "${company}".\n\n`
@@ -691,6 +704,7 @@ async function triageUnflagged(
         note: `unplaced ${start + 1}–${start + batch.length}`,
         timeoutMs: 180_000,
       });
+      trouble.ok();
       for (const verdict of result.verdict ?? []) {
         const mention = batch[verdict.index];
         if (!mention || !verdict.isProblem) continue;
@@ -713,7 +727,7 @@ async function triageUnflagged(
     } catch (error) {
       // One failed batch leaves those items unflagged, which is the state they
       // were already in. Never a reason to fail discovery.
-      emit('warn', `complaint triage batch failed — ${error instanceof Error ? error.message.slice(0, 100) : 'error'}`);
+      trouble.record(error);
     }
   }
 
@@ -1060,6 +1074,10 @@ export async function findMentions(
     if (!merged.has(hit.url)) merged.set(hit.url, hit);
   }
   const hits = [...merged.values()];
+  // The denominator for every drop below. Recorded before the first filter so
+  // "X returned 14 and we kept none" can be distinguished from "X returned
+  // none" — which look identical from the corpus and mean opposite things.
+  for (const hit of hits) retrieved(hit.url);
   emit('info', `${hits.length} distinct results, ${fromComplaints.size} whose text reads as a complaint`);
 
   const ownHost = (() => {
@@ -1077,20 +1095,44 @@ export async function findMentions(
   const reasons = { ownSite: 0, lexical: 0, unrelated: 0, homepage: 0 };
   const usable = hits.filter((hit) => {
     // A vendor's own blog, docs and status page are not third-party discussion.
-    if (ownHost && hit.url.includes(ownHost)) { reasons.ownSite += 1; return false; }
+    if (ownHost && hit.url.includes(ownHost)) {
+      reasons.ownSite += 1;
+      noteDrop(hit, `on the company's own site (${ownHost})`);
+      return false;
+    }
     // A brand that is also an ordinary word drags in dictionary and spelling
     // pages, which carry no opinion to score and no complaint to triage.
-    if (isLexicalNoise(hit)) { reasons.lexical += 1; return false; }
+    if (isLexicalNoise(hit)) {
+      reasons.lexical += 1;
+      noteDrop(hit, 'reads as a dictionary or spelling page');
+      return false;
+    }
     // Must actually be about the company, and not a site's front page — both of
     // which a narrow freshness window otherwise lets straight through.
     // Kept strict on purpose. Exempting complaint-shaped posts from discussion
     // venues was tried and let in gripes about MMA, Slipknot and golf games —
     // complaint language is common enough that without the brand test it
     // matches the whole of Reddit.
-    if (!namesCompany(hit, brand)) { reasons.unrelated += 1; return false; }
+    if (!namesCompany(hit, brand)) {
+      reasons.unrelated += 1;
+      // The one to watch. A site that serves a login wall to a crawler returns
+      // a title and no usable snippet, so this test fails on the wall rather
+      // than on the post — which is how a whole venue goes dark without any
+      // stage reporting a failure.
+      noteDrop(hit, `nothing in the title or snippet names "${brand}"`);
+      return false;
+    }
     // A different thing that happens to share the name.
-    if (isWrongSubject(hit, exclude)) { reasons.unrelated += 1; return false; }
-    if (isHomepage(hit.url)) { reasons.homepage += 1; return false; }
+    if (isWrongSubject(hit, exclude)) {
+      reasons.unrelated += 1;
+      noteDrop(hit, 'names something else with the same name');
+      return false;
+    }
+    if (isHomepage(hit.url)) {
+      reasons.homepage += 1;
+      noteDrop(hit, 'a site front page, not a page about this');
+      return false;
+    }
     return true;
   });
 
@@ -1242,6 +1284,16 @@ export async function findMentions(
       Number(Boolean(b.complaint)) - Number(Boolean(a.complaint))
       || Number(fromOwnCommunity(b)) - Number(fromOwnCommunity(a)));
 
+  // Everything the direct readers returned, counted the same way the web-search
+  // results were.
+  //
+  // `retrieved()` was called only at the search merge, so a venue with a reader
+  // of its own had its own corpus missing from the denominator: GitHub reported
+  // `returned=17 kept=82` and Reddit `returned=170 kept=826`. Keeping more than
+  // came back is nonsense on its face, and it discredits the one panel whose
+  // entire job is to be trusted about where the gaps are.
+  for (const mention of [...filed, ...voices]) retrieved(mention.url);
+
   const corpus: Mention[] = [];
   const seenUrls = new Set<string>();
   const take = (mention: Mention | undefined) => {
@@ -1286,6 +1338,11 @@ export async function findMentions(
   cutoff.setMonth(cutoff.getMonth() - (isDeep() ? RELEVANT_MONTHS * 2 : RELEVANT_MONTHS));
   const current = onTopic.filter((m) => !m.date || m.date >= cutoff.toISOString());
   const stale = onTopic.length - current.length;
+  for (const mention of onTopic) {
+    if (!current.includes(mention)) {
+      noteDrop(mention, `older than ${cutoff.toISOString().slice(0, 7)}`);
+    }
+  }
   if (stale) {
     emit(
       'info',
@@ -1294,7 +1351,11 @@ export async function findMentions(
     );
   }
 
-  return current.slice(0, deeper(MENTION_CAP));
+  const capped = current.slice(0, deeper(MENTION_CAP));
+  // A cap is a suppression like any other, and the quietest one: nothing tested
+  // these and nothing is wrong with them. They lost a race against a number.
+  noteDrops(current.slice(deeper(MENTION_CAP)), `over the ${deeper(MENTION_CAP)}-mention corpus cap`);
+  return capped;
 }
 
 /* ------------------------------------------------------------------- feed */
@@ -1302,7 +1363,8 @@ export async function findMentions(
 /** Pull the latest things to surface about a company — new videos, comments and
  *  posts, newest first — by running the attached search connectors (YouTube
  *  search first). */
-const FEED_QUALITY_BATCH = 20;
+/** Measured at 20 against a 15,000-token window; scaled to the host in use. */
+const FEED_QUALITY_BATCH_BASE = 20;
 
 /** How many items the model reads. Stated in the log, never silent.
  *
@@ -1391,7 +1453,10 @@ async function keepDatapoints(company: string, items: FeedItem[], emit: Emit, sa
   // complaint vocabulary and its triage: patterns settle what is unambiguous
   // for nothing, and the model is paid only for what is left.
   const chrome = items.filter(looksLikeChrome);
-  for (const item of chrome) dropped.add(item);
+  for (const item of chrome) {
+    dropped.add(item);
+    noteDrop({ url: item.url, title: item.headline }, 'a sign-in wall or sidebar, by pattern');
+  }
   if (chrome.length) {
     emit('info', `feed: ${chrome.length} recognised as sign-in walls or sidebar boilerplate without reading them`);
   }
@@ -1412,8 +1477,11 @@ async function keepDatapoints(company: string, items: FeedItem[], emit: Emit, sa
     );
   }
 
-  for (let start = 0; start < toRead.length; start += FEED_QUALITY_BATCH) {
-    const batch = toRead.slice(start, start + FEED_QUALITY_BATCH);
+  const trouble = new UpstreamTrouble('feed triage', emit);
+  const budget = readingBudget(10_000, FEED_QUALITY_BATCH_BASE);
+  emit('info', `feed triage: ${budget.note}`);
+  for (let start = 0; start < toRead.length; start += budget.items) {
+    const batch = toRead.slice(start, start + budget.items);
     try {
       const result = await runAgent<{ verdict: { index: number; quote?: string; isDatapoint: boolean }[] }>(
         feedQualityAgent,
@@ -1427,6 +1495,7 @@ async function keepDatapoints(company: string, items: FeedItem[], emit: Emit, sa
         },
       );
       read += batch.length;
+      trouble.ok();
 
       for (const verdict of result.verdict ?? []) {
         const item = batch[verdict.index];
@@ -1441,10 +1510,11 @@ async function keepDatapoints(company: string, items: FeedItem[], emit: Emit, sa
           continue;
         }
         dropped.add(item);
+        noteDrop({ url: item.url, title: item.headline }, 'read, and nobody said anything in it');
       }
       save();
     } catch (error) {
-      emit('warn', `feed triage batch failed — ${describeError(error).slice(0, 100)}`);
+      trouble.record(error);
     }
   }
 

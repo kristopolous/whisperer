@@ -194,3 +194,36 @@ test('a patch cannot write outside the checkout', async () => {
     /outside the checkout/,
   );
 });
+
+test('the rail points at the live run, not a stale failed one', () => {
+  // The case from a real session: a Replit rescan reached 1,590 mentions while
+  // the sidebar kept pointing at an errored attempt from a week earlier, so
+  // every panel opened stale and the rescan looked like it had never started.
+  const failed = { ...blank('aaaaaaaa'), company: 'Replit', site: 'https://replit.com/',
+    status: 'error' as const, createdAt: '2026-09-02T08:14:00.000Z',
+    mentions: Array.from({ length: 1586 }, (_, i) => ({ url: `https://a/${i}` } as never)) };
+  const running = { ...blank('bbbbbbbb'), company: 'Replit', site: 'https://replit.com/',
+    status: 'running' as const, createdAt: '2026-09-06T01:24:00.000Z',
+    mentions: Array.from({ length: 1590 }, (_, i) => ({ url: `https://b/${i}` } as never)) };
+
+  store.put(failed);
+  store.put(running);
+  const rows = store.list().filter((s) => s.company === 'Replit');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.id, 'bbbbbbbb');
+});
+
+test('a running scan with nothing yet still loses to a finished one', () => {
+  // The case the old rule was aimed at, and it stays correct: for the first
+  // half-minute there is genuinely nothing to show.
+  const done = { ...blank('cccccccc'), company: 'Acme', site: 'https://acme.test/',
+    status: 'done' as const, createdAt: '2026-09-01T00:00:00.000Z',
+    mentions: [{ url: 'https://acme.test/x' } as never] };
+  const starting = { ...blank('dddddddd'), company: 'Acme', site: 'https://acme.test/',
+    status: 'running' as const, createdAt: '2026-09-08T00:00:00.000Z' };
+
+  store.put(done);
+  store.put(starting);
+  const rows = store.list().filter((s) => s.company === 'Acme');
+  assert.equal(rows[0]?.id, 'cccccccc');
+});

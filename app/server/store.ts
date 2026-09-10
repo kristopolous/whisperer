@@ -94,16 +94,25 @@ const yield_ = (scan: Scan) =>
  *  says.
  *
  *  So: a run that produced something always beats one that did not, and only
- *  then does recency decide. A still-running scan still loses to a finished
- *  one, because a half-written record is not the thing to show — but it wins
- *  over a finished empty one, since it may yet produce something and the empty
- *  one never will. */
+ *  then does recency decide.
+ *
+ *  Among runs that have produced something, the live one wins. Preferring the
+ *  settled one was wrong in the way that matters most: asking for a rescan and
+ *  then watching the dashboard keep showing the previous attempt — including a
+ *  previous attempt that FAILED — with nothing to say a new run exists. A
+ *  Replit rescan sat at 1,590 mentions while the rail pointed at an errored run
+ *  from a week earlier, so every panel opened stale and the rescan looked like
+ *  it had never started.
+ *
+ *  A running scan with no results yet still loses, which is the case the old
+ *  rule was really aimed at: for the first half-minute there is genuinely
+ *  nothing to show, and the previous run is better than a blank page. */
 function best(a: Scan, b: Scan): Scan {
   const empty = (scan: Scan) => yield_(scan) === 0;
   if (empty(a) !== empty(b)) return empty(a) ? b : a;
   if (!empty(a) && !empty(b)) {
-    const settled = (scan: Scan) => scan.status !== 'running';
-    if (settled(a) !== settled(b)) return settled(a) ? a : b;
+    const live = (scan: Scan) => scan.status === 'running';
+    if (live(a) !== live(b)) return live(a) ? a : b;
   }
   return a.createdAt.localeCompare(b.createdAt) >= 0 ? a : b;
 }

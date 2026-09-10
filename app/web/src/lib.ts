@@ -142,3 +142,12 @@ export function fmtAgo(iso: string | undefined | null): string | null {
   if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
   return `${Math.round(ms / 86_400_000)}d`;
 }
+
+/** Strip markdown for display.
+ *
+ *  `cleanText` now does this at ingest, but every scan recorded before that
+ *  still holds the markup, and re-running an hour and a half of pipeline to
+ *  make old text readable is not a reasonable price. Idempotent, so applying it
+ *  to text that was already cleaned costs nothing.
+ */
+export { stripMarkdown as plain } from '../../shared/markdown.ts';

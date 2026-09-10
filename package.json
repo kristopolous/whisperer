@@ -4,7 +4,7 @@
   "description": "Listens to what the internet says about a company, and turns the complaints into issues.",
   "main": "index.js",
   "scripts": {
-    "test": "tsx --test app/server/*.test.ts",
+    "test": "tsx --test app/server/*.test.ts app/shared/*.test.ts",
     "typecheck": "tsc",
     "build": "vite build --config app/web/vite.config.ts",
     "setup": "tsx --env-file=.env src/setup.ts",

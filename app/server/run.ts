@@ -48,6 +48,19 @@ export async function performScan(
   send: (event: ScanEvent) => void,
   signal?: AbortSignal,
 ): Promise<'done' | 'error' | 'cancelled'> {
+  // A new run supersedes the last one's failure.
+  //
+  // Nothing cleared these, so a scan that was interrupted kept `error`,
+  // `errorDetail`, `errorKind` and `failedStage` forever — and the next run
+  // inherited them. Measured: a Replit rescan sat at 1,590 mentions with a live
+  // progress badge while the dashboard said "failed" and named a stage that had
+  // already succeeded twice since. A stale error is worse than no error,
+  // because it is indistinguishable from a current one.
+  scan.error = undefined;
+  scan.errorDetail = undefined;
+  scan.errorKind = undefined;
+  scan.failedStage = undefined;
+
   // One budget per run, not per process — otherwise the second scan of a
   // session inherits an already-spent one.
   resetSearchBudget();

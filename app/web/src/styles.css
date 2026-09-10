@@ -250,6 +250,13 @@ button.primary:hover:not(:disabled) { filter: brightness(1.08); box-shadow: var(
 @keyframes pulse { 50% { opacity: 0.25; } }
 
 .logout {
+  /* The badge inside this button is absolutely positioned, and without a
+     positioned ancestor here it resolved against `.masthead` — which is
+     `position: relative` — and drew itself at the HEADER's top-right corner
+     instead of the button's, where the header's own edge covers it. It looked
+     roughly plausible on a wide screen by coincidence; once the masthead wraps
+     on a phone the badge is simply somewhere else. */
+  position: relative;
   margin-left: 10px;
   font: 500 10px var(--mono);
   letter-spacing: 0.05em;
@@ -2133,12 +2140,20 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 }
 .cover-row-name {
   display: flex; align-items: center; gap: 6px;
-  background: none; border: 0; padding: 0 6px 0 0;
+  padding: 0 6px 0 0;
   font: 400 11px var(--mono); color: var(--ink-2);
-  text-align: left; cursor: pointer; white-space: nowrap;
+  white-space: nowrap; overflow: hidden;
+}
+.cover-row-open {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 6px;
+  background: none; border: 0; padding: 3px 0;
+  font: inherit; color: inherit;
+  text-align: left; cursor: pointer;
   overflow: hidden; text-overflow: ellipsis;
 }
-.cover-row-name:hover { color: var(--ink); }
+.cover-row-open:hover { color: var(--ink); box-shadow: none; }
+.cover-row-open[aria-expanded='true'] { color: var(--signal); }
 /* A source with nothing at all is the actionable row, so it is legible rather
    than faded into the background like an ordinary empty cell. */
 .cover-row-name.empty { color: var(--warning); }
@@ -2150,16 +2165,20 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 
 /* Only rows with a reader of their own can be dug into; the rest arrive
    through general web search, where there is no per-source limit to lift. */
-.cover-row-name.diggable { cursor: pointer; color: var(--ink); }
-.cover-row-name.diggable:hover { color: var(--signal); }
-.cover-row-name.diggable:hover .cover-dig { background: var(--signal); color: var(--paper); }
-.cover-row-name:disabled { cursor: default; }
+/* Two targets per row, and the free one is the big one. Reading why a band is
+   dark costs nothing; searching harder costs requests and minutes, so it gets
+   the small deliberate glyph rather than the whole row. */
+.cover-dig.diggable { cursor: pointer; color: var(--ink-2); }
+.cover-dig.diggable:hover { background: var(--signal); color: var(--paper); box-shadow: none; }
+.cover-dig:disabled { cursor: default; opacity: 0; }
 /* Marks the rows that can actually be deepened. Sized to be read, and given a
    fixed width so every row's swatch and label line up whether or not it has
    one. */
 .cover-dig {
   flex: none;
-  width: 12px;
+  width: 16px; height: 16px;
+  display: grid; place-items: center;
+  background: none; border: 0; border-radius: 3px; padding: 0;
   font-size: 12px;
   line-height: 1;
   color: var(--ink-3);
@@ -2277,4 +2296,150 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   line-height: 16px;
   text-align: center;
   box-shadow: 0 0 0 2px var(--tape);
+}
+
+/* One line per site, expanding to the reviews behind the number. */
+.scores { display: grid; gap: 2px; padding: 0 16px 14px; }
+.score-line { border-bottom: 1px solid var(--hair); }
+.score-line:last-child { border-bottom: 0; }
+.score-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 4px;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.score-head:hover { background: color-mix(in srgb, var(--signal) 5%, transparent); box-shadow: none; }
+.score-head .score-site { font-weight: 600; }
+.score-head .score-value { margin-left: auto; font: 600 15px var(--mono); }
+.score-head[data-tone='bad'] .score-value { color: var(--critical); }
+.score-head[data-tone='mid'] .score-value { color: var(--warning); }
+.score-head[data-tone='good'] .score-value { color: var(--good); }
+.score-head .tag { flex: none; }
+.score-none { padding: 0 4px 12px; }
+.score-head[data-tone='unread'] .score-value { color: var(--ink-3); }
+.score-blocked { font: 500 12px var(--sans); letter-spacing: 0.02em; }
+
+
+/* Why a source is dark. ------------------------------------------------ */
+
+.why {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--signal) 3%, transparent);
+}
+.why-verdict { margin: 0; font-size: 13px; line-height: 1.55; color: var(--ink); }
+.why-drops { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 2px; }
+.why-drop {
+  display: flex; align-items: baseline; gap: 10px;
+  width: 100%; padding: 7px 4px;
+  background: none; border: 0; border-top: 1px solid var(--hair);
+  text-align: left; cursor: pointer;
+}
+.why-drop:hover { background: color-mix(in srgb, var(--signal) 6%, transparent); box-shadow: none; }
+.why-n { font: 600 13px var(--mono); color: var(--warning); min-width: 2.5ch; }
+.why-reason { flex: 1; min-width: 0; font-size: 13px; }
+.why-drop .tag { flex: none; }
+.why-examples { list-style: none; margin: 0 0 8px; padding: 4px 0 0 calc(2.5ch + 10px); display: grid; gap: 8px; }
+.why-examples a { font-size: 12.5px; }
+.why-url {
+  display: block;
+  font: 400 10.5px var(--mono);
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
+}
+.why-dig { margin-top: 10px; }
+
+/* Phones. ---------------------------------------------------------------
+   Not a scaled-down desktop: the things that break first are horizontal
+   overflow, tap targets under a finger's width, and multi-column grids that
+   were never going to fit. Handled here rather than by hiding panels, because
+   a panel you cannot see on the device you carry is a panel you do not have. */
+@media (max-width: 640px) {
+  /* Nothing may push the page sideways. One overflowing table turns every
+     vertical scroll into a diagonal one. */
+  html, body { overflow-x: hidden; }
+  .shell { padding: 0 14px 48px; }
+  .masthead { padding: 10px 14px; gap: 8px; }
+  /* Room for a badge that overhangs its button by 6px. A wrapped header packs
+     rows tight enough that the overhang lands on the row above. */
+  .masthead { row-gap: 16px; }
+  .rig { margin-left: auto; padding-right: 2px; }
+  .masthead form { max-width: none; }
+
+  /* The tab strip scrolls instead of wrapping. Wrapped tabs change the header's
+     height as you move between them, which moves everything under it. */
+  .tabs {
+    margin-top: 22px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    flex-wrap: nowrap;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { flex: none; padding: 12px 12px 13px; }
+
+  .rubric { flex-wrap: wrap; gap: 8px; }
+  .rubric .rerun { margin-left: 0; }
+  .tab-body { margin-top: 18px; }
+
+  /* One column. These grids are 1.35fr/1fr and 300px/1fr, and neither has
+     anywhere to go at 360px. */
+  .split, .docket, .runbar { grid-template-columns: 1fr; }
+  .docket-list { max-height: 260px; }
+
+  /* Rows stack instead of squeezing five columns into a phone. */
+  .conn-row { grid-template-columns: auto minmax(0, 1fr); gap: 6px 10px; padding: 12px 14px; }
+  .conn-row > .conn-meta, .conn-row > .conn-tags { grid-column: 2; justify-content: flex-start; }
+  .conn-tags { justify-content: flex-start; }
+
+  .panel > header, .set-head { padding-left: 14px; padding-right: 14px; }
+  .scores, .revs { padding-left: 14px; padding-right: 14px; }
+
+  /* Targets a finger can hit. 44px is the platform guidance and the row-name
+     buttons in the coverage grid were 14px tall. */
+  .score-head { padding: 12px 4px; }
+
+  /* Four things on one line is one thing too many at 360px: the site name and
+     the audience label both wrap mid-word and the score ends up stranded
+     between them. Two rows, each with a left and a right, so the eye reads
+     name/score then detail/action and nothing has to wrap at all. */
+  .score-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 3px 10px;
+    align-items: baseline;
+  }
+  .score-head .score-site { grid-column: 1; }
+  .score-head .score-value { grid-column: 2; margin-left: 0; justify-self: end; }
+  .score-head .conn-meta { grid-column: 1; }
+  .score-head .tag { grid-column: 2; justify-self: end; }
+  .why-drop { padding: 12px 4px; }
+  .cover-row-open { padding: 12px 0; }
+  .cover-dig { width: 28px; height: 28px; font-size: 14px; }
+
+  /* Cells wide enough to hit, and a narrower name column so more of the time
+     axis is on screen at once. */
+  .cover-grid { --cover-name: 84px; --cover-cell: 15px; }
+  .cover-cell { height: 18px; }
+  .cover-row-name { font-size: 10.5px; }
+}
+
+/* An ask that joined the queue rather than starting. Sits with the running
+   jobs, because "yours is third in line" and "yours is going now" are the same
+   question answered two ways. */
+.snack-queued {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 12px;
+  border-radius: 999px;
+  background: var(--paper);
+  border: 1px solid var(--hair);
+  font: 500 12px var(--mono);
+  color: var(--ink-2);
 }

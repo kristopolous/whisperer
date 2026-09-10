@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { FeedItem, Scan, Venue } from '../../../shared/types.ts';
 import { Filter, matches } from './Filter.tsx';
-import { VENUES, fmtDate, venueOf } from '../lib.ts';
+import { VENUES, fmtDate, plain, venueOf } from '../lib.ts';
 
 /** Pull the video id out of a YouTube watch/shorts/embed URL. */
 function youtubeId(url: string): string | null {
@@ -136,7 +136,7 @@ function FeedRow({ item }: { item: FeedItem }) {
           line — the rest stays on the row's tooltip — so the feed is scannable
           at two rows per item rather than six. */}
       {item.snippet && item.snippet !== item.headline && (
-        <span className="feed-snippet">{item.snippet}</span>
+        <span className="feed-snippet">{plain(item.snippet ?? '')}</span>
       )}
     </a>
   );

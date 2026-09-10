@@ -108,6 +108,12 @@ export function App() {
   const [cursor, setCursor] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('defects');
   const [rerunningStage, setRerunningStage] = useState<Stage | null>(null);
+  /** What was just put in the queue, so a click that enqueues is not silent. */
+  const [queuedNote, setQueuedNote] = useState<string | null>(null);
+  /** Whether anything is running, readable synchronously inside a callback —
+   *  the state closure is a render behind, and this decides whether a click
+   *  starts work or joins the line. */
+  const busyRef = useRef(false);
   const [authed, setAuthed] = useState(() => sessionStorage.getItem('whisperer.auth') === '1');
   const [showSettings, setShowSettings] = useState(false);
   const [showAgents, setShowAgents] = useState(false);
@@ -443,16 +449,35 @@ useEffect(() => {
   // Anything the server says is in flight, whichever scan it belongs to.
   // `runs` is refreshed on a timer already, so this costs nothing extra.
   const busyRuns = (runs ?? []).filter((run) => run.status === 'running');
+  busyRef.current = busyRuns.length > 0 || running || rerunningStage !== null;
+
+  useEffect(() => {
+    if (!queuedNote) return;
+    const timer = setTimeout(() => setQueuedNote(null), 6_000);
+    return () => clearTimeout(timer);
+  }, [queuedNote]);
 
   // How many jobs are waiting, for the header badge. Polled with the runs list
   // rather than on its own timer — a queue that moves without saying so is the
   // thing this is meant to fix.
   const [waiting, setWaiting] = useState(0);
+  /** Scans with work waiting on them, so the rail can say so.
+   *
+   *  A queued scan is not a running one and has no state of its own on the
+   *  record — from the rail it looks exactly like a scan nobody has touched.
+   *  That is the same failure the queue was built to end: a job that starts in
+   *  four minutes and a job that silently never started must not look alike,
+   *  and the rail is where somebody looks for a property. */
+  const [queuedIds, setQueuedIds] = useState<string[]>([]);
   useEffect(() => {
     let live = true;
     const read = () => {
-      api<{ waiting: number }>('api/jobs')
-        .then((data) => { if (live) setWaiting(data.waiting); })
+      api<{ waiting: number; jobs: { scanId: string; state: string }[] }>('api/jobs')
+        .then((data) => {
+          if (!live) return;
+          setWaiting(data.waiting);
+          setQueuedIds((data.jobs ?? []).filter((job) => job.state === 'queued').map((job) => job.scanId));
+        })
         .catch(() => {});
     };
     read();
@@ -463,6 +488,32 @@ useEffect(() => {
   const rerun = useCallback(async (stages: Stage[], options?: { depth?: 'deep' | 'normal'; languages?: string[]; dig?: string }) => {
     const target = scanIdRef.current;
     if (!target || stages.length === 0) return;
+
+    // Something is already in flight, so this goes in the queue.
+    //
+    // The buttons used to disable while ANY run was going, anywhere. Runs are
+    // property-centric and the queue exists precisely so a second ask is
+    // remembered rather than refused — but the controls still behaved as though
+    // it did not, so starting a Replit run made every Rerun button on Bolt dead.
+    // Work is serialised either way; the only question is whether asking for it
+    // is possible, and there is no reason it should not be.
+    if (busyRef.current) {
+      try {
+        const { waiting } = await api<{ waiting: number }>('api/jobs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scanId: target, stages, ...options }),
+        });
+        setWaiting(waiting);
+        setQueuedNote(
+          `${cleanName(scan.company) || 'Scan'} queued`
+          + (waiting > 1 ? ` — ${waiting} waiting` : ''),
+        );
+      } catch (error) {
+        setQueuedNote(String(error).replace(/^Error:\s*/, '').slice(0, 120));
+      }
+      return;
+    }
     setOwnRun({ id: target, company: cleanName(scan.company), stage: stages[0] });
     source.current?.close();
     setRerunningStage(stages[0]);
@@ -609,9 +660,10 @@ useEffect(() => {
         const shown = live.length === 0 && ownRun && (running || rerunningStage !== null)
           ? [{ ...ownRun, stage: rerunningStage ?? ownRun.stage }]
           : live;
-        if (shown.length === 0) return null;
+        if (shown.length === 0 && !queuedNote) return null;
         return (
           <div className="snack" role="status">
+            {queuedNote && <span className="snack-queued">{queuedNote}</span>}
             {shown.map((run) => (
               <button key={run.id} className="snack-run" onClick={() => open(run.id)}>
                 <span className="lamp busy" />
@@ -664,6 +716,7 @@ useEffect(() => {
       <div className="dash">
         <RunDashboard
           runs={runs}
+          queued={queuedIds}
           activeId={scan.id}
           onOpen={open}
           onNew={onNew}
@@ -753,7 +806,6 @@ useEffect(() => {
                 <button
                   className="headline"
                   onClick={() => rerun(['discovery', 'buzz', 'health', 'abuse'])}
-                  disabled={rerunningStage !== null || running}
                   title="Search again and re-triage — a fresh observation of what people are saying now"
                 >
                   ↻ Rerun
@@ -761,7 +813,6 @@ useEffect(() => {
                 <button
                   className="headline"
                   onClick={() => rerun(['discovery', 'buzz'], { depth: 'deep' })}
-                  disabled={rerunningStage !== null || running}
                   title="Walk every window back to all-time instead of stopping once there is enough, and lift the corpus caps"
                 >
                   ⤓ Deeper
@@ -911,7 +962,6 @@ useEffect(() => {
                       <button
                         className="rerun"
                         onClick={() => rerun(rerunStageFor('presence')!)}
-                        disabled={rerunningStage !== null}
                       >
                         {rerunningStage === 'presence' ? 'Running…' : '↻ Rerun'}
                       </button>
@@ -927,7 +977,6 @@ useEffect(() => {
                       <button
                         className="rerun"
                         onClick={() => rerun(rerunStageFor('discovery')!)}
-                        disabled={rerunningStage !== null}
                       >
                         {rerunningStage === 'discovery' ? 'Running…' : '↻ Rerun'}
                       </button>
@@ -955,7 +1004,6 @@ useEffect(() => {
                       <button
                         className="rerun"
                         onClick={() => rerun(rerunStageFor('feed')!)}
-                        disabled={rerunningStage !== null}
                       >
                         {rerunningStage === 'feed' ? 'Running…' : '↻ Rerun'}
                       </button>
@@ -971,7 +1019,6 @@ useEffect(() => {
                       <button
                         className="rerun"
                         onClick={() => rerun(rerunStageFor('defects')!)}
-                        disabled={rerunningStage !== null}
                       >
                         {rerunningStage === 'health' ? 'Running…' : '↻ Rerun'}
                       </button>
@@ -1008,7 +1055,6 @@ useEffect(() => {
                       <button
                         className="rerun"
                         onClick={() => rerun(rerunStageFor('integrity')!)}
-                        disabled={rerunningStage !== null}
                       >
                         {rerunningStage === 'abuse' ? 'Running…' : '↻ Rerun'}
                       </button>

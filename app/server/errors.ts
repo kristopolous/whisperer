@@ -60,6 +60,8 @@ export function describeError(error: unknown): string {
     .find((message) => message && message !== head);
 
   const parts = [head];
+  const upstream = engineFailure(error);
+  if (upstream) parts.push(upstream);
   if (detail) parts.push(detail);
   if (code && MEANING[code] && !head.includes(code) && !(detail ?? '').includes(MEANING[code])) {
     parts.push(MEANING[code]);
@@ -69,4 +71,49 @@ export function describeError(error: unknown): string {
   // fetch failed" is worse than the original.
   const seen = new Set<string>();
   return parts.filter((part) => part && !seen.has(part) && seen.add(part)).join(' — ');
+}
+
+
+/** An inference host that wrote its own failure into the response.
+ *
+ *  A model server under pressure does not always fail as a request: it accepts
+ *  the request, streams part of an answer, and then emits an error string into
+ *  the token stream. What arrives is a truncated response with the error spliced
+ *  into it, sometimes mid-object:
+ *
+ *      ... "same": [engine error: KV cache exhausted]
+ *
+ *  `JSON.parse` then fails, and the message it produces — "Unexpected token
+ *  'e' ... is not valid JSON" — names our parser and the offset it gave up at.
+ *  Every part of that is true and none of it is the problem, so the reported
+ *  failure sends whoever reads it to look at the JSON repair code, which is
+ *  working correctly. The stage did not fail. The host did, and the fix is on
+ *  the other machine.
+ *
+ *  Recognised on the payload rather than on the parser's message, because the
+ *  parser's message differs by runtime and by where in the stream the splice
+ *  landed, while the marker the host wrote is the thing that is actually
+ *  diagnostic.
+ */
+const ENGINE_MARKERS = [
+  /\[engine\s*err(?:or)?\b[^\]]*\]?/i,
+  /\[?\bCUDA (?:error|out of memory)\b[^\]]*\]?/i,
+  /\bKV cache\b[^\n]{0,60}/i,
+  /\bcontext (?:window|length) exceeded\b/i,
+  /\bmodel (?:not loaded|unloaded|is loading)\b/i,
+  /\bslot unavailable\b/i,
+];
+
+export function engineFailure(error: unknown): string | null {
+  // The payload is on the message for a JSON error, which quotes the text it
+  // choked on. That quoted fragment is where the host's own words survive.
+  const text = error instanceof Error ? `${error.message}` : String(error ?? '');
+  for (const marker of ENGINE_MARKERS) {
+    const found = marker.exec(text);
+    if (found) {
+      return `the inference host failed mid-response and wrote "${found[0].trim().slice(0, 80)}" `
+        + 'into the stream — this is the model server, not the response parser';
+    }
+  }
+  return null;
 }

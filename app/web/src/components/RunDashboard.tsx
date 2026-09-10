@@ -60,12 +60,15 @@ const hostOf = (site: string): string => {
  *  pulls that run's tabs into the main canvas. */
 export function RunDashboard({
   runs,
+  queued = [],
   activeId,
   onOpen,
   onNew,
   onRemove,
 }: {
   runs: RunSummary[];
+  /** Scan ids with work waiting on them. */
+  queued?: string[];
   activeId: string;
   onOpen: (id: string) => void;
   onNew: () => void;
@@ -75,6 +78,7 @@ export function RunDashboard({
   // than a boolean so the dialog can name what is about to go.
   const [pending, setPending] = useState<RunSummary | null>(null);
   const [removing, setRemoving] = useState(false);
+  const isQueued = (id: string) => queued.includes(id);
 
   const confirm = async () => {
     if (!pending) return;
@@ -117,7 +121,7 @@ export function RunDashboard({
               />
               <span className="t-name">{cleanName(run.company)}</span>
               {run.fixture && <span className="tag plain" style={{ fontSize: 9.5 }}>demo</span>}
-              <span className={`st-dot ${run.status === 'done' ? 'ok' : run.status === 'error' ? 'bad' : 'warn'}`} />
+              <span className={`st-dot ${isQueued(run.id) ? 'warn' : run.status === 'done' ? 'ok' : run.status === 'error' ? 'bad' : 'warn'}`} />
             </span>
             <span className="s">
               <span className="s-url">{cleanSite(run.site) || fmtMonth(run.createdAt)}</span>
@@ -153,11 +157,23 @@ export function RunDashboard({
                   the rail is actually asked is "which of these is stale", and
                   only the age answers it. The other states keep their word,
                   because "running" and "error" are not about time. */}
+              {/* Waiting outranks the age.
+                  A row that says "2h" while a job sits in the queue against it
+                  is answering the wrong question: the rail is asked which of
+                  these needs attention, and one with work already lined up does
+                  not. The age comes back the moment the job starts, because
+                  then "running" is the truer word. */}
               <span
-                className={`tag ${run.status === 'done' ? 'plain' : run.status === 'error' ? 'critical' : 'warning'}`}
-                title={new Date(run.createdAt).toLocaleString()}
+                className={`tag ${isQueued(run.id)
+                  ? 'warning'
+                  : run.status === 'done' ? 'plain' : run.status === 'error' ? 'critical' : 'warning'}`}
+                title={isQueued(run.id)
+                  ? 'Work is queued against this scan'
+                  : new Date(run.createdAt).toLocaleString()}
               >
-                {run.status === 'done' ? (fmtAgo(lastRunAt(run)) ?? 'done') : run.status}
+                {isQueued(run.id)
+                  ? 'queued'
+                  : run.status === 'done' ? (fmtAgo(lastRunAt(run)) ?? 'done') : run.status}
               </span>
             </span>
           </button>

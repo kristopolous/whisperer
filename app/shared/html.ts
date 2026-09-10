@@ -1,3 +1,4 @@
+import { stripMarkdown } from './markdown.ts';
 /** Turning fragments of HTML into the text a person should read.
  *
  *  Search APIs return escaped markup, not plain text: Brave sends titles and
@@ -85,5 +86,9 @@ export const stripTags = (input: string): string => input.replace(/<[^>]+>/g, ' 
 /** The whole treatment: tags out, entities decoded, whitespace collapsed. */
 export function cleanText(input: string): string {
   if (!input) return '';
-  return decodeEntities(stripTags(input)).replace(/\s+/g, ' ').trim();
+  // Markdown goes here, at the point text enters, so the model reads sentences
+  // rather than link syntax and the stored corpus is clean at rest. Most of it
+  // arrives through a scraper that renders pages to markdown, and none of that
+  // markup is anything anybody wrote.
+  return stripMarkdown(decodeEntities(stripTags(input))).replace(/\s+/g, ' ').trim();
 }

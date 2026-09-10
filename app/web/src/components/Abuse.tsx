@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { AbuseFinding, ReviewKind, ReviewScore, Scan } from '../../../shared/types.ts';
-import { api, fmtDate } from '../lib.ts';
+import { api, fmtDate, plain } from '../lib.ts';
 import { Filter, matches } from './Filter.tsx';
 
 const STATUS_ORDER: AbuseFinding['status'][] = ['open', 'reported', 'dismissed'];
@@ -78,7 +78,7 @@ function RecentReviews({ reviews }: { reviews: ReviewScore[] }) {
               {r.author && <span className="conn-meta">{r.author}</span>}
             </div>
             {r.title && <div className="revs-title">{r.title}</div>}
-            <p className="revs-body">{r.body}</p>
+            <p className="revs-body">{plain(r.body)}</p>
           </li>
         ))}
       </ul>
@@ -104,7 +104,10 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
     <div className="panel">
       <div className="set-head">
         <strong>Public scores</strong>
-        <span className="tag plain">{reviews.length} sites</span>
+        <span className="tag plain">
+          {reviews.filter((r) => r.verified).length} read
+          {reviews.some((r) => !r.verified) ? ` · ${reviews.filter((r) => !r.verified).length} blocked` : ''}
+        </span>
       </div>
 
       {/* A score with nothing under it is a number to take on trust, which is
@@ -122,21 +125,26 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
               <button
                 className="score-head"
                 onClick={() => setOpen(showing ? null : r.site + r.url)}
-                data-tone={share >= 0.8 ? 'good' : share >= 0.6 ? 'mid' : 'bad'}
+                data-tone={!r.verified ? 'unread' : share >= 0.8 ? 'good' : share >= 0.6 ? 'mid' : 'bad'}
               >
                 <span className="score-site">{r.site}</span>
+                {/* No number unless the site's own page stated it. What a
+                    search result said near the site's name is not that site's
+                    score, and printing it as one invents a company's
+                    reputation. */}
                 <span className="score-value">
-                  {r.rating}<span className="score-scale">/{r.scale}</span>
+                  {r.verified
+                    ? <>{r.rating}<span className="score-scale">/{r.scale}</span></>
+                    : <span className="score-blocked">not readable</span>}
                 </span>
                 <span className="conn-meta">
                   {KIND_LABEL[r.kind]}
-                  {r.count ? ` · ${r.count.toLocaleString()} reviews` : ''}
-                  {!r.firstParty ? ' · quoted second-hand' : ''}
+                  {r.verified && r.count ? ` · ${r.count.toLocaleString()} reviews` : ''}
                 </span>
                 <span className={`tag ${recent.length ? 'plain' : 'warning'}`}>
                   {recent.length
                     ? `${showing ? 'hide' : 'read'} ${recent.length}`
-                    : r.firstParty ? 'reviews unreadable' : 'no page to read'}
+                    : r.verified ? 'reviews unreadable' : 'page blocked'}
                 </span>
               </button>
 
@@ -155,7 +163,7 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
                         <a href={r.url} target="_blank" rel="noreferrer" className="conn-meta">open</a>
                       </div>
                       {review.title && <div className="revs-title">{review.title}</div>}
-                      <p className="revs-body">{review.body}</p>
+                      <p className="revs-body">{plain(review.body)}</p>
                     </li>
                   ))}
                 </ul>
@@ -163,11 +171,14 @@ function Scorecard({ reviews }: { reviews: ReviewScore[] }) {
 
               {showing && recent.length === 0 && (
                 <p className="q score-none">
-                  {r.firstParty
-                    ? 'The page loaded but no reviews could be read out of it — these sites serve a '
-                      + 'sign-in wall to anything that is not a browser.'
-                    : 'This score was quoted by another site rather than read from the review site '
-                      + 'itself, so there is no page of reviews behind it.'}
+                  {r.verified
+                    ? 'The score is the site\u2019s own published figure, but no individual reviews '
+                      + 'could be read out of the page \u2014 these sites serve a sign-in wall to '
+                      + 'anything that is not a browser.'
+                    : 'This site serves nothing to a request that is not a browser, so its score '
+                      + 'could not be read. The figure that appeared in search results is not this '
+                      + 'site\u2019s score \u2014 it is a number found near its name \u2014 so it '
+                      + 'is not shown. A logged-in scraper would get past this.'}
                   {' '}<a href={r.url} target="_blank" rel="noreferrer">Open it</a>.
                 </p>
               )}

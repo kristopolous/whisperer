@@ -86,7 +86,7 @@ function BusyProgress({ scanId, onStop, stopping }: {
   return (
     <>
       <div className="notice">
-        <span className="tag warning">already running</span>
+        <span className="tag warning">running</span>
         <span className="busy-clock">{clock}</span>
         <span className="conn-meta">{label}</span>
         {onStop && (
@@ -160,7 +160,7 @@ export function FailureBox({
       <div className="panel">
         {scanId
           ? <BusyProgress scanId={scanId} onStop={onStop} stopping={stopping} />
-          : <div className="notice"><span className="tag warning">already running</span></div>}
+          : <div className="notice"><span className="tag warning">running</span></div>}
       </div>
     );
   }

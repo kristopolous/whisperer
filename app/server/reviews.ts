@@ -17,7 +17,7 @@
  */
 
 import type { ReviewKind, ReviewScore } from '../shared/types.ts';
-import { readReviews } from './review-text.ts';
+import { aggregateFrom, readReviews, statedFrom } from './review-text.ts';
 import { fetchRawHtml } from './content.ts';
 import { braveSearch, type SearchHit } from './search.ts';
 
@@ -254,6 +254,25 @@ export async function findReviewScores(
       // prose version would find nothing and look like a site that publishes
       // no reviews.
       let html = await fetchRawHtml(score.url);
+
+      // The site's own number, where the page states it. What a search snippet
+      // said is a guess about this figure, not the figure — and a wrong one is
+      // a fabricated claim about a company's reputation.
+      const published = aggregateFrom(html ?? '') ?? statedFrom(html ?? '', score.url);
+      if (published) {
+        if (Math.abs(published.rating / published.scale - score.rating / score.scale) > 0.05) {
+          emit(
+            'info',
+            `${score.site}: the page says ${published.rating}/${published.scale}, not the `
+            + `${score.rating}/${score.scale} the search result implied — using the page`,
+          );
+        }
+        score.rating = published.rating;
+        score.scale = published.scale;
+        score.count = published.count ?? score.count;
+        score.verified = true;
+      }
+
       let recent = readReviews(html ?? '');
 
       // Nothing readable on the page we were served? Try the scraper before
@@ -264,6 +283,16 @@ export async function findReviewScores(
       if (recent.length === 0) {
         html = await fetchRawHtml(score.url, true);
         recent = readReviews(html ?? '');
+        // A page that only arrived through the scraper still states its score.
+        if (!score.verified) {
+          const late = aggregateFrom(html ?? '') ?? statedFrom(html ?? '', score.url);
+          if (late) {
+            score.rating = late.rating;
+            score.scale = late.scale;
+            score.count = late.count ?? score.count;
+            score.verified = true;
+          }
+        }
       }
 
       if (recent.length) {
@@ -277,11 +306,34 @@ export async function findReviewScores(
     }
   }
 
-  const hearsay = found.filter((s) => !s.firstParty).length;
+  // What the site did not state itself is kept as a row and shown without a
+  // number.
+  //
+  // Two failures to avoid at once, and they pull in opposite directions. A
+  // rating parsed out of a search result is a number found in text near a
+  // site's name; printed as that site's score it is a claim about a company's
+  // reputation with nothing behind it. But deleting those rows leaves a panel
+  // that says nothing about G2 or Capterra — and silence reads as "no presence
+  // there", which is a second false claim.
+  //
+  // So the row survives and the figure does not: the site is listed, marked
+  // unreadable, and linked, which is the true statement. G2 and Capterra serve
+  // no document at all to a non-browser; that is a fact about them worth
+  // seeing, and it is also the thing a write key or a logged-in scraper would
+  // fix.
+  const verified = found.filter((score) => score.verified);
+  const unreadable = found.filter((score) => !score.verified);
+  if (unreadable.length) {
+    emit(
+      'warn',
+      `${unreadable.length} score(s) shown without a number — ${unreadable.map((s) => s.site).join(', ')}`
+      + ': the page could not be read, and the search snippet is not the site',
+    );
+  }
   emit(
     'info',
-    `review scores: ${found.length} of ${SITES.length} sites`
-    + (hearsay ? ` (${hearsay} quoted second-hand, not from the site itself)` : ''),
+    `review scores: ${verified.length} of ${SITES.length} sites read from the site itself`
+    + (unreadable.length ? `, ${unreadable.length} unreadable` : ''),
   );
   return found;
 }

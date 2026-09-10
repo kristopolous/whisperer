@@ -32,6 +32,28 @@ export interface Profile {
   confidence: 'high' | 'low';
 }
 
+export interface DropExample {
+  url: string;
+  title: string;
+}
+
+/** One reason, one stage, one source: how many were thrown away and a sample of
+ *  which. The sample is what tells a filter working from a filter misfiring. */
+export interface Drop {
+  stage: Stage | 'unknown';
+  reason: string;
+  count: number;
+  examples: DropExample[];
+}
+
+/** What one source yielded, and what became of it. */
+export interface VenueAudit {
+  venue: string;
+  /** Distinct results search returned for this venue, before any filter. */
+  returned: number;
+  drops: Drop[];
+}
+
 export interface Mention {
   id: string;
   venue: Venue;
@@ -362,6 +384,11 @@ export interface Scan {
   errorKind?: ErrorKind;
   profiles: Profile[];
   mentions: Mention[];
+  /** Per-source accounting: what search returned, and what we threw away and
+   *  why. The coverage grid's empty rows are unreadable without it — an empty
+   *  row means "nobody posted", "nothing came back" or "we dropped it all", and
+   *  those call for three different responses. */
+  retrieval?: VenueAudit[];
   issues: Issue[];
   abuse: AbuseFinding[];
   buzz: BuzzPoint[];

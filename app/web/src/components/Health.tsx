@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { FixStep, Issue, Mention, Scan, Stage, Tracker } from '../../../shared/types.ts';
-import { api, apiUrl, fmtAgo, fmtDate, venueOf } from '../lib.ts';
+import { api, apiUrl, fmtAgo, fmtDate, plain, venueOf } from '../lib.ts';
 import type { DefectHistory, Series } from '../../../server/series.ts';
 import { Filter, matches } from './Filter.tsx';
 import { ResolutionLoop } from './ResolutionLoop.tsx';
@@ -757,7 +757,7 @@ function Report({ scan, issue, onChange, onScan }: {
         </>
       )}
 
-      <p>{issue.summary}</p>
+      <p>{plain(issue.summary)}</p>
 
       <h5>Impact</h5>
       <p>{issue.impact}</p>

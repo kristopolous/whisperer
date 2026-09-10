@@ -157,6 +157,80 @@ export function aggregateFrom(html: string): { rating: number; scale: number; co
   return null;
 }
 
+/** The rating a page states about its own subject, in prose.
+ *
+ *  The JSON-LD path above covers the sites that publish structured data, which
+ *  measured on Replit is one in five. The rest state the figure perfectly
+ *  plainly in the page — Trustpilot prints it under the domain name, Indeed
+ *  prints it at the top of the reviews tab — and refusing to read it means an
+ *  empty scorecard, which is its own kind of lie.
+ *
+ *  Every pattern here is anchored on the page's own subject, and that anchoring
+ *  is the entire safety property. A Trustpilot page carries six other
+ *  TrustScores in its "companies you might like" rail; a pattern that merely
+ *  looked for "TrustScore N out of 5" would return whichever one appeared
+ *  first, which is exactly the class of mistake this function exists to end.
+ *  Matching `replit.com Reviews … 1,534 … TrustScore 3 out of 5 … 2.9` cannot
+ *  pick up a neighbour, because the neighbours are not the subject.
+ *
+ *  Per-site and deliberately so. A general "find a rating in this page" reader
+ *  is a guess wearing a parser's clothes. When a site changes its wording this
+ *  returns null and the score is reported as unreadable — the correct failure.
+ */
+export function statedFrom(page: string, url: string): { rating: number; scale: number; count: number | null } | null {
+  if (!page) return null;
+  let host: string;
+  let subject: string;
+  try {
+    const parsed = new URL(url);
+    host = parsed.hostname.replace(/^www\./, '').toLowerCase();
+    subject = parsed.pathname.split('/').filter(Boolean).pop() ?? '';
+  } catch {
+    return null;
+  }
+
+  const num = (raw: string | undefined): number | null => {
+    const value = Number((raw ?? '').replace(/,/g, ''));
+    return Number.isFinite(value) ? value : null;
+  };
+
+  // Trustpilot: "<domain> Reviews \n 1,534 \n • \n TrustScore 3 out of 5 \n 2.9".
+  // The rounded TrustScore is what the stars show; the number after it is the
+  // real average, and that is the one worth reporting.
+  if (host === 'trustpilot.com') {
+    const domain = /\/review\/([^/?#]+)/.exec(url)?.[1];
+    if (domain) {
+      const found = new RegExp(
+        `${domain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+Reviews\\s+([\\d,]+)\\s*.{0,12}?`
+        + `TrustScore\\s+([\\d.]+)\\s+out of\\s+(\\d+)\\s+([\\d.]+)`,
+        'is',
+      ).exec(page);
+      if (found) {
+        const rating = num(found[4]) ?? num(found[2]);
+        const scale = num(found[3]) ?? 5;
+        if (rating !== null && scale > 0 && rating <= scale) {
+          return { rating, scale, count: num(found[1]) };
+        }
+      }
+    }
+  }
+
+  // Indeed: the reviews tab leads with "4.0 out of 5 stars.4.0" — the figure
+  // repeated because the visual rating and its label are adjacent in the DOM.
+  if (host === 'indeed.com' && /\/reviews\b/.test(url)) {
+    const found = /([\d.]+)\s*out of\s*(\d+)\s*stars/i.exec(page);
+    const rating = num(found?.[1]);
+    const scale = num(found?.[2]) ?? 5;
+    if (rating !== null && scale > 0 && rating <= scale) {
+      const reviews = /([\d,]+)\s+reviews?\b/i.exec(page);
+      return { rating, scale, count: num(reviews?.[1]) };
+    }
+  }
+
+  void subject;
+  return null;
+}
+
 /** Reviews out of the markdown a scraper returns.
  *
  *  The fallback, and only reached when the JSON-LD is gone. Trustpilot blocks a
@@ -202,8 +276,54 @@ export function reviewsFromMarkdown(markdown: string, limit = 6): ReviewSnippet[
   return out.sort((a, b) => (b.date ?? '').localeCompare(a.date ?? '')).slice(0, limit);
 }
 
+/** Reviews out of an Indeed company page.
+ *
+ *  Indeed publishes no `Review` objects and does not use Trustpilot's wording,
+ *  so both readers above come back empty on a page that plainly has reviews on
+ *  it — which renders as "4.0 out of 5, no reviews readable" while the review
+ *  sits there in the markdown. Employee reviews are worth having: they are the
+ *  only source here that speaks to how the company runs rather than how the
+ *  product behaves.
+ *
+ *  Anchored on the review's own permalink, which is the one element of the
+ *  shape that cannot appear anywhere else on the page:
+ *
+ *      February 14, 2023
+ *      \[Impact but lots of work]\(/cmp/Replit/reviews/impact-but-lots-of-work?id=…)
+ *      Engineer
+ *      San Francisco, CA
+ *      It's a fun experience and environment. But you will have to…
+ */
+export function reviewsFromIndeed(markdown: string, limit = 6): ReviewSnippet[] {
+  if (!markdown) return [];
+
+  const pattern = /([A-Z][a-z]+\s+\d{1,2},\s+\d{4})\n+\\?\[([^\n\]]{1,120})\]\\?\((\/cmp\/[^)\s]*\/reviews\/[^)\s]*)\)\n+([^\n]{0,80})\n+([^\n]{0,80})\n+([\s\S]*?)(?=\n\s*(?:Was this review helpful|Yes\b|Report\b|[A-Z][a-z]+\s+\d{1,2},\s+\d{4}\n)|$)/g;
+
+  const out: ReviewSnippet[] = [];
+  for (const match of markdown.matchAll(pattern)) {
+    const [, when, title, , role, place, raw] = match;
+    const body = cleanText((raw ?? '').trim());
+    if (body.length < 15) continue;
+    const parsed = new Date(when ?? '');
+    out.push({
+      // Indeed reviews are anonymous; the job title and location are what it
+      // publishes instead, and they are the part that gives a review weight.
+      author: [role, place].map((s) => (s ?? '').trim()).filter(Boolean).join(', ') || null,
+      rating: null,
+      date: Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null,
+      title: (title ?? '').trim() || null,
+      body: body.slice(0, 600),
+    });
+  }
+
+  return out.sort((a, b) => (b.date ?? '').localeCompare(a.date ?? '')).slice(0, limit);
+}
+
 /** Whatever the page turns out to be. */
 export const readReviews = (page: string, limit = 6): ReviewSnippet[] => {
   const structured = reviewsFrom(page, limit);
-  return structured.length ? structured : reviewsFromMarkdown(page, limit);
+  if (structured.length) return structured;
+  const trustpilot = reviewsFromMarkdown(page, limit);
+  if (trustpilot.length) return trustpilot;
+  return reviewsFromIndeed(page, limit);
 };

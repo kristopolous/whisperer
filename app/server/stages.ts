@@ -9,6 +9,7 @@ import { resolveSubject } from './agents/resolve-run.ts';
 import { findReviewScores } from './reviews.ts';
 import { brandToken } from '../shared/name.ts';
 import * as store from './store.ts';
+import { audit, mergeAudit } from './suppression.ts';
 import { applyOverrides } from './presence-overrides.ts';
 
 export interface StageCtx {
@@ -309,6 +310,11 @@ export async function runStage(ctx: StageCtx, next: Stage): Promise<void> {
     scan.timings[next] = Date.now() - started;
     scan.pulledAt = { ...scan.pulledAt, [next]: new Date().toISOString() };
     scan.stage = next;
+    // Recorded on success and on failure alike. A stage that died halfway still
+    // suppressed whatever it suppressed before it died, and that accounting is
+    // most of what says where the gap came from.
+    scan.retrieval = mergeAudit(scan.retrieval ?? [], audit(scan.id), next);
     store.put(scan);
+    send({ type: 'patch', scan: { retrieval: scan.retrieval } });
   });
 }

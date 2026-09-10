@@ -3,7 +3,7 @@ import type { Scan } from '../../../shared/types.ts';
 import { VenueBars } from '../charts/VenueBars.tsx';
 import { Filter, matches } from './Filter.tsx';
 import { Coverage } from '../charts/Coverage.tsx';
-import { VENUES, fmtDate, fmtMonth, fmtScore, venueOf } from '../lib.ts';
+import { VENUES, fmtDate, fmtMonth, fmtScore, plain, venueOf } from '../lib.ts';
 
 /** Discovery is the raw material for everything else: every mention and where
  *  it lives. The ledger shows the remarks; the venue bars show the mix. */
@@ -123,7 +123,7 @@ export function Buzz({ scan, cursor, onDig }: {
                   </td>
                   <td>
                     <a href={m.url} target="_blank" rel="noreferrer">{m.title}</a>
-                    <div className="quote">{m.excerpt.slice(0, 190)}{m.excerpt.length > 190 ? '…' : ''}</div>
+                    <div className="quote">{plain(m.excerpt).slice(0, 190)}{plain(m.excerpt).length > 190 ? '…' : ''}</div>
                     {m.themes.length > 0 && (
                       <div style={{ marginTop: 6, display: 'flex', gap: 5, flexWrap: 'wrap' }}>
                         {m.themes.slice(0, 4).map((t) => (

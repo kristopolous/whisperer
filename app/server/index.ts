@@ -335,7 +335,22 @@ setRunner(async (job: Job, onStage) => {
     scan.log.push({ at: new Date().toISOString(), level, stage: scan.stage, text });
   };
 
-  store.patch(scan.id, { startedAt: new Date().toISOString(), status: 'running' });
+  // A new run supersedes the last one's failure.
+  //
+  // The same clearing exists in `run.ts`, but the queue does not go through it
+  // — this runner drives `runStage` directly, and the queue is now how every
+  // run starts. So a scan that was once interrupted kept `error`, `failedStage`
+  // and the rest forever: a Replit run finished cleanly, produced 328 defects,
+  // and still displayed "Interrupted — the server stopped while this run was in
+  // progress" from an attempt two hours earlier.
+  store.patch(scan.id, {
+    startedAt: new Date().toISOString(),
+    status: 'running',
+    error: undefined,
+    errorDetail: undefined,
+    errorKind: undefined,
+    failedStage: undefined,
+  });
   try {
     for (const stage of job.stages.length ? job.stages : STAGE_KEYS) {
       onStage(stage);

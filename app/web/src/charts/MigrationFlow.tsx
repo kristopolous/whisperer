@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { Migration } from '../../../shared/types.ts';
-import { fmtDate, venueOf } from '../lib.ts';
+import { fmtDate, plain, venueOf } from '../lib.ts';
 
 /** Who people leave for, and who they arrive from.
  *
@@ -140,7 +140,7 @@ export function MigrationFlow({ migrations, onSearchDeeper, busy }: {
                         in the search snippet the model was given, so the link
                         is the only way to read the rest of the sentence. */}
                     <blockquote>
-                      {move.quote}
+                      {plain(move.quote)}
                       <cite>
                         {' — '}
                         <a href={move.url} target="_blank" rel="noreferrer">
