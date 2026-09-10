@@ -538,7 +538,22 @@ section { margin-top: 44px; }
    as a chart whose data stops there, which is the one thing a chart must not
    say by accident. */
 .viz { padding: 8px 12px 14px; max-width: 100%; overflow-x: auto; }
-.viz svg { display: block; width: 100%; max-width: 100%; height: auto; overflow: visible; }
+/* Charts draw at their own size, and only shrink.
+   `width: 100%` stretched every chart to its panel and scaled the contents with
+   it — a 460-unit-wide chart in an 881px panel is drawn at 1.92x, so its 11px
+   labels rendered at 25px and the whole thing towered over every other word on
+   the page. Setting `width` and `height` on the <svg> did not help, because
+   this rule beat the attributes.
+   `max-width: 100%` with `width: auto` keeps the intrinsic size on a wide
+   panel and still lets a narrow one shrink it. A chart that has its own idea of
+   how big it should be is entitled to it. */
+.viz svg {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  overflow: visible;
+}
 .tick { font: 400 10px var(--mono); fill: var(--ink-3); }
 .mark-label { font: 500 11px var(--mono); fill: var(--ink-2); }
 .gridline { stroke: var(--grid); stroke-width: 1; }
@@ -2662,4 +2677,39 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 .cover-cell.hit:focus-visible {
   outline: 2px solid var(--signal);
   outline-offset: 1px;
+}
+
+/* A cell with work against it. -------------------------------------------
+   Marching ants, because at 13x14px a pulse alone is ambiguous — half these
+   cells already vary in opacity to show volume, so brightness is a channel
+   this grid has already spent. A moving border is the one thing here that
+   cannot be mistaken for data.
+   Four repeating gradients, one per edge, with their positions animated. The
+   tidier `mask ... exclude` version of this does not render in Chrome, which
+   wants `-webkit-mask-composite: xor` instead — so the ring is drawn directly
+   rather than punched out of a filled box. */
+.cover-cell.chasing { position: relative; z-index: 1; }
+.cover-cell.chasing::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  pointer-events: none;
+  background-image:
+    linear-gradient(90deg, var(--signal) 50%, transparent 0),
+    linear-gradient(90deg, var(--signal) 50%, transparent 0),
+    linear-gradient(0deg, var(--signal) 50%, transparent 0),
+    linear-gradient(0deg, var(--signal) 50%, transparent 0);
+  background-repeat: repeat-x, repeat-x, repeat-y, repeat-y;
+  background-size: 6px 1px, 6px 1px, 1px 6px, 1px 6px;
+  background-position: 0 0, 0 100%, 0 0, 100% 0;
+  animation: ants 0.5s linear infinite;
+}
+@keyframes ants {
+  to {
+    background-position: 6px 0, -6px 100%, 0 -6px, 100% 6px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Still unmistakably marked, just not moving. */
+  .cover-cell.chasing::after { animation: none; }
 }

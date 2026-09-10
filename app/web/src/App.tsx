@@ -130,7 +130,48 @@ export function App() {
   const [patchSignal, setPatchSignal] = useState(0);
   /** The queue, polled. Declared here because both the header indicator and
    *  the per-button disabled test read it, and both run during render. */
-  const [jobs, setJobs] = useState<{ scanId: string; stages: Stage[]; state: string; company?: string; stage?: Stage }[]>([]);
+  const [jobs, setJobs] = useState<{
+    scanId: string; stages: Stage[]; state: string; company?: string; stage?: Stage;
+    options?: { dig?: string; digFrom?: string; digTo?: string };
+  }[]>([]);
+  /** Cells clicked in the last few seconds.
+   *
+   *  The queue is the truth about what is being pursued, but it is polled every
+   *  five seconds, and a square that does nothing for five seconds after you
+   *  click it reads as a square that does nothing. These carry the mark until
+   *  the poll can — then the poll takes over, so a job that was refused or
+   *  cancelled stops being marked rather than staying lit forever. */
+  const [justClicked, setJustClicked] = useState<Record<string, number>>({});
+
+  /** Drop a local mark once the queue can speak for it, or after twelve
+   *  seconds if the queue never picked it up at all.
+   *
+   *  Two ways this could otherwise stick. Testing `clock - at < 12_000` during
+   *  render tied the expiry to the live clock, which only ticks while a run is
+   *  in flight — so once everything finished, the comparison stopped being
+   *  re-evaluated and the ants ran forever. And a local mark that outlives its
+   *  job says work is happening when none is, which is the same lie as a stale
+   *  error. */
+  useEffect(() => {
+    const keys = Object.keys(justClicked);
+    if (keys.length === 0) return;
+    const live = new Set(
+      jobs
+        .filter((job) => (job.state === 'queued' || job.state === 'running') && job.scanId === scan.id)
+        .map((job) => `${job.options?.dig}|${job.options?.digFrom}|${job.options?.digTo}`),
+    );
+    const now = Date.now();
+    const keep = Object.fromEntries(
+      Object.entries(justClicked).filter(([key, at]) => live.has(key) || now - at < 12_000),
+    );
+    if (Object.keys(keep).length !== keys.length) setJustClicked(keep);
+    // A timer as well as the jobs poll, so the last mark expires even if the
+    // poll never changes again.
+    const timer = setTimeout(() => setJustClicked((prev) => Object.fromEntries(
+      Object.entries(prev).filter(([key, at]) => live.has(key) || Date.now() - at < 12_000),
+    )), 3_000);
+    return () => clearTimeout(timer);
+  }, [justClicked, jobs, scan.id]);
   /** Whether anything is running, readable synchronously inside a callback —
    *  the state closure is a render behind, and this decides whether a click
    *  starts work or joins the line. */
@@ -501,6 +542,24 @@ useEffect(() => {
    *  alone leaves a gap — a queue-started run is invisible in the first for a
    *  while, and a run started directly from this page never appears in the
    *  second at all. */
+  /** Which source-and-window cells have work against them, as `venue|from|to`.
+   *
+   *  From the queue, so it survives a reload and shows work somebody else
+   *  started — plus anything clicked in the last twelve seconds, which is the
+   *  gap the five-second poll leaves. */
+  const pursuing = (() => {
+    const keys = new Set<string>();
+    for (const job of jobs) {
+      const { dig, digFrom, digTo } = job.options ?? {};
+      if (!dig || !digFrom || !digTo) continue;
+      if (job.scanId !== scan.id) continue;
+      if (job.state !== 'queued' && job.state !== 'running') continue;
+      keys.add(`${dig}|${digFrom}|${digTo}`);
+    }
+    for (const key of Object.keys(justClicked)) keys.add(key);
+    return keys;
+  })();
+
   const busyRuns = (() => {
     const byId = new Map<string, { id: string; company: string; stage: Scan['stage'] }>();
     for (const job of jobs) {
@@ -540,7 +599,7 @@ useEffect(() => {
   useEffect(() => {
     let live = true;
     const read = () => {
-      api<{ waiting: number; jobs: { scanId: string; stages: Stage[]; state: string; company?: string; stage?: Stage }[] }>('api/jobs')
+      api<{ waiting: number; jobs: typeof jobs }>('api/jobs')
         .then((data) => {
           if (!live) return;
           setWaiting(data.waiting);
@@ -561,6 +620,31 @@ useEffect(() => {
     const timer = setInterval(read, 5_000);
     return () => { live = false; clearInterval(timer); };
   }, [refresh]);
+
+  /** Pull the scan back down when work on it finishes.
+   *
+   *  A queued job writes to the record on the server and this page never hears
+   *  about it — the stream belongs to runs this page started, and a queued one
+   *  opens none. So a dig would complete, the ants would stop, and the grid
+   *  would still show the counts from before the search that was just paid for.
+   *  Watching the queue for a job that was live and is not any more is the
+   *  signal, and it is the same signal for every kind of queued work. */
+  const wasLive = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const live = new Set(
+      jobs.filter((job) => job.state === 'running' || job.state === 'queued')
+        .map((job) => `${job.scanId}:${job.stages.join('+')}`),
+    );
+    const finished = [...wasLive.current].filter((key) => !live.has(key));
+    wasLive.current = live;
+    if (finished.length === 0) return;
+    const mine = finished.some((key) => key.startsWith(`${scan.id}:`));
+    if (!mine || !scan.id) return;
+    api<Scan>(`api/scans/${scan.id}`)
+      .then((fresh) => setScan(normalize({ ...fresh, id: scan.id })))
+      .catch(() => {});
+    refresh();
+  }, [jobs, scan.id, refresh]);
 
   /** Put an ask in the queue and say so. */
   const queueInstead = useCallback(async (
@@ -1135,8 +1219,11 @@ useEffect(() => {
                       scan={scan}
                       cursor={cursor}
                       onDig={(venue) => rerun(['discovery', 'buzz'], { dig: venue })}
-                      onDigWindow={(venue, digFrom, digTo) =>
-                        rerun(['discovery', 'buzz'], { dig: venue, digFrom, digTo })}
+                      pursuing={pursuing}
+                      onDigWindow={(venue, digFrom, digTo) => {
+                        setJustClicked((prev) => ({ ...prev, [`${venue}|${digFrom}|${digTo}`]: Date.now() }));
+                        void rerun(['discovery', 'buzz'], { dig: venue, digFrom, digTo });
+                      }}
                     />
                   </section>
                 )}

@@ -7,13 +7,15 @@ import { VENUES, fmtDate, fmtMonth, fmtScore, plain, venueOf } from '../lib.ts';
 
 /** Discovery is the raw material for everything else: every mention and where
  *  it lives. The ledger shows the remarks; the venue bars show the mix. */
-export function Buzz({ scan, cursor, onDig, onDigWindow }: {
+export function Buzz({ scan, cursor, onDig, onDigWindow, pursuing }: {
   scan: Scan;
   cursor: string | null;
   /** Search one source harder — the coverage grid's row click. */
   onDig?: (venue: string) => void;
   /** One source, one bucket — the cell rather than the row. */
   onDigWindow?: (venue: string, from: string, to: string) => void;
+  /** `venue|from|to` keys with work queued or running against them. */
+  pursuing?: Set<string>;
 }) {
   const [venue, setVenue] = useState<string>('all');
   const [query, setQuery] = useState('');
@@ -68,7 +70,7 @@ export function Buzz({ scan, cursor, onDig, onDigWindow }: {
     // glance.
     <div className="stack">
       <div className="panel">
-        <Coverage scan={scan} onDig={onDig} onDigWindow={onDigWindow} />
+        <Coverage scan={scan} onDig={onDig} onDigWindow={onDigWindow} pursuing={pursuing} />
         <header>
           <h3>Ledger</h3>
           <span style={{ font: '400 11px var(--mono)', color: 'var(--ink-3)' }}>

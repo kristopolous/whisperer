@@ -52,7 +52,7 @@ const labelFor = (key: string, grain: 'week' | 'month') =>
     ? new Date(`${key}-01T00:00:00Z`).toLocaleDateString(undefined, { month: 'short', year: '2-digit' })
     : new Date(`${key}T00:00:00Z`).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }));
 
-export function Coverage({ scan, onDig, onDigWindow }: {
+export function Coverage({ scan, onDig, onDigWindow, pursuing }: {
   scan: Scan;
   /** Search one source harder. Only the sources with their own reader can be
    *  dug into — everything else arrives through general web search, where there
@@ -61,6 +61,9 @@ export function Coverage({ scan, onDig, onDigWindow }: {
   /** Search one source inside one bucket — the cell rather than the row. A dark
    *  band is a source AND a month, and this is the ask that fills it. */
   onDigWindow?: (venue: string, from: string, to: string) => void;
+  /** `venue|from|to` keys with work queued or running against them, so a cell
+   *  that was clicked says so until the work lands. */
+  pursuing?: Set<string>;
 }) {
   const [hover, setHover] = useState<{ venue: string; bucket: string; n: number } | null>(null);
   const [aiming, setAiming] = useState<string | null>(null);
@@ -189,6 +192,7 @@ export function Coverage({ scan, onDig, onDigWindow }: {
               onAim={setAiming}
               onDig={onDig}
               onDigWindow={onDigWindow}
+              pursuing={pursuing}
               picked={picked === row.key}
               onPick={() => setPicked(picked === row.key ? null : row.key)}
             />
@@ -234,7 +238,7 @@ const WHY: Record<string, string> = {
   forum: 'aims the complaint queries at the forums in Sources',
 };
 
-function Row({ row, buckets, counts, undated, anyUndated, peak, grain, rowTotal, onHover, onAim, onDig, onDigWindow, picked, onPick }: {
+function Row({ row, buckets, counts, undated, anyUndated, peak, grain, rowTotal, onHover, onAim, onDig, onDigWindow, pursuing, picked, onPick }: {
   row: { key: string; label: string; slot: string };
   buckets: string[];
   counts: Map<string, number>;
@@ -247,6 +251,7 @@ function Row({ row, buckets, counts, undated, anyUndated, peak, grain, rowTotal,
   onAim: (text: string | null) => void;
   onDig?: (venue: string) => void;
   onDigWindow?: (venue: string, from: string, to: string) => void;
+  pursuing?: Set<string>;
   picked: boolean;
   onPick: () => void;
 }) {
@@ -309,6 +314,8 @@ function Row({ row, buckets, counts, undated, anyUndated, peak, grain, rowTotal,
           return stop.toISOString().slice(0, 10);
         };
         const hittable = Boolean(onDigWindow) && row.key !== 'other';
+        // Work is queued or running against exactly this source and window.
+        const chasing = pursuing?.has(`${row.key}|${from}|${until()}`) ?? false;
         return (
           <span
             key={b}
@@ -322,7 +329,7 @@ function Row({ row, buckets, counts, undated, anyUndated, peak, grain, rowTotal,
                 onDigWindow?.(row.key, from, until());
               }
             } : undefined}
-            className={`cover-cell${n === 0 ? ' none' : ''}${hittable ? ' hit' : ''}`}
+            className={`cover-cell${n === 0 ? ' none' : ''}${hittable ? ' hit' : ''}${chasing ? ' chasing' : ''}`}
             // Square-rooted, because a linear ramp against a peak of 400 makes
             // every ordinary week look empty — and "empty" is the one thing
             // this grid must not say by accident.
