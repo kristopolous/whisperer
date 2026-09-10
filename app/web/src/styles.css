@@ -674,15 +674,16 @@ td .quote { color: var(--ink-2); font-size: 12.5px; margin-top: 3px; }
   .panel.fail { animation: rise 0.4s var(--ease); }
 }
 
-/* Stays put while you read. A run is minutes long and the console is the only
-   thing that says whether it is moving, so scrolling down a defect list should
-   not take it off the screen. */
-.runbar-sticky {
-  position: sticky;
-  top: 0;
-  z-index: 30;
-  background: var(--paper);
-}
+/* Sits above the tabs and stays mounted across them.
+   That is the whole requirement: switching tabs redraws the tab's section, not
+   the run status, so a live run does not visibly restart every time you look at
+   another screen. It is achieved by where this lives in the tree — outside
+   `.tab-body` — and needs no positioning at all.
+   It was `position: sticky; top: 0` for a while, which solved a problem nobody
+   had and created one: a panel pinned to the top of the viewport covers the
+   page underneath it, and a second sticky element at the same edge covers this
+   one in turn. */
+.runbar-sticky { position: static; }
 
 .tab-body { margin-top: 26px; }
 
@@ -830,8 +831,13 @@ button.big {
 .runbar { display: grid; gap: 12px; padding: 14px 16px 16px; }
 .run-head {
   display: flex; align-items: center; justify-content: space-between; gap: 14px;
-  flex-wrap: wrap;
-  row-gap: 10px;
+  /* Deliberately does NOT wrap here. Wrapping was added to stop the clocks
+     colliding on a narrow window, but it turned a one-line sticky bar into a
+     three-line one at ordinary widths — and a sticky element that tall covers
+     the page it is supposed to sit above. The clocks shrink instead, and only
+     the phone breakpoint below is allowed to wrap. */
+  flex-wrap: nowrap;
+  min-width: 0;
 }
 /* Centred, not baseline-aligned, and with one line-height across the row.
    `align-items: baseline` matches the baselines of an 11px uppercase mono word
@@ -2395,6 +2401,9 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   /* Room for a badge that overhangs its button by 6px. A wrapped header packs
      rows tight enough that the overhang lands on the row above. */
   .masthead { row-gap: 16px; }
+  /* Now it may wrap: there is genuinely no room for the title, three clocks and
+     the step dots on one line at 360px. */
+  .run-head { flex-wrap: wrap; row-gap: 10px; }
   .rig { margin-left: auto; padding-right: 2px; }
   .masthead form { max-width: none; }
 
@@ -2527,8 +2536,10 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
 /* Served-code-is-older-than-source. Loud on purpose: every minute spent looking
    for a bug that was already fixed starts here. */
 .stale-build {
-  position: sticky;
-  top: 0;
+  /* Not sticky. It was, and a second element pinned at `top: 0` does not stack
+     below the first — it sits on top of it, so the run status disappeared under
+     a build warning. This is a one-time notice; it can scroll away, and the run
+     status is the thing that has earned the top of the viewport. */
   z-index: 40;
   padding: 8px 28px;
   background: color-mix(in srgb, var(--warning) 20%, var(--paper));
