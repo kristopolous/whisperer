@@ -20,6 +20,7 @@ import { mentionId } from './mention-id.ts';
 import { audit, dropped as noteDrop, droppedAll as noteDrops, retrieved } from './suppression.ts';
 import { UpstreamTrouble } from './upstream-trouble.ts';
 import { windowQueries } from './date-queries.ts';
+import { ownSite } from './own-site.ts';
 import { readingBudget } from './reading-budget.ts';
 import { describeError, why } from './errors.ts';
 import { enabledLanguages, queriesFor } from './languages.ts';
@@ -1132,13 +1133,9 @@ export async function findMentions(
   for (const hit of hits) retrieved(hit.url);
   emit('info', `${hits.length} distinct results, ${fromComplaints.size} whose text reads as a complaint`);
 
-  const ownHost = (() => {
-    try {
-      return new URL(site).hostname.replace(/^www\./, '');
-    } catch {
-      return '';
-    }
-  })();
+  // Path-aware: a subject at github.com/microsoft/markitdown owns that path,
+  // not github.com. See own-site.ts.
+  const own = ownSite(site);
 
   // Counted per reason rather than in total. A single "dropped 79 results"
   // line — worse, one that called all of them dictionary noise — hides which
@@ -1147,9 +1144,9 @@ export async function findMentions(
   const reasons = { ownSite: 0, lexical: 0, unrelated: 0, homepage: 0 };
   const usable = hits.filter((hit) => {
     // A vendor's own blog, docs and status page are not third-party discussion.
-    if (ownHost && hit.url.includes(ownHost)) {
+    if (own.owns(hit.url)) {
       reasons.ownSite += 1;
-      noteDrop(hit, `on the company's own site (${ownHost})`);
+      noteDrop(hit, `on the company's own site (${own.label})`);
       return false;
     }
     // A brand that is also an ordinary word drags in dictionary and spelling
@@ -1192,7 +1189,7 @@ export async function findMentions(
   if (dropped) {
     emit(
       'info',
-      `kept ${usable.length} of ${hits.length}: dropped ${reasons.ownSite} on ${ownHost || 'own site'}, `
+      `kept ${usable.length} of ${hits.length}: dropped ${reasons.ownSite} on ${own.label || 'own site'}, `
       + `${reasons.lexical} dictionary/spelling, ${reasons.unrelated} that never name "${brand}", `
       + `${reasons.homepage} homepages`,
     );
@@ -2241,17 +2238,13 @@ export async function findAbuse(
   const hits = await braveSearchAll(queries, 8, (query, message) =>
     emit('warn', `search "${query}" failed — ${message}`));
 
-  const ownHost = (() => {
-    try {
-      return new URL(site).hostname.replace(/^www\./, '');
-    } catch {
-      return '';
-    }
-  })();
+  // Path-aware: a subject at github.com/microsoft/markitdown owns that path,
+  // not github.com. See own-site.ts.
+  const own = ownSite(site);
 
   // The company's own pages are not abusing the company.
   const shortlist = hits
-    .filter((hit) => !ownHost || !hit.url.includes(ownHost))
+    .filter((hit) => !own.owns(hit.url))
     .slice(0, 30);
 
   if (shortlist.length === 0) {

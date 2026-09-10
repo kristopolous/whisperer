@@ -152,14 +152,33 @@ export async function resolveSubject(
           resolved.site = homepage;
           emit('info', `site taken from the repository's own metadata: ${homepage}`);
         }
-      } else if (resolved.site) {
+      } else {
         // The host was asked and said there is no homepage. That is an answer,
         // and it beats a guess: resolving `hangman-test-1` produced
         // `https://yourhomework.net`, a real and entirely unrelated site, which
         // the crawler then dutifully read for the company's social accounts.
-        // A repository with no homepage has no homepage.
-        emit('warn', `ignoring "${resolved.site}" — the repository lists no homepage, so there is nothing to crawl`);
-        resolved.site = '';
+        //
+        // But blanking it outright was the wrong conclusion. A repository with
+        // no homepage is not a subject with no home — the repository IS the
+        // home, and it is a real URL with a README, a link list and an issue
+        // tracker on it. `microsoft/markitdown` resolved with high confidence
+        // and then produced `site: ""`, so the footprint crawl reported "not a
+        // site to crawl", found zero channels, and the scan came back with
+        // nothing from the one place its users actually are.
+        //
+        // Safe now that the own-site filter is path-aware: pointing `site` at
+        // github.com/owner/repo excludes that repo's own pages from the corpus
+        // without excluding the whole of GitHub with them.
+        const page = String(facts.html_url ?? facts.web_url ?? raw).trim();
+        if (resolved.site && resolved.site !== page) {
+          emit(
+            'warn',
+            `ignoring "${resolved.site}" — the repository lists no homepage, so the repository `
+            + 'itself is the site',
+          );
+        }
+        resolved.site = page;
+        emit('info', `no homepage listed, so the repository page is the site: ${page}`);
       }
       if (!resolved.repo && clone) resolved.repo = clone;
       if (resolved.site && homepage && resolved.site !== homepage) {
