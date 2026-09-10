@@ -2471,7 +2471,7 @@ export async function groupTopics(
       // group four themes is not going to manage two. Stop and let those fall
       // through to mechanical consolidation.
       if (slice.length > 4 && depth < 2) {
-        emit('info', `topic slice of ${slice.length} failed (${why}) — splitting and retrying`);
+        emit('info', `topic slice of ${slice.length} failed (${reason}) — splitting and retrying`);
         const half = Math.ceil(slice.length / 2);
         await group(slice.slice(0, half), depth + 1);
         await group(slice.slice(half), depth + 1);
