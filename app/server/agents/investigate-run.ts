@@ -12,7 +12,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { describeError } from '../errors.ts';
+import { describeError, why } from '../errors.ts';
 import type { Issue, Scan } from '../../shared/types.ts';
 import { ensureFork } from '../channels/fork.ts';
 import { createIssue, commentOnIssue, createPullRequest, loopComment, pushBranch } from '../channels/github.ts';
@@ -69,7 +69,7 @@ export async function investigate(
       // Not fatal. Without a fork there is nowhere to publish and nowhere to
       // push, but reading the code is still worth doing and is what most of
       // this run is for.
-      emit('warn', `could not fork — ${describeError(error).slice(0, 200)}`);
+      emit('warn', `could not fork — ${why(error)}`);
     }
   }
 
@@ -157,7 +157,7 @@ export async function investigate(
         ref: { label: `#${result.pr.number}`, url: result.pr.url },
       }];
     } catch (error) {
-      emit('warn', `could not push the patch — ${describeError(error).slice(0, 200)}`);
+      emit('warn', `could not push the patch — ${why(error)}`);
     }
   }
 
@@ -167,7 +167,7 @@ export async function investigate(
     try {
       result.ledger = await publishLedger(scan, issue, emit);
     } catch (error) {
-      emit('warn', `could not publish the record — ${describeError(error).slice(0, 200)}`);
+      emit('warn', `could not publish the record — ${why(error)}`);
     }
   }
 

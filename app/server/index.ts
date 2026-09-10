@@ -29,7 +29,7 @@ import {
 import { runStage, explainFailure } from './stages.ts';
 import * as store from './store.ts';
 import { buildSeries } from './series.ts';
-import { describeError } from './errors.ts';
+import { describeError, why } from './errors.ts';
 import { performScan } from './run.ts';
 import { listSchedule, removeEntry, runningNow, startScheduler, upsert } from './schedule.ts';
 import { listCredits, setLedger } from './credits.ts';
@@ -508,7 +508,7 @@ app.get('/api/inference/models', async (req, res) => {
     res.json({
       reachable: false,
       models: [],
-      error: error instanceof Error ? error.message.slice(0, 140) : 'could not reach it',
+      error: why(error),
     });
   }
 });
@@ -704,7 +704,7 @@ async function inspectConnector(name: string) {
   } catch (error) {
     return {
       reachable: false,
-      error: error instanceof Error ? error.message.slice(0, 200) : String(error),
+      error: why(error),
       tools: [],
       suggested: {},
     };

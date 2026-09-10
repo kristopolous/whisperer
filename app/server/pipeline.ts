@@ -20,7 +20,7 @@ import { mentionId } from './mention-id.ts';
 import { audit, dropped as noteDrop, droppedAll as noteDrops, retrieved } from './suppression.ts';
 import { UpstreamTrouble } from './upstream-trouble.ts';
 import { readingBudget } from './reading-budget.ts';
-import { describeError } from './errors.ts';
+import { describeError, why } from './errors.ts';
 import { enabledLanguages, queriesFor } from './languages.ts';
 import { abuseAgent } from './agents/abuse.ts';
 import { buzzAgent } from './agents/buzz.ts';
@@ -468,7 +468,7 @@ async function upstreamMentions(
   try {
     return await fetchUpstreamIssues(source, emit);
   } catch (error) {
-    emit('warn', `tracker lookup failed — ${error instanceof Error ? error.message.slice(0, 100) : 'error'}`);
+    emit('warn', `tracker lookup failed — ${why(error)}`);
     return [];
   }
 }
@@ -1893,7 +1893,7 @@ export async function scoreBuzz(
     } catch (error) {
       // One failed batch leaves those mentions unscored (neutral); it does not
       // cost the batches that worked.
-      emit('warn', `batch ${index + 1}/${batches.length} failed — ${error instanceof Error ? error.message.slice(0, 120) : 'error'}`);
+      emit('warn', `batch ${index + 1}/${batches.length} failed — ${why(error)}`);
     }
   }
 
@@ -2066,7 +2066,7 @@ export async function findIssues(
       emit('info', `batch ${index + 1}/${batches.length}: ${(result.issues ?? []).length} issue(s)`);
       save();
     } catch (error) {
-      failures.push(error instanceof Error ? error.message.slice(0, 120) : 'error');
+      failures.push(why(error));
       emit('warn', `batch ${index + 1}/${batches.length} failed — ${failures.at(-1)}`);
     }
   }
@@ -2216,7 +2216,7 @@ ${JSON.stringify(batch)}`,
       abuseSucceeded += 1;
       emit('info', `batch ${index + 1}/${batches.length}: ${(result.findings ?? []).length} finding(s)`);
     } catch (error) {
-      emit('warn', `batch ${index + 1}/${batches.length} failed — ${error instanceof Error ? error.message.slice(0, 120) : 'error'}`);
+      emit('warn', `batch ${index + 1}/${batches.length} failed — ${why(error)}`);
     }
   }
 
@@ -2466,7 +2466,7 @@ export async function groupTopics(
         }
       }
     } catch (error) {
-      const why = error instanceof Error ? error.message.slice(0, 100) : 'error';
+      const reason = why(error);
       // Two splits deep is four themes at the smallest, and a model that cannot
       // group four themes is not going to manage two. Stop and let those fall
       // through to mechanical consolidation.

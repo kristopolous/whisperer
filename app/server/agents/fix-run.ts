@@ -17,6 +17,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import { why } from '../errors.ts';
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -222,9 +223,9 @@ Return targeted edits: for each change, the exact text to find in the file and w
       timeoutMs: 600_000,
       });
     } catch (error) {
-      const why = error instanceof Error ? error.message.slice(0, 140) : 'error';
-      emit('warn', `attempt ${attempts}: the model call failed — ${why}`);
-      record({ edits: [], rejected: [], modelError: why, outcome: 'model-failed' });
+      const reason = why(error);
+      emit('warn', `attempt ${attempts}: the model call failed — ${reason}`);
+      record({ edits: [], rejected: [], modelError: reason, outcome: 'model-failed' });
       failure = `Your previous attempt did not return a usable answer (${why}). Try again.`;
       continue;
     }

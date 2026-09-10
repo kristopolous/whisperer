@@ -8,6 +8,7 @@
  */
 
 import type { Subject } from '../../shared/types.ts';
+import { why } from '../errors.ts';
 import { braveSearch } from '../search.ts';
 import { absoluteUrl, cleanName, hostOf, looksLikeHost } from '../../shared/name.ts';
 import { resolveAgent } from './resolve.ts';
@@ -88,7 +89,7 @@ export async function resolveSubject(
       hits = (await braveSearch(looksLikeHost(raw) ? hostOf(raw) : `"${raw}"`, 6))
         .map((h) => ({ title: h.title, url: h.url, description: h.description.slice(0, 200) }));
     } catch (error) {
-      emit('warn', `could not search for "${raw}" — ${error instanceof Error ? error.message.slice(0, 80) : 'error'}`);
+      emit('warn', `could not search for "${raw}" — ${why(error)}`);
     }
   }
 
@@ -175,7 +176,7 @@ export async function resolveSubject(
   } catch (error) {
     // A failed resolution must not stop a scan. Fall back to reading the input
     // the old way — which is what every scan did before this agent existed.
-    emit('warn', `could not resolve the subject — ${error instanceof Error ? error.message.slice(0, 100) : 'error'}`);
+    emit('warn', `could not resolve the subject — ${why(error)}`);
     const fallbackName = facts ? String(facts.name ?? cleanName(raw)) : cleanName(raw);
     // A repository URL is a repository URL whether or not anything answered.
     //

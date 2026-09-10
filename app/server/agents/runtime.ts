@@ -22,7 +22,7 @@ import path from 'node:path';
 import type { Stage } from '../../shared/types.ts';
 import { askJsonDirect } from '../model.ts';
 import { currentRun } from '../run-context.ts';
-import { describeError } from '../errors.ts';
+import { describeError, why } from '../errors.ts';
 import type { AgentDefinition } from './types.ts';
 
 export type RunStatus = 'running' | 'ok' | 'failed';
@@ -262,7 +262,7 @@ export async function runAgent<T>(agent: AgentDefinition, options: RunOptions): 
     return result;
   } catch (error) {
     run.status = 'failed';
-    run.error = describeError(error).slice(0, 400);
+    run.error = why(error);
     const raw = (error as { raw?: string }).raw;
     if (raw) run.raw = raw.slice(0, 4_000);
     throw error;

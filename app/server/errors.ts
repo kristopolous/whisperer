@@ -46,6 +46,23 @@ function chain(error: unknown, seen = new Set<unknown>()): Causal[] {
  *  Keeps the original wording — a failure should be reported in its own words,
  *  not paraphrased into something that no longer matches the logs — and appends
  *  what the chain adds to it. */
+/** The whole reason, for a log line or a stored failure.
+ *
+ *  Call sites had grown their own version of this — `error instanceof Error ?
+ *  error.message.slice(0, 80) : 'error'` and a dozen variants — and both halves
+ *  of that were losing information. `error.message` alone drops the cause
+ *  chain, which is where `fetch failed` keeps the address and the syscall; and
+ *  eighty characters truncates any message that was actually trying to explain
+ *  something. A real example that reached a user: a full report of which Python
+ *  interpreter was used, what its sys.path was and why the obvious fix had not
+ *  worked, cut down to "praw is not installed: run `pip install praw` (see
+ *  data-reddit.txt)" — a sentence naming a file that does not exist.
+ *
+ *  These are one line per failure, not per item. There is nothing to save by
+ *  clipping them, and a truncated error costs an hour of somebody's time.
+ */
+export const why = (error: unknown, limit = 1_200): string => describeError(error).slice(0, limit);
+
 export function describeError(error: unknown): string {
   if (!error) return 'unknown error';
   const links = chain(error);

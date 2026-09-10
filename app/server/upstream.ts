@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { why } from './errors.ts';
 import type { Mention } from '../shared/types.ts';
 import { cached, HOUR } from './cache.ts';
 import { cleanText } from '../shared/html.ts';
@@ -189,7 +190,7 @@ export async function fetchUpstreamIssues(
       }));
     });
   } catch (error) {
-    emit('warn', `could not read the ${upstream.host} tracker — ${error instanceof Error ? error.message.slice(0, 120) : 'error'}`);
+    emit('warn', `could not read the ${upstream.host} tracker — ${why(error)}`);
     return [];
   }
 

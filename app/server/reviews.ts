@@ -17,6 +17,7 @@
  */
 
 import type { ReviewKind, ReviewScore } from '../shared/types.ts';
+import { why } from './errors.ts';
 import { aggregateFrom, readReviews, statedFrom } from './review-text.ts';
 import { fetchRawHtml } from './content.ts';
 import { braveSearch, type SearchHit } from './search.ts';
@@ -234,7 +235,7 @@ export async function findReviewScores(
         || (b.count ?? 0) - (a.count ?? 0));
       found.push(scores[0]!);
     } catch (error) {
-      emit('warn', `${reviewSite.name} lookup failed — ${error instanceof Error ? error.message.slice(0, 80) : 'error'}`);
+      emit('warn', `${reviewSite.name} lookup failed — ${why(error)}`);
     }
   }
 

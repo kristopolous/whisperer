@@ -15,6 +15,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { why } from './errors.ts';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Scan } from '../shared/types.ts';
@@ -156,7 +157,7 @@ async function fire(entry: ScheduleEntry) {
     entry.lastFound = { mentions: scan.mentions.length, issues: scan.issues.length };
   } catch (error) {
     entry.lastOutcome = 'error';
-    entry.lastError = error instanceof Error ? error.message.slice(0, 300) : String(error);
+    entry.lastError = why(error);
   } finally {
     store.release(scan.id, 'scheduled scan');
     running = null;

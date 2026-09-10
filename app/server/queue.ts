@@ -20,6 +20,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { why } from './errors.ts';
 import type { Stage } from '../shared/types.ts';
 
 export type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -115,7 +116,7 @@ async function pump(): Promise<void> {
         job.state = 'done';
       } catch (error) {
         job.state = 'failed';
-        job.error = error instanceof Error ? error.message.slice(0, 300) : String(error);
+        job.error = why(error);
       } finally {
         job.stage = undefined;
         job.finishedAt = new Date().toISOString();
