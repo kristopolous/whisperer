@@ -38,10 +38,43 @@ export function FeedView({ scan }: { scan: Scan }) {
   // nothing took away the box you would have cleared it in — the panel looked
   // broken and the only way out was to change tab.
   if (all.length === 0) {
+    // Why it is empty, not just that it is.
+    //
+    // "Nothing in the feed yet" was said whether the stage had run and found
+    // nothing, run and failed, never run at all, or was running at that moment.
+    // Those are four different situations with four different responses, and
+    // only one of them is "yet" — a scan interrupted during discovery never
+    // reached this stage, and reporting that as an empty feed reads as the
+    // internet being quiet about the subject.
+    const ran = scan.timings?.feed !== undefined;
+    const failed = scan.failedStage === 'feed';
+    const running = scan.status === 'running' && scan.stage === 'feed';
+    const stopped = !ran && scan.status === 'error';
+
     return (
       <div className="panel">
         <div className="empty">
-          <h3>Nothing in the feed yet</h3>
+          <h3>
+            {running ? 'Reading the feed…'
+              : failed ? 'The feed stage failed'
+                : ran ? 'Nothing recent to show'
+                  : stopped ? 'The feed stage never ran'
+                    : 'Nothing in the feed yet'}
+          </h3>
+          <p>
+            {running
+              ? 'Newest first, as they arrive.'
+              : failed
+                ? scan.error ?? 'No reason was recorded. Rerun it from the Feed tab.'
+                : ran
+                  ? 'The stage ran and found nothing recent enough to show. That is a statement '
+                    + 'about the last few months, not about the subject as a whole — the corpus on '
+                    + 'Discovery goes back further.'
+                  : stopped
+                    ? `The scan stopped at ${scan.failedStage ?? 'an earlier stage'}, before the `
+                      + 'feed was collected. Rerun it and the feed fills in.'
+                    : 'It has not been collected yet.'}
+          </p>
         </div>
       </div>
     );

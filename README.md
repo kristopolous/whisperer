@@ -21,7 +21,7 @@ series of observations, not a pile of text.
 
 | | |
 |---|---|
-| **Retrieval** | Six search providers with per-role chains, per-provider pacers and a spend ledger; direct readers for Reddit (PRAW), Hacker News (Algolia), GitHub issues and the App Store; a scraper path for pages that refuse a plain fetch |
+| **Retrieval** | Five built-in search providers (Brave, Perplexity, Parallel, Andi, you.com) plus any MCP connector bound to the search role, with per-role chains, per-provider pacers and a spend ledger; direct readers for Reddit (PRAW), Hacker News (Algolia), GitHub issues and the App Store; a scraper path for pages that refuse a plain fetch |
 | **Judgement** | Subject disambiguation, complaint triage, sentiment scoring, defect merging, feed quality, abuse sweep — each held to a JSON schema, each quoting its evidence before its verdict |
 | **Accounting** | Per-source coverage grid, a suppression ledger that names every dropped result and why, and a credit ledger per provider |
 | **The loop** | Diagnose against real source, patch, run the suite in a throwaway copy, open a PR, file a ticket, draft the reply — with an audit trail per defect |
@@ -105,7 +105,7 @@ restart resumes rather than restarts.
    is not. Editable, because a wrong entry sends every later stage somewhere
    useless.
 3. **Discovery** — the corpus. Paginated general search plus a complaint
-   vocabulary, in several languages, alongside direct reads of Reddit, Hacker
+   vocabulary, in nine languages, alongside direct reads of Reddit, Hacker
    News, the project's own tracker and the App Store. Every result that is
    dropped is counted against a reason.
 4. **Feed** — the newest material, read to tell a datapoint from a sign-in wall.
@@ -180,7 +180,8 @@ app/
     sources/         direct readers: Hacker News, GitHub issues, the App Store
     channels/        GitHub: forking, and filing to a fork
   web/               the dashboard
-skills/reddit-search  the PRAW reader
+skills/              reddit-search (the PRAW reader), extract-social-media, find-discussions
+src/                 TrueForge control plane, if you run one — registry, setup, a CLI turn
 data/                scans, settings, credits — none of it in git
 ```
 
