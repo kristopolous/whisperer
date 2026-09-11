@@ -22,6 +22,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } fr
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { purgeCaches } from '../verify.ts';
+import { noRunnerReason, testPlanFor } from '../testing.ts';
 import type { FixStep, Issue, Reproduction, Scan } from '../../shared/types.ts';
 import { fixAgent } from './fix.ts';
 import type { Diagnosis } from './diagnose-run.ts';
@@ -82,22 +83,12 @@ export interface FixAttempt {
   workdir: string;
 }
 
-/** How this project runs its tests. Detected rather than configured, because a
- *  repo tells you: a tests directory of test_*.py means pytest. */
-export function detectTestCommand(repo: string): { cmd: string; args: string[] } | null {
-  if (existsSync(path.join(repo, 'pytest.ini')) || existsSync(path.join(repo, 'tests'))) {
-    return { cmd: 'python3', args: ['-m', 'pytest', 'tests/', '-q'] };
-  }
-  if (existsSync(path.join(repo, 'package.json'))) {
-    try {
-      const pkg = JSON.parse(readFileSync(path.join(repo, 'package.json'), 'utf8')) as { scripts?: Record<string, string> };
-      if (pkg.scripts?.test) return { cmd: 'npm', args: ['test', '--silent'] };
-    } catch { /* unreadable package.json is not a test runner */ }
-  }
-  if (existsSync(path.join(repo, 'Cargo.toml'))) return { cmd: 'cargo', args: ['test'] };
-  if (existsSync(path.join(repo, 'go.mod'))) return { cmd: 'go', args: ['test', './...'] };
-  return null;
-}
+/* How this project runs its tests — and how to give it a way when it has none —
+ * lives in ../testing.ts. It used to be a few `existsSync` checks here, which
+ * answered "is there a suite" and then refused the whole run when there was not.
+ * That refusal was the bug: a project without tests is the normal case for the
+ * repositories worth pointing this at, and it is something to fix rather than a
+ * reason to stop. */
 
 async function runTests(dir: string, test: { cmd: string; args: string[] }) {
   try {
@@ -135,9 +126,13 @@ export async function fixIssue(
   // the provider, which would otherwise leave a single real attempt.
   const maxAttempts = options.maxAttempts ?? 3;
 
-  const test = detectTestCommand(repo);
-  if (!test) throw new Error(`cannot tell how to run tests in ${repo} — refusing to claim a fix works`);
+  const plan = await testPlanFor(repo);
+  if (!plan) throw new Error(noRunnerReason(repo));
+  const test = plan.suite;
   const command = `${test.cmd} ${test.args.join(' ')}`;
+  emit('info', plan.origin === 'established'
+    ? `this project has no test suite — using ${plan.note}, so the only test here will be the one this run adds`
+    : `tests run with ${plan.note}`);
 
   // A throwaway copy. The checkout this was pointed at is never written to.
   const workdir = path.resolve(`${repo}-work-${Date.now().toString(36)}`);
@@ -146,8 +141,15 @@ export async function fixIssue(
   cpSync(repo, workdir, { recursive: true });
   emit('info', `working in ${path.basename(workdir)}`);
 
-  const baseline = await runTests(workdir, test);
-  emit('info', `baseline: ${command} ${baseline.passed ? 'passes' : 'FAILS'}`);
+  // A project with no suite has no baseline to take — there is nothing there to
+  // pass or fail yet, and running the command would report the absence of a
+  // directory as a failing test.
+  const baseline = plan.origin === 'established'
+    ? { passed: true, output: 'the project had no test suite; one was established for this run' }
+    : await runTests(workdir, test);
+  emit('info', plan.origin === 'established'
+    ? 'no baseline to take — this project had no tests before this run'
+    : `baseline: ${command} ${baseline.passed ? 'passes' : 'FAILS'}`);
   if (!baseline.passed) {
     emit('warn', 'the suite was already failing — a pass after the change would not mean anything');
   }
@@ -242,7 +244,7 @@ ${JSON.stringify({ title: issue.title, kind: issue.kind, severity: issue.severit
 Diagnosis:
 ${JSON.stringify({ cause: diagnosis.likelyCause, fix: diagnosis.proposedFix, test: diagnosis.regressionTest })}
 
-Tests are run with: ${command}
+Tests are run with: ${command}${plan.origin === 'established' ? `\nThis project has no tests. Put the regression test at ${plan.place.dir}/, named ${plan.place.naming} — for example ${plan.place.example} — or the runner will not collect it.` : ''}
 ${reproTests.length ? `\nA test demonstrating this defect has already been written and is in the working copy: ${reproTests.map((f) => f.path).join(', ')}. It fails against the current code — ${reproduction!.detail}. Your patch must make it pass. Do not edit it, and do not weaken it; it is the acceptance criterion, not part of the problem.\n` : ''}
 Current files:
 ${sources.map((f) => `--- ${f.path}\n${f.contents}`).join('\n\n')}
@@ -391,9 +393,15 @@ Return targeted edits: for each change, the exact text to find in the file and w
     trail,
     baseline: {
       passed: baseline.passed,
-      note: baseline.passed
-        ? 'the suite passed before anything was changed, so a pass afterwards means something'
-        : 'the suite was ALREADY failing before anything was changed — a pass afterwards proves less than it looks',
+      // Three states, not two. "The suite passed before" is a claim about a suite
+      // that existed, and saying it about a project that had none would credit a
+      // green run that never happened.
+      note: plan.origin === 'established'
+        ? `this project had no test suite — ${plan.note} was established for this run, so the only `
+          + 'test involved is the one it adds, and there is no prior green run behind it'
+        : baseline.passed
+          ? 'the suite passed before anything was changed, so a pass afterwards means something'
+          : 'the suite was ALREADY failing before anything was changed — a pass afterwards proves less than it looks',
     },
     workdir,
   };

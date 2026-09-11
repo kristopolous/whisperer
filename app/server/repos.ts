@@ -119,7 +119,11 @@ export function projectFor(company: string, discovered: { repo?: string } = {}):
       return { state: 'declared-none', why: 'you recorded that this product has no source to read' };
     }
     if (specified.url) {
-      return { state: 'specified', at: specified.url, why: 'the repository you set' };
+      // Nothing to say. The badge already reads "the repository you set" and the
+      // URL is on the next line, so a sentence repeating the badge is a third
+      // copy of one fact. The other states earn their sentence because the badge
+      // ("a guess", "no source") does not explain itself.
+      return { state: 'specified', at: specified.url, why: '' };
     }
     if (discovered.repo) {
       return {

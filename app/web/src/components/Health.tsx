@@ -530,7 +530,7 @@ function CodeSource({ scan, onScan }: { scan: Scan; onScan: (changes: Partial<Sc
           </div>
         )
         : null}
-      <p className="q">{code.why}</p>
+      {code.why && <p className="q">{code.why}</p>}
 
       {/* A guess is offered for confirmation rather than acted on. One click
           makes it the answer and it stops being re-derived every run.

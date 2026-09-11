@@ -17,6 +17,7 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { checkPath, classify, targeted } from './reproduce-run.ts';
+import type { TestPlan } from '../testing.ts';
 
 test('a failing assertion is the only failure that counts as a reproduction', () => {
   const result = classify({
@@ -86,10 +87,21 @@ test('only a new test file may be written', () => {
 });
 
 test('the new test is run on its own where the runner allows it', () => {
-  const pytest = targeted({ cmd: 'python3', args: ['-m', 'pytest', 'tests/', '-q'] }, ['tests/test_a.py']);
-  assert.deepEqual(pytest, { cmd: 'python3', args: ['-m', 'pytest', 'tests/test_a.py', '-q'] });
+  const plan: TestPlan = {
+    suite: { cmd: 'python3', args: ['-m', 'pytest', 'tests/', '-q'] },
+    only: (paths) => ({ cmd: 'python3', args: ['-m', 'pytest', ...paths, '-q'] }),
+    place: { dir: 'tests', naming: 'test_<x>.py', example: 'tests/test_x.py' },
+    origin: 'project',
+    language: 'python',
+    note: 'pytest',
+  };
+  assert.deepEqual(
+    targeted(plan, ['tests/test_a.py']),
+    { cmd: 'python3', args: ['-m', 'pytest', 'tests/test_a.py', '-q'] },
+  );
 
-  // Anything else falls back to the whole suite, which the caller then has to
-  // read against the baseline rather than as a statement about one test.
-  assert.equal(targeted({ cmd: 'npm', args: ['test', '--silent'] }, ['tests/a.test.ts']), null);
+  // A runner that cannot be narrowed — `npm test` runs whatever the script is —
+  // falls back to the whole suite, which the caller then has to read against the
+  // baseline rather than as a statement about one test.
+  assert.equal(targeted({ ...plan, only: null }, ['tests/a.test.ts']), null);
 });

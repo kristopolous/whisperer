@@ -27,13 +27,11 @@ import { why } from '../errors.ts';
 import { purgeCaches } from '../verify.ts';
 import type { Issue, Reproduction, ReproductionStep, Scan } from '../../shared/types.ts';
 import type { Diagnosis } from './diagnose-run.ts';
-import { detectTestCommand } from './fix-run.ts';
+import { noRunnerReason, testPlanFor, type TestCommand, type TestPlan } from '../testing.ts';
 import { reproduceAgent } from './reproduce.ts';
 import { runAgent } from './runtime.ts';
 
 const run = promisify(execFile);
-
-export interface TestCommand { cmd: string; args: string[] }
 
 export interface Outcome {
   /** Non-zero exit, whatever the reason. */
@@ -64,13 +62,12 @@ async function runCommand(dir: string, test: TestCommand): Promise<Outcome> {
  *
  *  Worth the trouble because the whole suite going red says nothing about which
  *  test did it, and the claim being recorded is specifically that THIS test
- *  fails. Only pytest is targeted here; for the others the fallback is the
- *  comparison the suite already supports — green before, red after — which is
- *  weaker but not a guess. */
-export function targeted(test: TestCommand, paths: string[]): TestCommand | null {
-  const pytest = test.args[0] === '-m' && test.args[1] === 'pytest';
-  if (pytest) return { cmd: test.cmd, args: ['-m', 'pytest', ...paths, '-q'] };
-  return null;
+ *  fails. Which runners can be narrowed is the test plan's business (see
+ *  ../testing.ts); when one cannot, the fallback is the comparison the suite
+ *  already supports — green before, red after — which is weaker but not a guess.
+ */
+export function targeted(plan: TestPlan, paths: string[]): TestCommand | null {
+  return plan.only ? plan.only(paths) : null;
 }
 
 /** Did the test fail because the behaviour is wrong, or because the test is?
@@ -196,9 +193,20 @@ export async function reproduceIssue(
 ): Promise<Omit<Reproduction, 'at'>> {
   const maxAttempts = options.maxAttempts ?? 3;
 
-  const test = detectTestCommand(repo);
-  if (!test) throw new Error(`cannot tell how to run tests in ${repo} — refusing to claim a defect is reproduced`);
+  // How to run a test here — and if the project has no suite, how to give it one.
+  //
+  // This used to refuse when it could not find a framework, which is a refusal
+  // to do the job: the point of this step is to CREATE a test, most of the
+  // repositories worth pointing it at have none, and a project cannot lack a way
+  // to execute its own language even when it lacks a suite. The only honest
+  // refusal is a machine that cannot run the language at all.
+  const plan = await testPlanFor(repo);
+  if (!plan) throw new Error(noRunnerReason(repo));
+  const test = plan.suite;
   const suiteCommand = `${test.cmd} ${test.args.join(' ')}`;
+  emit('info', plan.origin === 'established'
+    ? `no test suite here — establishing one: ${plan.note}`
+    : `tests run with ${plan.note}`);
 
   const workdir = path.resolve(`${repo}-repro-${Date.now().toString(36)}`);
   rmSync(workdir, { recursive: true, force: true });
@@ -210,8 +218,20 @@ export async function reproduceIssue(
   // you that a new red line is the new test's, so the fallback comparison for
   // runners that cannot be targeted depends on this being green — and either
   // way the reader needs to know.
-  const baseline = await runCommand(workdir, test);
-  emit(baseline.failed ? 'warn' : 'info', `baseline: ${suiteCommand} ${baseline.failed ? 'FAILS' : 'passes'}`);
+  // The suite before the test exists. A suite that is already red cannot tell
+  // you that a new red line is the new test's, so the fallback comparison for
+  // runners that cannot be targeted depends on this being green — and either
+  // way the reader needs to know.
+  //
+  // A project whose suite this run is inventing has no baseline to take: there is
+  // nothing there yet, and running the command would fail for want of a
+  // directory rather than for want of working code.
+  const baseline = plan.origin === 'established'
+    ? { failed: false, code: 0, output: 'the project had no test suite; one was established for this' }
+    : await runCommand(workdir, test);
+  emit(baseline.failed ? 'warn' : 'info', plan.origin === 'established'
+    ? 'no baseline to take — this is the project\'s first test'
+    : `baseline: ${suiteCommand} ${baseline.failed ? 'FAILS' : 'passes'}`);
 
   const suspects = diagnosis.suspectFiles
     .map((f) => f.path)
@@ -263,7 +283,11 @@ Tests are run with: ${suiteCommand}
 Current code, which your test must fail against:
 ${sources.map((f) => `--- ${f.path}\n${f.contents}`).join('\n\n')}
 
-${sample ? `An existing test file from this project. Match it — imports, naming, fixtures, style:\n--- ${sample.path}\n${sample.contents}` : 'This project has no test files to copy the style of. Follow the conventions of its test runner.'}
+${sample
+  ? `An existing test file from this project. Match it — imports, naming, fixtures, style:\n--- ${sample.path}\n${sample.contents}`
+  : `This project has no tests yet, so you are writing its first. There is nothing to copy the style of — follow the runner's own conventions exactly, or it will not be collected.`}
+
+Write the file at ${plan.place.dir}/ named ${plan.place.naming} — for example ${plan.place.example}. It will be run with: ${suiteCommand}
 ${feedback ? `\n${feedback}\n` : ''}
 Write the test that fails against the code above, for the reason in the report. Do not fix anything.`,
         items: sources.length,
@@ -319,7 +343,7 @@ Write the test that fails against the code above, for the reason in the report. 
     // rewrites one within the same second is not.
     purgeCaches(workdir);
 
-    const only = targeted(test, written.map((f) => f.path));
+    const only = targeted(plan, written.map((f) => f.path));
     const runner = only ?? test;
     command = `${runner.cmd} ${runner.args.join(' ')}`;
     outcome = await runCommand(workdir, runner);
