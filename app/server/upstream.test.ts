@@ -9,7 +9,8 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { repoUrlFrom, upstreamFor } from './upstream.ts';
+import { repoUrlFrom, trackerMention, upstreamFor } from './upstream.ts';
+import { mentionId } from './mention-id.ts';
 
 test('the owner/name shorthand is a repository', () => {
   assert.equal(repoUrlFrom('microsoft/markitdown'), 'https://github.com/microsoft/markitdown');
@@ -70,4 +71,34 @@ test('things that are not repositories are refused, not guessed at', () => {
   assert.equal(repoUrlFrom('markitdown'), null);
   assert.equal(repoUrlFrom('https://github.com/microsoft'), null);
   assert.equal(upstreamFor('not a repo', 10), null);
+});
+
+test('a tracker issue keeps the same id across runs', () => {
+  // The whole of a defect's provenance hangs off this. An issue cites mentions
+  // by id, so a per-run id means every re-run orphans the evidence of every
+  // defect triaged from a filed bug — silently, because the thread is still in
+  // the corpus under a new number and nothing errors. It cost 27 of the 68
+  // defects on the markitdown scan their source panel.
+  const row = {
+    title: 'CSV conversion scales quadratically with leading blank lines',
+    html_url: 'https://github.com/microsoft/markitdown/issues/2449',
+    created_at: '2026-09-10T18:47:29Z',
+    body: 'CSV conversion slows down quadratically…',
+    user: { login: 'ROTl24' },
+    labels: ['bug'],
+  };
+
+  const first = trackerMention(row, 'https://github.com/microsoft/markitdown/issues');
+  const second = trackerMention({ ...row }, 'https://github.com/microsoft/markitdown/issues');
+  assert.equal(first.id, second.id);
+  // And the same id every other source would give the same URL, so a tracker
+  // report and a search hit on the same thread are one mention, not two.
+  assert.equal(first.id, mentionId('https://github.com/microsoft/markitdown/issues/2449'));
+  assert.equal(first.complaint, true, 'a filed bug is a complaint by construction');
+});
+
+test('a row with no link of its own falls back to the tracker, not to a random id', () => {
+  const mention = trackerMention({ title: 'untitled' }, 'https://github.com/microsoft/markitdown/issues');
+  assert.equal(mention.url, 'https://github.com/microsoft/markitdown/issues');
+  assert.equal(mention.id, mentionId('https://github.com/microsoft/markitdown/issues'));
 });

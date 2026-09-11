@@ -2107,11 +2107,26 @@ export async function findIssues(
       for (const issue of result.issues ?? []) {
         // Resolved here, inside the batch, because the indices only mean
         // anything against the items this call was given.
-        const cited = (issue.evidence ?? [])
-          .map((i) => batch[Number(i)]?.id)
-          .filter((id): id is string => Boolean(id));
-        if (cited.length !== (issue.evidence ?? []).length) unresolved += 1;
-        issues.push({ ...issue, evidence: cited });
+        const items = (issue.evidence ?? [])
+          .map((i) => batch[Number(i)])
+          .filter((item): item is (typeof batch)[number] => Boolean(item));
+        if (items.length !== (issue.evidence ?? []).length) unresolved += 1;
+        // Both forms, and this is the only moment either can be produced
+        // honestly: the id for the join, and the citation written onto the issue
+        // so it still says where it came from when the join stops resolving.
+        // Every way provenance has been lost here has been a dangling join, and
+        // a defect with no source reads as a defect nobody needs to check.
+        issues.push({
+          ...issue,
+          evidence: items.map((item) => item.id),
+          sources: items.map((item) => ({
+            id: item.id,
+            url: item.url,
+            venue: item.venue,
+            title: item.title,
+            date: item.date,
+          })),
+        });
       }
       succeeded += 1;
       emit('info', `batch ${index + 1}/${batches.length}: ${(result.issues ?? []).length} issue(s)`);

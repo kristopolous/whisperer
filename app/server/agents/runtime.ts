@@ -180,17 +180,6 @@ export { withRunContext, type RunContext } from '../run-context.ts';
 const FLAKY = new RegExp([
   'empty response',
   'no JSON in model output',
-  // Every JSON syntax error belongs here. They are all the same event from the
-  // caller's side — the model produced something unusable — and the identical
-  // request usually works a second later. parseJson repairs the one that is
-  // mechanically fixable (raw control characters); this covers the rest, like
-  // a reply that simply stops mid-token.
-  'Unexpected end of JSON',
-  'Unexpected token',
-  'Unterminated string',
-  'Bad control character',
-  "Expected ',' or",
-  'is not valid JSON',
   // A transport failure reaching the model endpoint. Local hosts drop a
   // connection now and then — often while a model is being swapped in — and the
   // next request goes through. Losing a stage to that is the same waste as
@@ -199,6 +188,27 @@ const FLAKY = new RegExp([
   'ECONNRESET',
   'socket hang up',
 ].join('|'), 'i');
+
+/** Is this worth trying once more?
+ *
+ *  Every JSON syntax error is, and that is now decided by the error's type
+ *  rather than by recognising its wording. The list used to enumerate
+ *  messages — 'Unexpected token', "Expected ',' or", 'Unterminated string' —
+ *  which meant the class was only covered as far as somebody had met it.
+ *  "Expected ':' after property name in JSON at position 1159" was not in the
+ *  list, so a buzz batch that hit it was dropped without a second attempt: 24
+ *  mentions went unscored because of a wording nobody had written down. V8 also
+ *  rephrases these between releases, so an enumeration decays on its own.
+ *
+ *  Everything JSON.parse throws is a SyntaxError, and from the caller's side
+ *  they are all one event: the model produced something unusable, and the same
+ *  request usually works a second later. parseJson has already tried to repair
+ *  the mechanically fixable ones by the time this is reached.
+ */
+export function isFlaky(error: unknown): boolean {
+  if (error instanceof SyntaxError) return true;
+  return FLAKY.test(error instanceof Error ? error.message : String(error));
+}
 
 /** One retry on a flaky failure.
  *
@@ -209,8 +219,7 @@ async function withRetry<T>(call: () => Promise<T>): Promise<T> {
   try {
     return await call();
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!FLAKY.test(message)) throw error;
+    if (!isFlaky(error)) throw error;
     return call();
   }
 }

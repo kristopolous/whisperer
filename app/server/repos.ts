@@ -152,6 +152,18 @@ export function projectFor(company: string, discovered: { repo?: string } = {}):
   };
 }
 
+/** The repository to act on for this company: what a person set, else what the
+ *  scan worked out.
+ *
+ *  Exported because the callers that fork, and that offer to fork, were reading
+ *  `scan.subject.repo` — the resolver's guess — directly. So answering "no, it is
+ *  this instead" in the Source code panel changed what got cloned and not what
+ *  got forked: the working copy was right and the pull request went to a fork of
+ *  the wrong project. One precedence, in one place.
+ */
+export const codeUrlFor = (company: string, discovered?: string): string | undefined =>
+  projectFor(company, { repo: discovered }).effective.url;
+
 /** Write a company's project settings. An empty string clears a field back to
  *  whatever discovery says, which is why they are stored as absent rather than
  *  as empty strings. */
@@ -245,9 +257,16 @@ export async function ensureCheckout(
     return { path: resolved, config: { company, path: resolved } };
   }
 
+  // What a person set, over what the scan worked out — and merged rather than
+  // chosen between. An entry that only carries a `testCommand` used to win
+  // outright and then fail as "neither a url nor a path", so setting how the
+  // tests run could take away the repository.
+  const specified = repoFor(company);
   const config = fork
     ? { company, url: `https://github.com/${fork}.git` }
-    : repoFor(company) ?? (discovered ? { company, url: discovered } : undefined);
+    : specified || discovered
+      ? { company, ...(discovered ? { url: discovered } : {}), ...specified }
+      : undefined;
   if (!config) {
     throw new Error(
       `no repository configured for "${company}" — add it to config/repos.json before diagnosing`,

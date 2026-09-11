@@ -867,7 +867,14 @@ useEffect(() => {
         );
       })()}
 
-      {rig?.dist?.stale && (
+      {/* Only on the port that actually serves the bundle.
+          `staleDist()` is a fact about `app/web/dist`, and it is the right
+          warning on :8791 — but the dev server compiles from source, so under
+          `npm run dev` this banner accused the page you were looking at of being
+          stale while it was live-reloading in front of you. Vite sets DEV at
+          compile time, so the built bundle keeps the warning and the dev server
+          cannot show it. */}
+      {!import.meta.env.DEV && rig?.dist?.stale && (
         <div className="stale-build" role="status">
           <b>These assets are stale.</b> This port serves the built bundle in
           {' '}<code>app/web/dist</code>, last built {rig.dist.builtAt ? fmtAgo(rig.dist.builtAt) : 'at some point'}

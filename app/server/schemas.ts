@@ -373,6 +373,52 @@ export const diagnoseSchema = {
   },
 } as const;
 
+/** A test that demonstrates the defect, and nothing else.
+ *
+ *  Deliberately narrower than `fixSchema`: there is no `edits` field, so a
+ *  reproduction physically cannot change the code it is supposed to be failing
+ *  against. A run that may rewrite the source is a run whose red-then-green
+ *  result proves nothing about the defect.
+ *
+ *  `expectedFailure` is the part that makes a bad attempt detectable. A test
+ *  that fails because it imports a module that does not exist also "fails", and
+ *  without a stated expectation there is no way to tell that apart from a
+ *  demonstration of the bug. */
+export const reproduceSchema = {
+  name: 'reproduction',
+  schema: {
+    type: 'object',
+    required: ['summary', 'files', 'expectedFailure', 'notes'],
+    properties: {
+      summary: { type: 'string', description: 'What the test asserts, in one or two sentences' },
+      files: {
+        type: 'array',
+        description: 'Test files to add, in full. Test files only — never a change to the code under test.',
+        items: {
+          type: 'object',
+          required: ['path', 'contents', 'why'],
+          properties: {
+            path: {
+              type: 'string',
+              description: "Repo-relative path of a NEW test file, inside the project's existing test directory and matching its naming convention",
+            },
+            contents: { type: 'string' },
+            why: { type: 'string', description: 'What this file demonstrates' },
+          },
+        },
+      },
+      expectedFailure: {
+        type: 'string',
+        description: 'The assertion you expect to fail against the current code, and roughly what the failure output will say. Used to check the test failed for the reported reason rather than because it could not run.',
+      },
+      notes: {
+        type: 'string',
+        description: 'Anything the reader should know. If the defect cannot be demonstrated from what you were shown, return no files and say why here.',
+      },
+    },
+  },
+} as const;
+
 export const fixSchema = {
   name: 'fix',
   schema: {

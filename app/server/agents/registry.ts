@@ -21,6 +21,7 @@ import { fixAgent } from './fix.ts';
 import { footprintAgent } from './footprint.ts';
 import { healthAgent } from './health.ts';
 import { migrationsAgent } from './migrations.ts';
+import { reproduceAgent } from './reproduce.ts';
 import { rescueAgent } from './rescue.ts';
 import { resolveAgent } from './resolve.ts';
 import { respondAgent } from './respond-to-user.ts';
@@ -51,6 +52,9 @@ export const AGENTS: AgentDefinition[] = [
   abuseAgent,
   fileTicketAgent,
   diagnoseAgent,
+  // Before the fix, always: a test written beside its own patch proves less
+  // than one written first.
+  reproduceAgent,
   fixAgent,
   respondAgent,
   siteAgent,

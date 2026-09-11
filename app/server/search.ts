@@ -353,6 +353,7 @@ async function mcpSearch(
     ? `${query} after:${new Date(Date.now() - since * 86_400_000).toISOString().slice(0, 10)}`
     : query;
 
+  let lastError: unknown;
   for (const connector of connectorsForRole('search')) {
     if (only && connector.name !== only) continue;
     const binding = bindingFor(connector, 'search');
@@ -371,8 +372,14 @@ async function mcpSearch(
       // hung for the full timeout, and will keep paying that timeout on every
       // remaining query of the run.
       noteOutcome(connector.name, error);
+      lastError = error;
     }
   }
+  // Null means "no connector here could be asked". A connector that was asked
+  // and failed is reported, so the chain above can name it: a query that ends
+  // with "no search provider answered" and no reason is the shape that makes a
+  // broken connector look like an empty internet.
+  if (lastError) throw lastError;
   return null;
 }
 
@@ -434,6 +441,12 @@ const isStalled = (provider: string) => (stalled.get(provider) ?? 0) >= STALL_LI
 
 function noteOutcome(provider: string, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
+  // Rejected outright: the same request will be rejected every time, so one is
+  // enough to stop asking for the rest of the run.
+  if (error instanceof PermanentSearchError) {
+    stalled.set(provider, STALL_LIMIT);
+    return;
+  }
   // A timeout or an aborted request is the shape that costs time. A 429 or a
   // 500 came back promptly and says nothing about whether the next one will.
   if (/timed out|timeout|aborted|AbortError|fetch failed/i.test(message)) {
@@ -469,13 +482,19 @@ function overBudget(emit?: (level: 'warn', text: string) => void): boolean {
 const stallAnnounced = new Set<string>();
 
 /** Said once per provider per run, because the alternative is one line per
- *  query for the rest of the scan. */
-function emitStall(provider: string): void {
+ *  query for the rest of the scan.
+ *
+ *  The reason is carried rather than assumed. This said "timed out N times in a
+ *  row" for every case, which became wrong the moment a rejected key could also
+ *  drop a provider — and a log line that names the wrong cause sends whoever
+ *  reads it to the wrong setting. */
+function emitStall(provider: string, reason?: unknown): void {
   if (stallAnnounced.has(provider)) return;
   stallAnnounced.add(provider);
-  console.warn(
-    `[search] ${provider} timed out ${STALL_LIMIT} times in a row — skipping it for the rest of this run`,
-  );
+  const why = reason instanceof PermanentSearchError
+    ? `refused the request (${reason.message})`
+    : `timed out ${STALL_LIMIT} times in a row`;
+  console.warn(`[search] ${provider} ${why} — skipping it for the rest of this run`);
 }
 
 /* ------------------------------------------------------- perplexity ----- */
@@ -536,7 +555,7 @@ async function perplexitySearch(
       if (response.status === 429 || response.status >= 500) {
         throw new RecoverableSearchError(`perplexity ${response.status}: ${detail.slice(0, 120)}`);
       }
-      throw new Error(`perplexity ${response.status}: ${detail.slice(0, 160)}`);
+      throw new PermanentSearchError(`perplexity ${response.status}: ${detail.slice(0, 160)}`);
     }
 
     const body = (await response.json()) as {
@@ -644,7 +663,7 @@ async function youSearch(
       if (response.status === 402 || response.status === 429 || response.status >= 500) {
         throw new RecoverableSearchError(`you.com ${response.status}: ${detail.slice(0, 120)}`);
       }
-      throw new Error(`you.com ${response.status}: ${detail.slice(0, 160)}`);
+      throw new PermanentSearchError(`you.com ${response.status}: ${detail.slice(0, 160)}`);
     }
 
     interface YouResult {
@@ -735,7 +754,7 @@ async function parallelSearch(
       if (response.status === 402 || response.status === 429 || response.status >= 500) {
         throw new RecoverableSearchError(`parallel ${response.status}: ${detail.slice(0, 120)}`);
       }
-      throw new Error(`parallel ${response.status}: ${detail.slice(0, 160)}`);
+      throw new PermanentSearchError(`parallel ${response.status}: ${detail.slice(0, 160)}`);
     }
 
     const body = (await response.json()) as {
@@ -855,7 +874,7 @@ async function andiSearch(
       if (response.status === 402 || response.status === 429 || response.status >= 500) {
         throw new RecoverableSearchError(`andi ${response.status}: ${detail.slice(0, 120)}`);
       }
-      throw new Error(`andi ${response.status}: ${detail.slice(0, 160)}`);
+      throw new PermanentSearchError(`andi ${response.status}: ${detail.slice(0, 160)}`);
     }
 
     const body = (await response.json()) as {
@@ -907,7 +926,10 @@ export async function braveSearch(
   // Freshness is part of the cache key: the same query restricted to the last
   // year is a different question with a different answer.
   const cacheKey = `brave:${count}:${freshness ?? 'all'}:${offset}:${query}`;
-  return cached(`search`, cacheKey, ttlFor(freshness), async () => {
+  // `null` means "nobody ran this query", and the cache is documented to store
+  // neither null nor undefined — which is the only way a skipped query can avoid
+  // being remembered as an empty answer. See the budget check below.
+  const hits = await cached<SearchHit[] | null>(`search`, cacheKey, ttlFor(freshness), async () => {
     // Checked here rather than only between stages. Discovery is hundreds of
     // queries paced at one per 1.1 seconds, so a cancel that only took effect
     // at the next stage boundary could be four minutes away — long enough that
@@ -928,9 +950,19 @@ export async function braveSearch(
     }
     // Checked after the cache, so a spent budget still serves everything
     // already fetched.
-    if (overBudget()) return [];
+    //
+    // Null, not an empty array, and the distinction is the whole point. An empty
+    // array is a result — "a provider ran this and the web has nothing" — and
+    // gets cached, correctly, for up to a week. Returning one here cached the
+    // fact that this run had run out of money as though it were a fact about the
+    // world, so every later scan read "no results" off disk for seven days and
+    // never asked again. A query nobody ran must leave no trace.
+    if (overBudget()) return null;
 
     let lastError: unknown;
+    // Every provider's reason, so the error when none of them worked says which
+    // failed and how rather than naming only the last one.
+    const failures: string[] = [];
     // Did anybody actually run the query? An empty result from a provider that
     // searched is an answer — "nothing out there matches" — and must not be
     // reported as a broken chain. The two were conflated, and it showed the
@@ -999,29 +1031,67 @@ export async function braveSearch(
         if (hits) answered = true;
         if (hits && hits.length) return hits;
       } catch (error) {
-        // A provider that is rate limited, down or unreachable is a reason to
-        // try the next one. Anything else — a rejected key, a malformed query —
-        // would fail the same way everywhere, so it stops here.
+        // Failover is the default, and this is the whole point of a chain.
+        //
+        // It used to re-throw anything that was not a RecoverableSearchError,
+        // on the reasoning that a rejected key or a malformed query "would fail
+        // the same way everywhere". That is true of a malformed query and false
+        // of everything else: a key is per provider, a quota is per provider, a
+        // changed response shape is per provider. So one misconfigured connector
+        // at the head of the chain failed every query of the run — discovery
+        // included — while the providers behind it sat configured and idle.
+        //
+        // A cancellation is the one thing that must not be failed over: the run
+        // is being stopped, and trying five more providers is five more things
+        // to wait for. Asked of the run rather than read off the error, because
+        // a provider timing out also throws an AbortError and that one is
+        // exactly what the next provider exists for.
+        throwIfCancelled();
         noteOutcome(entry.id, error);
         if (isStalled(entry.id)) {
-          emitStall(entry.id);
+          emitStall(entry.id, error);
         }
-        if (!(error instanceof RecoverableSearchError)) throw error;
         lastError = error;
+        failures.push(`${entry.id}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
 
-    // A provider ran it and found nothing. That is a result, not a failure.
+    // A provider ran it and found nothing. That is a result, not a failure, and
+    // it is worth caching: asking again tomorrow costs a request to be told the
+    // same thing.
     if (answered) return [];
+    if (failures.length > 1) {
+      // Named together. One provider's message on its own reads as the reason
+      // the query failed, when the reason is that every provider failed —
+      // which is a different problem with a different fix.
+      const error = new Error(
+        `no search provider could answer "${query}" — ${failures.join('; ')}`,
+      );
+      throw error;
+    }
     if (lastError) throw lastError;
     throw new Error(`no search provider answered "${query}"`);
   });
+  return hits ?? [];
 }
 
-/** Rate limits and outages are what the backup is for. Anything else — a bad
- *  key, a malformed query — would fail the same way there, so only the
- *  recoverable ones are worth a second provider and a second wait. */
+/** Rate limits and outages: worth the next provider, and worth asking this one
+ *  again later in the run. */
 class RecoverableSearchError extends Error {}
+
+/** This provider is not going to answer this run — a rejected key, a spent
+ *  grant, a rejected request shape.
+ *
+ *  Still a reason to try the next provider, which is the part that was wrong:
+ *  these were thrown as plain Errors and the chain treated a plain Error as
+ *  fatal, so one 401 from whichever provider happened to lead the chain failed
+ *  every query in the run while five configured providers sat idle. A rejected
+ *  key is per provider almost by definition.
+ *
+ *  What it does change is whether this provider is asked again: it will fail
+ *  identically on the next query, so it is dropped for the rest of the run
+ *  rather than paying a round trip per query to learn the same thing. */
+class PermanentSearchError extends Error {}
 
 async function braveCall(
   query: string, key: string, count: number, freshness: Freshness | undefined, offset: number,
@@ -1061,7 +1131,7 @@ async function braveCall(
         }
         throw new RecoverableSearchError(`brave ${response.status} for "${query}"`);
       }
-      throw new Error(`brave ${response.status} for "${query}"`);
+      throw new PermanentSearchError(`brave ${response.status} for "${query}"`);
     }
 
     const body = (await response.json()) as {

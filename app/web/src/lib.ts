@@ -36,6 +36,8 @@ export const VENUES: { key: Venue; label: string; slot: string }[] = [
   { key: 'x',          label: 'X',            slot: 'var(--s-3)' },
   { key: 'youtube',    label: 'YouTube',      slot: 'var(--s-10)' },
   { key: 'github',     label: 'GitHub',       slot: 'var(--s-4)' },
+  { key: 'gitlab',     label: 'GitLab',       slot: 'var(--s-13)' },
+  { key: 'bugzilla',   label: 'Bugzilla',     slot: 'var(--s-14)' },
   { key: 'discord',    label: 'Discord',      slot: 'var(--s-11)' },
   { key: 'linkedin',   label: 'LinkedIn',     slot: 'var(--s-12)' },
   { key: 'telegram',   label: 'Telegram',     slot: 'var(--s-7)' },

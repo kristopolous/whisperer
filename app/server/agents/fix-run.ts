@@ -22,7 +22,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } fr
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { purgeCaches } from '../verify.ts';
-import type { FixStep, Issue, Scan } from '../../shared/types.ts';
+import type { FixStep, Issue, Reproduction, Scan } from '../../shared/types.ts';
 import { fixAgent } from './fix.ts';
 import type { Diagnosis } from './diagnose-run.ts';
 import { runAgent } from './runtime.ts';
@@ -129,7 +129,7 @@ export async function fixIssue(
   diagnosis: Diagnosis,
   repo: string,
   emit: (level: 'info' | 'warn', text: string) => void,
-  options: { maxAttempts?: number } = {},
+  options: { maxAttempts?: number; reproduction?: Reproduction } = {},
 ): Promise<FixAttempt> {
   // Three, not two: one is routinely spent on a transient empty response from
   // the provider, which would otherwise leave a single real attempt.
@@ -152,6 +152,30 @@ export async function fixIssue(
     emit('warn', 'the suite was already failing — a pass after the change would not mean anything');
   }
 
+  // The failing test, if one was written before this run — and it is written
+  // into the copy, not just shown to the model.
+  //
+  // This is what makes "fixed" mean something. The acceptance criterion is then
+  // a test the patch's author did not write, already known to fail against the
+  // unpatched code, and the suite going green has to include turning that red
+  // line green. It goes in after the baseline deliberately: the baseline is the
+  // suite as the project ships it, and the run needs both numbers — green
+  // before the test, red with it, green again with the patch.
+  const reproduction = options.reproduction;
+  const reproTests = reproduction?.demonstrated ? reproduction.files : [];
+  if (reproTests.length) {
+    for (const file of reproTests) {
+      const target = path.resolve(workdir, file.path);
+      if (!target.startsWith(workdir + path.sep)) continue;
+      mkdirSync(path.dirname(target), { recursive: true });
+      writeFileSync(target, file.contents);
+    }
+    purgeCaches(workdir);
+    const withTest = await runTests(workdir, test);
+    emit(withTest.passed ? 'warn' : 'info',
+      `with the reproduction added, ${command} ${withTest.passed ? 'still passes — the failing test is no longer failing' : 'fails, as it should'}`);
+  }
+
   // The files the diagnosis pointed at, in full, as the model's working set.
   const targets = diagnosis.suspectFiles
     .map((f) => f.path)
@@ -162,6 +186,12 @@ export async function fixIssue(
     path: p,
     contents: readFileSync(path.join(workdir, p), 'utf8').slice(0, 20_000),
   }));
+
+  // The reproduction is part of the working set, and the prompt says what it is
+  // for: this test must go green, and must not be edited to get there.
+  for (const file of reproTests) {
+    sources.push({ path: file.path, contents: file.contents.slice(0, 12_000) });
+  }
 
   // Existing tests go in too: a regression test that does not match the
   // project's imports and naming will not be collected, and a test that never
@@ -213,7 +243,7 @@ Diagnosis:
 ${JSON.stringify({ cause: diagnosis.likelyCause, fix: diagnosis.proposedFix, test: diagnosis.regressionTest })}
 
 Tests are run with: ${command}
-
+${reproTests.length ? `\nA test demonstrating this defect has already been written and is in the working copy: ${reproTests.map((f) => f.path).join(', ')}. It fails against the current code — ${reproduction!.detail}. Your patch must make it pass. Do not edit it, and do not weaken it; it is the acceptance criterion, not part of the problem.\n` : ''}
 Current files:
 ${sources.map((f) => `--- ${f.path}\n${f.contents}`).join('\n\n')}
 ${failure ? `\nYour previous attempt failed the tests. Output:\n${failure}\n\nFix the cause of that failure.` : ''}
@@ -311,7 +341,19 @@ Return targeted edits: for each change, the exact text to find in the file and w
   // a pristine checkout and expect a failure. Without this, a test that asserts
   // nothing would sail through.
   let proves = { checked: false, failedOnOriginal: false, detail: 'not checked' };
-  const testFiles = last.files.filter((f) => /(^|\/)tests?\//.test(f.path) || /test_/.test(path.basename(f.path)));
+
+  // A reproduction written before the patch already answers this question, and
+  // answers it better: that test was run against the unpatched code by a run
+  // that could not have edited the code, and it was written without the patch to
+  // shape it. Re-deriving the same fact from the patch's own tests would be
+  // weaker evidence dressed as a second opinion.
+  const provenAhead = reproduction?.demonstrated
+    ? reproTests.filter((f) => existsSync(path.resolve(workdir, f.path)))
+    : [];
+
+  const testFiles = provenAhead.length
+    ? provenAhead
+    : last.files.filter((f) => /(^|\/)tests?\//.test(f.path) || /test_/.test(path.basename(f.path)));
   if (result.passed && testFiles.length) {
     const control = `${workdir}-control`;
     rmSync(control, { recursive: true, force: true });
@@ -328,7 +370,10 @@ Return targeted edits: for each change, the exact text to find in the file and w
       failedOnOriginal: !control_result.passed,
       detail: control_result.passed
         ? 'the new test PASSES against the original buggy code, so it does not test the fix'
-        : 'the new test fails against the original code, as it should',
+        : provenAhead.length
+          ? 'the test fails against the original code, as it should — and it was written before the patch, '
+            + 'by a run that could not change the code it was failing against'
+          : 'the new test fails against the original code, as it should',
     };
     emit(proves.failedOnOriginal ? 'info' : 'warn', `regression test vs original: ${proves.detail}`);
     rmSync(control, { recursive: true, force: true });

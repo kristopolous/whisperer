@@ -4,7 +4,7 @@
   "description": "Listens to what the internet says about a company, and turns the complaints into issues.",
   "main": "index.js",
   "scripts": {
-    "test": "tsx --test app/server/*.test.ts app/shared/*.test.ts",
+    "test": "tsx --test app/server/*.test.ts app/server/agents/*.test.ts app/shared/*.test.ts",
     "typecheck": "tsc",
     "build": "vite build --config app/web/vite.config.ts",
     "setup": "tsx --env-file=.env src/setup.ts",
@@ -14,7 +14,7 @@
     "stack": "concurrently -n trueforge,api -c blue,cyan \"npm:trueforge\" \"npm:api\"",
     "api": "tsx --env-file=.env --watch app/server/index.ts",
     "web": "vite --config app/web/vite.config.ts",
-    "dev": "concurrently -n api,web -c cyan,magenta \"npm:api\" \"npm:web\"",
+    "dev": "WHISPERER_DEV=1 concurrently -n api,web -c cyan,magenta \"npm:api\" \"npm:web\"",
     "start": "tsx --env-file=.env app/server/index.ts",
     "demo": "tsx --env-file=.env src/demo.ts",
     "hello": "tsx --env-file=.env src/hello.ts",

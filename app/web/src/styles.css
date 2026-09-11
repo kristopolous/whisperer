@@ -34,6 +34,8 @@
   --s-4: #eda100;  --s-5: #e87ba4;  --s-6: #008300;
   --s-7: #2a86d6;  --s-8: #5b7cfa;  --s-9: #1faf62;
   --s-10: #c4302b; --s-11: #8257e5; --s-12: #0f7b8a;
+  /* GitLab and Bugzilla, which used to be reported as GitHub. */
+  --s-13: #d9622b; --s-14: #6b7f3a;
 
   --good: #0ca30c;  --warning: #fab219;  --serious: #ec835a;  --critical: #d03b3b;
 
@@ -58,6 +60,7 @@
     --s-4: #c98500;  --s-5: #d55181;  --s-6: #008300;
     --s-7: #2a86d6;  --s-8: #6b8aff;  --s-9: #1faf62;
     --s-10: #b5453d; --s-11: #9a75f0; --s-12: #17909f;
+    --s-13: #e0763f; --s-14: #86994b;
     --pos: #3987e5;  --neg: #e66767;  --mid: #3a3f36;
   }
 }
@@ -760,7 +763,13 @@ td .quote { color: var(--ink-2); font-size: 12.5px; margin-top: 3px; }
 .tag.serious  { color: var(--serious);  border-color: color-mix(in srgb, var(--serious) 40%, transparent); }
 .tag.warning  { color: var(--warning);  border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
 .tag.good     { color: var(--good);     border-color: color-mix(in srgb, var(--good) 35%, transparent); }
-.tag.plain::before { display: none; }
+/* The dot's space is kept even when the dot is not drawn.
+   `display: none` removed the dot AND the 5px gap after it, so a plain badge sat
+   10px tighter on the left than the dotted ones beside it — the labels in a row
+   of mixed badges started at two different insets, which reads as one badge
+   having the wrong padding. Hidden rather than removed: same box, same inset, no
+   coloured dot. */
+.tag.plain::before { visibility: hidden; }
 
 .sent { font: 500 11px var(--mono); }
 .sent.positive { color: var(--pos); }
@@ -2551,6 +2560,16 @@ button.ghost:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-3
   }
   .tabs::-webkit-scrollbar { display: none; }
   .tab { flex: none; padding: 12px 12px 13px; }
+
+  /* A notice is a tag, a sentence and sometimes a button, and it is the one
+     shape that cannot survive being squeezed: the sentence is a paragraph, so
+     side by side at 360px it gets a column three words wide while the button
+     holds the right edge. Each part gets its own row instead, in reading order.
+     Deliberately only this — a row of buttons or a header of short labels reads
+     better wrapped than stacked, and stacking them makes a phone scroll for
+     nothing. */
+  .notice { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .notice button { margin-left: 0; }
 
   .rubric { flex-wrap: wrap; gap: 8px; }
   .rubric .rerun { margin-left: 0; }

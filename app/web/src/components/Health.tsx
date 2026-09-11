@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
-import type { FixStep, Issue, Mention, Scan, Stage, Tracker } from '../../../shared/types.ts';
+import type { Citation, FixStep, Issue, Mention, Scan, Stage, Tracker } from '../../../shared/types.ts';
 import { api, apiUrl, fmtAgo, fmtDate, plain, venueOf } from '../lib.ts';
 import type { DefectHistory, Series } from '../../../server/series.ts';
 import { Filter, matches } from './Filter.tsx';
@@ -356,21 +356,40 @@ export function Health({ scan, onChange, onScan, onRerun, busy, patchSignal }: {
   );
 }
 
-/** The mentions an issue was built from, resolved against the scan.
+/** Where an issue came from, resolved two ways.
  *
- *  The ids that resolved to nothing are returned too. An issue cites mention
- *  ids; if one is not in the corpus there is no link to give, and rendering one
- *  fewer row without saying so makes an unsupported claim look identical to a
- *  supported one. */
+ *  An issue cites mention ids, and it also carries the citations themselves —
+ *  url, venue, title, date — copied on at triage time. The id is the better
+ *  record when it resolves, because the mention has the full text and the
+ *  scoring on it. The copy is what is left when it does not, and it does not
+ *  rot: reminted ids, a corpus cap, a re-run stage — every way this has gone
+ *  wrong has been a join that stopped resolving while the claim it supported
+ *  stayed on screen.
+ *
+ *  So all three cases are returned separately, because they are not the same
+ *  thing to a reader. A link from the corpus can be opened and cross-checked
+ *  against what the scan holds; a link from the stored citation can be opened;
+ *  an id with neither is a claim with nothing behind it, and saying so is the
+ *  whole job of this panel. */
 function sourcesFor(scan: Scan, issue: Issue) {
   const found: Mention[] = [];
+  const recorded: Citation[] = [];
   const missing: string[] = [];
   for (const id of issue.evidence) {
     const mention = scan.mentions.find((m) => m.id === id);
-    if (mention) found.push(mention);
-    else missing.push(id);
+    if (mention) { found.push(mention); continue; }
+    const citation = issue.sources?.find((c) => c.id === id);
+    if (citation) { recorded.push(citation); continue; }
+    missing.push(id);
   }
-  return { found, missing };
+  // A citation the issue carries for something it never listed as evidence
+  // shouldn't disappear either.
+  for (const citation of issue.sources ?? []) {
+    if (!issue.evidence.includes(citation.id) && !recorded.some((c) => c.id === citation.id)) {
+      recorded.push(citation);
+    }
+  }
+  return { found, recorded, missing };
 }
 
 /** Where a defect came from: the links, directly under its title.
@@ -382,7 +401,8 @@ function sourcesFor(scan: Scan, issue: Issue) {
  *  evidence that the link is good, and all of them cost attention on the way
  *  to it. */
 function Provenance({ scan, issue }: { scan: Scan; issue: Issue }) {
-  const { found, missing } = sourcesFor(scan, issue);
+  const { found, recorded, missing } = sourcesFor(scan, issue);
+  const links = found.length + recorded.length;
 
   return (
     <div className="prov">
@@ -393,11 +413,30 @@ function Provenance({ scan, issue }: { scan: Scan; issue: Issue }) {
             <a href={m.url} target="_blank" rel="noreferrer">{m.url}</a>
           </li>
         ))}
-        {found.length === 0 && <li className="q">No source in this scan can be opened for this.</li>}
+        {/* The same link, from the copy the issue carries. Marked, because the
+            thread is no longer in this scan's corpus and a reader comparing
+            this panel with the mention list needs to know why it is not
+            there — not because the link is worth less. */}
+        {recorded.map((c) => (
+          <li key={c.id}>
+            <a href={c.url} target="_blank" rel="noreferrer">{c.url}</a>
+            <span className="conn-meta"> — {c.venue}{c.date ? `, ${fmtDate(c.date)}` : ''}, no longer in this scan's corpus</span>
+          </li>
+        ))}
+        {links === 0 && (
+          <li className="q">
+            {issue.evidence.length === 0
+              ? 'Triage recorded no source for this at all, so there is nothing to check it against.'
+              : `This cites ${issue.evidence.length} source${issue.evidence.length === 1 ? '' : 's'} `
+                + 'and none of them can be resolved — the defect was catalogued before citations '
+                + 'were written onto it, and the ids it kept no longer refer to anything.'}
+          </li>
+        )}
       </ul>
-      {missing.length > 0 && found.length > 0 && (
+      {missing.length > 0 && links > 0 && (
         <p className="q">
-          {missing.length} cited {missing.length === 1 ? 'source is' : 'sources are'} not in this scan.
+          {missing.length} further cited {missing.length === 1 ? 'source' : 'sources'} cannot be
+          resolved at all.
         </p>
       )}
     </div>
@@ -477,17 +516,39 @@ function CodeSource({ scan, onScan }: { scan: Scan; onScan: (changes: Partial<Sc
         )}
       </div>
 
+      {/* The repository, as a link. A guess can only be checked by opening it,
+          and it was rendered as plain text — so the one action the sentence
+          underneath asks for ("check it is this product and not something
+          adjacent") meant copying a URL out of a <code> element by hand.
+          A local checkout is not a link and stays as text. */}
       {code.at
-        ? <div className="codesrc-at"><code>{code.at}</code></div>
+        ? (
+          <div className="codesrc-at">
+            {/^https?:\/\//i.test(code.at)
+              ? <a href={code.at} target="_blank" rel="noreferrer"><code>{code.at}</code></a>
+              : <code>{code.at}</code>}
+          </div>
+        )
         : null}
       <p className="q">{code.why}</p>
 
       {/* A guess is offered for confirmation rather than acted on. One click
-          makes it the answer and it stops being re-derived every run. */}
+          makes it the answer and it stops being re-derived every run.
+          All three answers are here, including the one that was only reachable
+          through a "Change" button in the panel's header: the guess is wrong AND
+          there is a real repository, which is the commonest case of the three and
+          was the hardest to act on. */}
       {code.state === 'discovered' && !editing && (
         <div className="actions">
           <button className="primary" disabled={busy} onClick={() => save({ url: code.at })}>
             Yes, that is this product
+          </button>
+          <button
+            className="ghost"
+            disabled={busy}
+            onClick={() => { setEditing(true); setUrl(code.at ?? ''); }}
+          >
+            No — it is this instead
           </button>
           <button className="ghost" disabled={busy} onClick={() => save({ noSource: true, url: '' })}>
             No — closed source
@@ -505,8 +566,11 @@ function CodeSource({ scan, onScan }: { scan: Scan; onScan: (changes: Partial<Sc
 
       {editing && (
         <div className="actions">
+          {/* Autofocused, because every route into this state is somebody who
+              has already decided to type a URL. */}
           <input
             className="conn-url"
+            autoFocus
             value={url}
             spellCheck={false}
             placeholder="https://github.com/owner/repo"
@@ -547,7 +611,7 @@ function Report({ scan, issue, onChange, onScan, autoStart }: {
   // Reading the source and patching it are minutes of model time, so the state
   // here is per-issue and the buttons say which phase they are in rather than
   // just spinning.
-  const [working, setWorking] = useState<'diagnose' | 'fix' | null>(null);
+  const [working, setWorking] = useState<'diagnose' | 'reproduce' | 'fix' | null>(null);
   const [steps, setSteps] = useState<{ step: string; note: string }[]>([]);
   const [investigating, setInvestigating] = useState(false);
   const busyNow = working !== null || investigating;
@@ -637,14 +701,28 @@ function Report({ scan, issue, onChange, onScan, autoStart }: {
     }
   };
 
-  const runSource = async (which: 'diagnose' | 'fix') => {
+  const runSource = async (which: 'diagnose' | 'reproduce' | 'fix') => {
     setWorking(which);
     setSourceError(null);
     try {
-      const result = await api<{ diagnosis?: Issue['diagnosis']; fix?: Issue['fix'] }>(
+      const result = await api<{
+        diagnosis?: Issue['diagnosis'];
+        reproduction?: Issue['reproduction'];
+        fix?: Issue['fix'];
+        issue?: Issue;
+      }>(
         `api/scans/${scan.id}/issues/${issue.id}/${which}`, { method: 'POST', body: '{}' },
       );
-      onChange({ ...issue, ...(result.diagnosis ? { diagnosis: result.diagnosis } : {}), ...(result.fix ? { fix: result.fix } : {}) });
+      // The loop events come back on the issue, and the ladder is drawn from
+      // them — merging only the artefact would leave the rung the run just
+      // climbed looking untouched until the next reload.
+      onChange({
+        ...issue,
+        ...(result.issue?.loop ? { loop: result.issue.loop } : {}),
+        ...(result.diagnosis ? { diagnosis: result.diagnosis } : {}),
+        ...(result.reproduction ? { reproduction: result.reproduction } : {}),
+        ...(result.fix ? { fix: result.fix } : {}),
+      });
     } catch (error) {
       setSourceError(String(error).replace(/^Error:\s*/, '').slice(0, 300));
     } finally {
@@ -753,6 +831,7 @@ function Report({ scan, issue, onChange, onScan, autoStart }: {
       <CodeSource scan={scan} onScan={onScan} />
       
       {issue.diagnosis && <DiagnosisView diagnosis={issue.diagnosis} />}
+      {issue.reproduction && <ReproductionView reproduction={issue.reproduction} />}
       {issue.fix && <FixView fix={issue.fix} />}
 
       {issue.fix && (
@@ -870,6 +949,7 @@ function Report({ scan, issue, onChange, onScan, autoStart }: {
         onAction={(action) => {
           if (action === 'investigate') return investigate();
           if (action === 'diagnose') return void runSource('diagnose');
+          if (action === 'reproduce') return void runSource('reproduce');
           if (action === 'file') return void preview('github');
           // Filing first is enforced by the ladder, so by the time this fires
           // there is a ticket for the reply to hand over.
@@ -1010,6 +1090,61 @@ function DiagnosisView({ diagnosis }: { diagnosis: NonNullable<Issue['diagnosis'
  *  and did the new regression test FAIL against the original code. A test that
  *  passes before and after has tested nothing, and a green suite on top of it
  *  is the most convincing way this whole pipeline can be wrong. */
+/** The test that demonstrates the defect, and whether it really does.
+ *
+ *  The test itself is shown, not summarised. A reproduction is a claim about
+ *  code, and the only way to check a claim about code is to read it — a badge
+ *  saying "reproduced" is exactly the kind of thing this panel exists to stop
+ *  people taking on trust. The failure output sits under it for the same reason:
+ *  red for the reported reason and red because the test could not be imported
+ *  look identical in a summary and nothing alike in a log.
+ */
+function ReproductionView({ reproduction }: { reproduction: NonNullable<Issue['reproduction']> }) {
+  const { demonstrated } = reproduction;
+
+  return (
+    <div className="source-result">
+      <div className="source-head">
+        <span className={`tag ${demonstrated ? 'good' : 'warning'}`}>
+          {demonstrated ? 'fails against the current code' : 'not demonstrated'}
+        </span>
+        <span className="conn-meta">
+          {reproduction.attempts} attempt{reproduction.attempts === 1 ? '' : 's'}
+          {reproduction.files.length > 0 && ` · ${reproduction.files.map((f) => f.path).join(', ')}`}
+        </span>
+      </div>
+
+      {reproduction.summary && <p className="q">{reproduction.summary}</p>}
+      <p className={demonstrated ? 'q' : 'conn-err'}>{reproduction.detail}</p>
+      {reproduction.baseline && (
+        <p className={reproduction.baseline.passed ? 'q' : 'conn-err'}>
+          <b>Before the test was added:</b> {reproduction.baseline.note}
+        </p>
+      )}
+
+      <dl className="agent-detail">
+        <dt>run with</dt><dd><code>{reproduction.test.command}</code></dd>
+        {/* What it said would fail, written down before it was run — so the
+            output below can be compared with a prediction instead of just
+            believed. */}
+        {reproduction.expectedFailure && <><dt>expected</dt><dd>{reproduction.expectedFailure}</dd></>}
+        <dt>working copy</dt>
+        <dd><code>{reproduction.workdir}</code> — test files only; the code under test was not touched</dd>
+      </dl>
+
+      {reproduction.files.map((file) => (
+        <div key={file.path}>
+          <p className="conn-meta"><code>{file.path}</code> — {file.why}</p>
+          <pre className="payload">{file.contents.slice(0, 6000)}</pre>
+        </div>
+      ))}
+
+      {reproduction.test.output && <pre className="payload">{reproduction.test.output.slice(-2000)}</pre>}
+      {reproduction.notes && <p className="q">{reproduction.notes}</p>}
+    </div>
+  );
+}
+
 function FixView({ fix }: { fix: NonNullable<Issue['fix']> }) {
   const proven = fix.provesTheBug.checked && fix.provesTheBug.failedOnOriginal;
 
@@ -1314,12 +1449,13 @@ function WorkLog({ trail }: { trail: FixStep[] }) {
   );
 }
 
-const STEP_ORDER = ['forking', 'cloning', 'reading', 'patching', 'pushing', 'publishing'] as const;
+const STEP_ORDER = ['forking', 'cloning', 'reading', 'reproducing', 'patching', 'pushing', 'publishing'] as const;
 
 const STEP_LABEL: Record<(typeof STEP_ORDER)[number], string> = {
   forking: 'Fork it, so nothing touches the real project',
   cloning: 'Check out the code',
   reading: 'Read the source against the complaint',
+  reproducing: 'Write a test that fails against the current code',
   patching: 'Write a patch and run the tests',
   pushing: 'Push the patch and open a pull request',
   publishing: 'Publish the record to the fork',

@@ -16,12 +16,13 @@ import { describeError, why } from '../errors.ts';
 import type { Issue, Scan } from '../../shared/types.ts';
 import { ensureFork } from '../channels/fork.ts';
 import { createIssue, commentOnIssue, createPullRequest, loopComment, pushBranch } from '../channels/github.ts';
-import { ensureCheckout } from '../repos.ts';
+import { codeUrlFor, ensureCheckout } from '../repos.ts';
 import { diagnoseIssue } from './diagnose-run.ts';
 import { fixIssue } from './fix-run.ts';
+import { reproduceIssue } from './reproduce-run.ts';
 
 export type Step =
-  | 'forking' | 'cloning' | 'reading' | 'patching' | 'pushing' | 'publishing' | 'done';
+  | 'forking' | 'cloning' | 'reading' | 'reproducing' | 'patching' | 'pushing' | 'publishing' | 'done';
 
 export interface Progress {
   step: Step;
@@ -36,6 +37,8 @@ const forkable = (repo: string | undefined, workspace: string | undefined): bool
 export interface InvestigateResult {
   fork?: string;
   diagnosed: boolean;
+  /** A test that fails against the unpatched code now exists. */
+  reproduced: boolean;
   patched: boolean;
   ledger?: { ref: string; url: string };
   pr?: { number: number; url: string };
@@ -47,7 +50,7 @@ export async function investigate(
   emit: (level: 'info' | 'warn', text: string) => void,
   onStep: (progress: Progress) => void,
 ): Promise<InvestigateResult> {
-  const result: InvestigateResult = { diagnosed: false, patched: false };
+  const result: InvestigateResult = { diagnosed: false, reproduced: false, patched: false };
 
   // Which pass this is. Investigating twice used to append a second diagnosis
   // and a second fix with nothing distinguishing them, so a reader of the
@@ -58,11 +61,17 @@ export async function investigate(
   const label = (text: string) => (pass > 1 ? `Pass ${pass} — ${text}` : text);
 
   // 1. Somewhere of our own to work in.
+  //
+  //    The repository a person set, if they set one. This read the scan's own
+  //    guess, so answering "no, it is this instead" in the Source code panel
+  //    changed the checkout and not the fork — and the pull request went to a
+  //    fork of whatever the resolver had guessed.
+  const upstream = codeUrlFor(scan.company, scan.subject?.repo);
   let fork = scan.fork;
-  if (!fork && forkable(scan.subject?.repo, scan.workspace)) {
+  if (!fork && forkable(upstream, scan.workspace)) {
     onStep({ step: 'forking', note: 'making a copy under your own account' });
     try {
-      fork = (await ensureFork(scan.subject!.repo, emit)).fullName;
+      fork = (await ensureFork(upstream!, emit)).fullName;
       scan.fork = fork;
       result.fork = fork;
     } catch (error) {
@@ -76,7 +85,7 @@ export async function investigate(
   // 2. The working copy. From the fork when there is one, so what comes out of
   //    this is pushable.
   onStep({ step: 'cloning', note: fork ? `checking out ${fork}` : 'checking out the source' });
-  const { path: repo } = await ensureCheckout(scan.company, emit, scan.subject?.repo, scan.workspace, fork);
+  const { path: repo } = await ensureCheckout(scan.company, emit, upstream, scan.workspace, fork);
 
   // 3. Read it.
   onStep({ step: 'reading', note: 'reading the source against the complaint' });
@@ -101,8 +110,57 @@ export async function investigate(
   if (diagnosis.verdict === 'not-a-defect' || diagnosis.verdict === 'insufficient') {
     emit('info', `stopping after the read: ${diagnosis.verdict} — not enough to patch against`);
   } else {
+    // 3a. Demonstrate it, before anything is patched.
+    //
+    //     The order is the point. A test written alongside the patch that makes
+    //     it pass can be shaped, without anybody intending to, into a test of
+    //     whatever the patch did; a test written first has to fail against the
+    //     code as it stands or it is thrown away. So this runs on its own, is
+    //     allowed to add test files and nothing else, and its result is what the
+    //     `reproduced` rung rests on.
+    //
+    //     A failure here does not stop the patch. Plenty of real defects cannot
+    //     be reduced to a test from a diagnosis alone, and "we could not
+    //     demonstrate it" is a fact worth recording rather than a reason to
+    //     abandon the run — the patch is just then worth less, and the ladder
+    //     says so by leaving the rung open.
+    onStep({ step: 'reproducing', note: 'writing a test that fails against the current code' });
+    try {
+      const reproduction = {
+        ...(await reproduceIssue(scan, issue, diagnosis, repo, emit)),
+        at: new Date().toISOString(),
+      };
+      issue.reproduction = reproduction;
+      result.reproduced = reproduction.demonstrated;
+      issue.loop = [...(issue.loop ?? []), {
+        id: randomUUID().slice(0, 8),
+        // Only a demonstrated reproduction may write `reproduced`. A test that
+        // passed against the buggy code, or never ran, is recorded as part of
+        // reading the source — which is what it was.
+        step: reproduction.demonstrated ? 'reproduced' : 'diagnosed',
+        actor: 'agent',
+        at: reproduction.at,
+        human: false,
+        summary: label(reproduction.demonstrated
+          ? `Wrote a failing test in ${reproduction.attempts} attempt(s): `
+            + `${reproduction.files.map((f) => f.path).join(', ')}. ${reproduction.detail}`
+          : `Could not demonstrate this with a test after ${reproduction.attempts} attempt(s). `
+            + `${reproduction.detail}. ${reproduction.notes.slice(0, 200)}`),
+        ref: reproduction.files[0]
+          ? { label: reproduction.files[0].path }
+          : { label: `${reproduction.attempts} attempt(s)` },
+      }];
+    } catch (error) {
+      // Cannot tell how to run this project's tests, most often. Worth saying
+      // plainly, and not worth losing the diagnosis over.
+      emit('warn', `could not write a failing test — ${why(error)}`);
+    }
+
     onStep({ step: 'patching', note: 'writing a patch and running the tests' });
-    const fix = { ...(await fixIssue(scan, issue, diagnosis, repo, emit)), at: new Date().toISOString() };
+    const fix = {
+      ...(await fixIssue(scan, issue, diagnosis, repo, emit, { reproduction: issue.reproduction })),
+      at: new Date().toISOString(),
+    };
     issue.fix = fix;
     result.patched = fix.applied && fix.tests.passed;
     const proven = fix.provesTheBug.checked && fix.provesTheBug.failedOnOriginal;
@@ -115,7 +173,11 @@ export async function investigate(
     // A patch whose test passes both before and after proves nothing: it is
     // green against a bug that was never demonstrated. Writing `fixed` for that
     // is how a scan reports work it did not do.
-    if (proven) {
+    // Only when the reproduction step did not already write this rung. The fix
+    // run checking its own test against the original code is the fallback for a
+    // defect no test could be written for ahead of the patch, not a second
+    // reproduction of one that was.
+    if (proven && !result.reproduced) {
       issue.loop = [...(issue.loop ?? []), {
         id: randomUUID().slice(0, 8),
         step: 'reproduced',

@@ -16,10 +16,11 @@ import { channelStates, reloadChannels } from './channels/index.ts';
 import { addConnector, enabledConnectors, missingCredentials, removeConnector, inferenceConfig, inferenceHost, inferenceHosts, patchConnector, patchInferenceHost, reloadConfig } from './config.ts';
 import { diagnoseIssue } from './agents/diagnose-run.ts';
 import { fixIssue } from './agents/fix-run.ts';
+import { reproduceIssue } from './agents/reproduce-run.ts';
 import { ensureFork } from './channels/fork.ts';
 import { openPullRequest } from './channels/github.ts';
 import { discard, outbox } from './outbox.ts';
-import { ensureCheckout, patchProject, projectFor, reloadRepos, repoConfig } from './repos.ts';
+import { codeUrlFor, ensureCheckout, patchProject, projectFor, reloadRepos, repoConfig } from './repos.ts';
 import { hintFor, warnAbout } from './credential-hints.ts';
 import { secretSource, setSecrets, storedSecrets } from './secrets.ts';
 import { availableConnectors, checkConnectors, listTools, toolUsage, type McpTool } from './mcp.ts';
@@ -1370,6 +1371,56 @@ app.get('/api/scans/:id/issues/:issueId/investigate/stream', async (req, res) =>
   }
 });
 
+/** Write a test that fails against the current code, and nothing else.
+ *
+ *  The `reproduced` rung on its own. It used to be reachable only by asking for
+ *  a patch, which meant a defect could be read and understood and still sit at
+ *  "no test yet that fails against the current code" — and filing is gated on
+ *  that rung, so the one step that turns a rumour into a bug report was blocked
+ *  behind a much larger and more expensive one.
+ *
+ *  Nothing is committed or pushed, and the run may only add test files: the
+ *  code it is failing against cannot be edited by the thing producing the
+ *  failure. Requires a diagnosis, because a test written without one is a guess
+ *  at where the defect is. */
+app.post('/api/scans/:id/issues/:issueId/reproduce', async (req, res) => {
+  const scan = store.get(req.params.id);
+  const issue = scan?.issues.find((i) => i.id === req.params.issueId);
+  if (!scan || !issue) return res.status(404).json({ error: 'no such issue' });
+  if (!issue.diagnosis) return res.status(400).json({ error: 'read the source first — a test needs somewhere to aim' });
+
+  const trail: string[] = [];
+  const emit = (level: 'info' | 'warn', text: string) => trail.push(`[${level}] ${text}`);
+
+  try {
+    const { path: repo } = await ensureCheckout(scan.company, emit, scan.subject?.repo, scan.workspace, scan.fork);
+    const result = await reproduceIssue(scan, issue, issue.diagnosis, repo, emit);
+    issue.reproduction = { ...result, at: new Date().toISOString() };
+    issue.loop = [...(issue.loop ?? []), {
+      id: randomUUID().slice(0, 8),
+      // A test that passed, or never ran, demonstrates nothing — recorded as
+      // what it was rather than as the rung it failed to reach.
+      step: result.demonstrated ? 'reproduced' : 'diagnosed',
+      actor: 'agent',
+      at: issue.reproduction.at,
+      human: false,
+      summary: result.demonstrated
+        ? `Wrote a failing test in ${result.attempts} attempt(s): `
+          + `${result.files.map((f) => f.path).join(', ')}. ${result.detail}`
+        : `Could not demonstrate this with a test after ${result.attempts} attempt(s). `
+          + `${result.detail}. ${result.notes.slice(0, 200)}`,
+      ref: result.files[0] ? { label: result.files[0].path } : { label: `${result.attempts} attempt(s)` },
+    }];
+    store.put(scan);
+    res.json({ reproduction: issue.reproduction, issue, log: trail });
+  } catch (error) {
+    res.status(502).json({
+      error: error instanceof Error ? error.message : 'reproduction failed',
+      log: trail,
+    });
+  }
+});
+
 /** Write the patch and run the tests, in a throwaway copy.
  *
  *  Nothing is committed, pushed or applied to the configured checkout. The
@@ -1422,7 +1473,10 @@ app.post('/api/scans/:id/fork', async (req, res) => {
   const scan = store.get(req.params.id);
   if (!scan) return res.status(404).json({ error: 'no such scan' });
 
-  const upstream = scan.subject?.repo;
+  // The repository a person set, else the one the scan worked out — the same
+  // precedence the Source code panel shows, so forking cannot go somewhere the
+  // panel says it is not reading.
+  const upstream = codeUrlFor(scan.company, scan.subject?.repo);
   if (!upstream) return res.status(400).json({ error: 'this scan has no repository to fork' });
 
   const trail: string[] = [];
@@ -1586,7 +1640,10 @@ if (existsSync(DIST)) {
   // to land on index.html rather than a 404.
   app.get(/^(?!\/api\/).*/, (_req, res) => res.sendFile(path.join(DIST, 'index.html')));
   console.log(`serving dashboard from ${DIST}`);
-  const dist = staleDist();
+  // Not under `npm run dev`: that session is being read on :5173, where the
+  // assets are compiled from source on demand, so telling it to run a build is
+  // advice to do nothing about a file nobody is looking at.
+  const dist = process.env.WHISPERER_DEV ? { stale: false, builtAt: null, editedAt: null } : staleDist();
   if (dist.stale) {
     console.warn(
       `WARNING: app/web/dist is older than app/web/src — this port serves the BUILT assets, and\n`

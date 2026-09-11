@@ -3,6 +3,11 @@
 
 export type Venue =
   | 'reddit' | 'hackernews' | 'x' | 'github' | 'youtube'
+  // The other two trackers this reads. They were both reported as `github`,
+  // which is a mention claiming to come from somewhere it does not — GIMP's
+  // bugs are on gitlab.gnome.org and Krita's on a KDE Bugzilla, and a defect's
+  // provenance is the one field on a mention that must not be approximated.
+  | 'gitlab' | 'bugzilla'
   | 'discord' | 'linkedin'
   | 'telegram' | 'signal' | 'whatsapp'
   | 'blog' | 'forum' | 'review' | 'other';
@@ -126,6 +131,22 @@ export interface Issue {
   check?: string;
   /** Mention ids backing this up. */
   evidence: string[];
+  /** The same citations, written down rather than pointed at.
+   *
+   *  An id is a join, and a join is only as good as the thing it joins to. Every
+   *  way this pipeline has lost provenance has been a join that stopped
+   *  resolving — ids reminted on a rerun, a cited mention trimmed by the corpus
+   *  cap, a stage re-run against a corpus the issue predates — and in every case
+   *  the screen showed a defect with no source rather than an error, which is the
+   *  worst of both: the claim survives and the evidence for it does not.
+   *
+   *  So the URL, venue, title and date are copied onto the issue at the moment
+   *  it is triaged, from the item the model was actually shown. `evidence` is
+   *  still the join and still preferred when it resolves, because the mention
+   *  carries more; this is what remains when it does not, and it cannot rot.
+   *
+   *  Absent on issues catalogued before this existed. */
+  sources?: Citation[];
   /** When the evidence says people reported it — the earliest and latest dates
    *  on the mentions backing it. Null when none of them published a date. */
   firstSeen: string | null;
@@ -149,6 +170,13 @@ export interface Issue {
   loop?: LoopEvent[];
   /** What reading the source concluded, once someone asked. */
   diagnosis?: Diagnosis;
+  /** The test that demonstrates it, written before any patch existed.
+   *
+   *  Separate from `fix` on purpose. A test that arrives with the patch it
+   *  validates is worth less than one written first, because nothing stops it
+   *  being shaped to whatever the patch happened to do. This is the one the
+   *  `reproduced` rung is allowed to rest on. */
+  reproduction?: Reproduction;
   /** The patch, and whether its tests actually passed. */
   fix?: FixResult;
   /** How many loop events have already been written to the tracker, so a
@@ -157,6 +185,25 @@ export interface Issue {
   /** How many times this has been investigated. Each pass is labelled in the
    *  ledger so a re-run reads as a second look rather than a second problem. */
   investigations?: number;
+}
+
+/** Where a defect came from, copied onto the defect itself.
+ *
+ *  Deliberately the minimum that lets a reader go and look: the link, what kind
+ *  of place it is, what it was called and when it was published. Not a copy of
+ *  the mention — the mention is the richer record and is still preferred when it
+ *  can be found — just enough that "where the hell did this come from" always has
+ *  an answer.
+ */
+export interface Citation {
+  /** The mention id this was resolved from, so the two can be rejoined when the
+   *  corpus still has it. */
+  id: string;
+  url: string;
+  venue: Venue;
+  title: string;
+  /** What the source published, when it published one. */
+  date: string | null;
 }
 
 /** The result of reading a project's source against a reported defect. */
@@ -200,6 +247,58 @@ export interface FixStep {
   /** Tail of the test output — enough to see the failure, not the whole log. */
   testOutput?: string;
   outcome: 'kept' | 'retried' | 'no-changes' | 'model-failed';
+}
+
+/** One try at a reproduction, kept whether it worked or not.
+ *
+ *  The rejected and non-running attempts are the interesting ones: they are the
+ *  record of what the pipeline tried before it got a test that fails for the
+ *  right reason, and they are what stops "reproduced" from being a word somebody
+ *  has to take on trust. */
+export interface ReproductionStep {
+  n: number;
+  at: string;
+  /** Test files written this attempt, and what each was for. */
+  files: { path: string; why: string }[];
+  /** Files refused — not a test, already existing, or outside the copy. */
+  rejected: string[];
+  /** Set when the model call itself failed rather than the test. */
+  modelError?: string;
+  /** `demonstrated` is the only outcome that counts. `passed` means the test
+   *  agreed with the buggy behaviour; `did-not-run` means it never asserted
+   *  anything. */
+  outcome: 'demonstrated' | 'passed' | 'did-not-run' | 'no-files' | 'model-failed' | 'retried';
+  /** Tail of the run's output, enough to see why. */
+  output?: string;
+}
+
+/** A test that fails against the current code, and the evidence it does.
+ *
+ *  `demonstrated` is a narrow claim and it is checked rather than asserted: the
+ *  test ran, it failed, and it failed on an assertion rather than on an import
+ *  error or an empty collection. Nothing here ever touches the code under
+ *  test — a reproduction run may only add test files, which is what makes the
+ *  red meaningful. */
+export interface Reproduction {
+  demonstrated: boolean;
+  summary: string;
+  notes: string;
+  /** What the agent said would fail, before it was run. Kept so the failure can
+   *  be compared with the prediction instead of just believed. */
+  expectedFailure: string;
+  files: { path: string; contents: string; why: string }[];
+  /** How the new test was run, and what happened. `command` is the test alone
+   *  where the runner can be pointed at one file, and the whole suite where it
+   *  cannot. */
+  test: { command: string; failed: boolean; output: string };
+  /** Whether the suite passed BEFORE the test was added. */
+  baseline: { passed: boolean; note: string };
+  /** Why this counts as a reproduction, or why it does not. */
+  detail: string;
+  attempts: number;
+  trail: ReproductionStep[];
+  workdir: string;
+  at: string;
 }
 
 export interface FixResult {

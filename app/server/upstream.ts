@@ -17,12 +17,12 @@
  *  nothing else.
  */
 
-import { randomUUID } from 'node:crypto';
 import { why } from './errors.ts';
 import { rescue } from './rescue.ts';
 import type { Mention } from '../shared/types.ts';
 import { cached, HOUR } from './cache.ts';
 import { cleanText } from '../shared/html.ts';
+import { mentionId } from './mention-id.ts';
 import { secret } from './secrets.ts';
 
 interface Upstream {
@@ -199,6 +199,51 @@ interface RawIssue {
 const labelNames = (issue: RawIssue): string[] =>
   (issue.labels ?? []).map((l) => (typeof l === 'string' ? l : l?.name ?? '')).filter(Boolean);
 
+/** One row from a tracker, as a mention.
+ *
+ *  Exported for the sake of the id, which is the part that has been wrong. Every
+ *  other source derives a mention's id from its URL (see mention-id.ts); this
+ *  one minted `randomUUID().slice(0, 8)` per run, which is precisely the bug that
+ *  module was written to kill — and it survived here because nothing could reach
+ *  this mapping to test it.
+ *
+ *  What it cost: an issue cites mentions by id, so every re-run renamed the
+ *  tracker reports and silently orphaned the provenance of every defect triaged
+ *  from one. The thread was still in the corpus under a new number, nothing
+ *  errored, and the Source panel just went blank. Measured on the markitdown
+ *  scan: 27 of 68 defects cited nothing that resolved, and all 27 of them came
+ *  from this list.
+ */
+export function trackerMention(
+  issue: RawIssue,
+  fallbackUrl: string,
+  host: Upstream['host'] = 'github',
+): Mention {
+  const url = issue.html_url ?? issue.web_url ?? fallbackUrl;
+  const body = cleanText(String(issue.body ?? issue.description ?? '')).slice(0, 1_200);
+  const labels = labelNames(issue);
+  return {
+    id: mentionId(url),
+    venue: host,
+    title: cleanText(issue.title ?? '(untitled issue)'),
+    url,
+    date: issue.created_at ?? null,
+    author: issue.user?.login ?? issue.author?.username ?? null,
+    excerpt: body || cleanText(issue.title ?? ''),
+    engagement: null,
+    // Left for the scoring pass like everything else — a filed bug is not
+    // automatically a furious one, and pretending to know its sentiment would
+    // put a number in front of the model that it did not produce.
+    sentiment: 'neutral',
+    score: 0,
+    themes: labels.slice(0, 3),
+    discussion: true,
+    // It is a defect report by construction. This is the flag that gets it into
+    // the half of the corpus triage actually reads.
+    complaint: true,
+  };
+}
+
 /** Open issues from the project's own tracker, as mentions.
  *
  *  Cached for an hour: a tracker does not turn over fast enough to be worth
@@ -320,31 +365,7 @@ export async function fetchUpstreamIssues(
   // Newest first, ours to guarantee rather than the server's to promise.
   issues.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
 
-  const mentions: Mention[] = issues.slice(0, limit).map((issue) => {
-    const url = issue.html_url ?? issue.web_url ?? upstream.web;
-    const body = cleanText(String(issue.body ?? issue.description ?? '')).slice(0, 1_200);
-    const labels = labelNames(issue);
-    return {
-      id: randomUUID().slice(0, 8),
-      venue: 'github',
-      title: cleanText(issue.title ?? '(untitled issue)'),
-      url,
-      date: issue.created_at ?? null,
-      author: issue.user?.login ?? issue.author?.username ?? null,
-      excerpt: body || cleanText(issue.title ?? ''),
-      engagement: null,
-      // Left for the scoring pass like everything else — a filed bug is not
-      // automatically a furious one, and pretending to know its sentiment
-      // would put a number in front of the model that it did not produce.
-      sentiment: 'neutral',
-      score: 0,
-      themes: labels.slice(0, 3),
-      discussion: true,
-      // It is a defect report by construction. This is the flag that gets it
-      // into the half of the corpus triage actually reads.
-      complaint: true,
-    };
-  });
+  const mentions: Mention[] = issues.slice(0, limit).map((issue) => trackerMention(issue, upstream.web, upstream.host));
 
   emit(
     'info',

@@ -48,7 +48,7 @@ const STEP_LABEL: Record<LoopStep, string> = {
  *  These get the quoted treatment. */
 const CONVERSATIONAL: LoopStep[] = ['discovered', 'outreach', 'fix-notified', 'confirmed'];
 
-export type LoopAction = 'investigate' | 'diagnose' | 'file' | 'reply' | 'notify';
+export type LoopAction = 'investigate' | 'diagnose' | 'reproduce' | 'file' | 'reply' | 'notify';
 
 /** The order this is supposed to happen in.
  *
@@ -91,11 +91,21 @@ const LADDER: {
       + 'regression test fails against the original code.',
   },
   {
-    // A test that fails against the unpatched code. Written by the patch run,
-    // never by reading alone.
+    // A test that fails against the unpatched code — the thing the word means.
+    // It has its own action now. It used to be produced only as a by-product of
+    // the patch run, so a defect that had been read and understood sat here with
+    // nothing to press, and filing — which is gated on this rung — was blocked
+    // behind writing a fix.
     step: 'reproduced',
     pending: 'No test yet that fails against the current code',
+    action: 'reproduce',
+    actionLabel: 'Write the failing test',
+    needs: 'diagnosed',
     theirs: false,
+    blurb: 'Writes a test that asserts the reported behaviour and runs it in a throwaway copy, '
+      + 'where it has to fail. The run may add test files and nothing else, so it cannot touch the '
+      + 'code it is failing against — and a test that passes, or never runs, is thrown away rather '
+      + 'than recorded.',
   },
   {
     step: 'filed',
@@ -167,7 +177,15 @@ export function ResolutionLoop({ issue, onAction, busy, progress }: {
   // never happened — and worse, opens the gate in front of filing. The proof
   // lives on `issue.fix`, so it can be checked rather than trusted: no failing
   // test against the original code, no reproduction.
-  const provenBug = Boolean(issue.fix?.provesTheBug?.checked && issue.fix.provesTheBug.failedOnOriginal);
+  //
+  // Either half of the pipeline can establish it: a reproduction run, which
+  // writes a test before any patch exists and may not touch the source, or the
+  // fix run's own check that its regression test fails against the original.
+  // The first is the better evidence and the one the dedicated rung produces.
+  const provenBug = Boolean(
+    issue.reproduction?.demonstrated
+    || (issue.fix?.provesTheBug?.checked && issue.fix.provesTheBug.failedOnOriginal),
+  );
   if (done.has('reproduced') && !provenBug) {
     const stale = done.get('reproduced')!;
     done.delete('reproduced');
@@ -295,8 +313,8 @@ export function ResolutionLoop({ issue, onAction, busy, progress }: {
                     {blocked && !untestable && rung.needs === 'reproduced' && (
                       <span className="conn-meta">
                         Nothing yet fails against the current code. A ticket saying somebody
-                        complained is a report; one carrying a test that fails is a bug. Patch it
-                        first and the failing test comes with it.
+                        complained is a report; one carrying a test that fails is a bug. Write the
+                        failing test first — it is the rung above this one.
                       </span>
                     )}
                     {blocked && !untestable && rung.needs && rung.needs !== 'reproduced' && (
